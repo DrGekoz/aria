@@ -60,7 +60,14 @@ void aria_sa3_dit_free(aria_sa3_dit *m);
 /* Per-request context: a reusable scratch arena plus the step-invariant state
  * cached once and reused across all denoising steps -- cross_ed (to_cond_embed),
  * RoPE tables, to_global_embed(seconds), and the per-block cross-attention K/V
- * (the prompt context is constant across steps, so it is projected just once). */
+ * (the prompt context is constant across steps, so it is projected just once).
+ *
+ * Thread-safety / batch foundation: the model (aria_sa3_dit) is immutable and
+ * read-only during a step; each request owns its arena and caches with no shared
+ * mutable state. Distinct requests may therefore run concurrently against one
+ * shared model -- the basis for a request-parallel batch/server API (see
+ * ROADMAP E13). (Each step uses OpenMP internally, so a server caps per-request
+ * threads to avoid oversubscription.) */
 typedef struct aria_sa3_dit_req aria_sa3_dit_req;
 
 aria_sa3_dit_req *aria_sa3_dit_req_begin(const aria_sa3_dit *m, int T,

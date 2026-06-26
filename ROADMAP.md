@@ -172,6 +172,34 @@ doubles as the activation-extraction path.
 - ⬜ **E12.8** `∥` **P2** Steering validation sweep (scale/layer/site) scored with the taste regressor (wav2taste / sonic-taste-regressor). deps: E12.7 · Verify: taste metric responds monotonically-ish to scale for a known direction; reproducible.
 - ⬜ **E12.9** **P2** (stretch) LoRA-style steering arm: `aria_linear_lora` op + adapter loader on chosen projections (the steering-vs-LoRA comparison). deps: E2.x, E4.4 · Verify: loaded adapter matches a Python LoRA forward within tol; zero-rank ≡ base.
 
+## E13 — Batch / server (throughput)
+
+Foundation laid in E2.9b: the immutable model (`aria_sa3_dit`, read-only weights)
+is split from per-request scratch (`aria_sa3_dit_req`, owns its arena + caches),
+so distinct requests share one loaded model with no shared mutable state. Two
+complementary strategies:
+
+- ⬜ **E13.1** **P1** *Request-parallel (multi-stream)* — a worker pool runs N
+  independent `aria_sa3_dit_req` generations against one shared model. Correct
+  **today** for the DiT (model is immutable, reqs are independent); deliverable =
+  a server/CLI harness + a per-request thread budget (each step uses OpenMP, so
+  choose: few requests × all cores for latency, or many requests × `OMP=1` for
+  throughput). deps: E2.9b, E13.3 · Verify: K concurrent generations match K
+  sequential ones bit-for-bit; aggregate throughput scales with cores.
+- ⬜ **E13.2** **P2** *True batched forward (batch dim B)* — one req processes B
+  same-duration latents together so each weight streams from memory once for all
+  B (these GEMMs are memory-bound ⇒ the big throughput win). Plumb a batch dim
+  through attention (block-diagonal per sample) and conditioning (per-sample
+  `cross_ed` / cross-KV / `global`, shared RoPE): `aria_sa3_dit_req_begin_batch(m,
+  T, cross[B], n_cond, global[B], B)` → `aria_sa3_dit_step_batch`. Ragged
+  durations pad to max-T or fall back to E13.1. deps: E13.1, E4.4 · Verify: a
+  B-batch matches B singletons within parity tol; throughput/sample beats E13.1
+  at the same core count.
+- ⬜ **E13.3** **P1** Extend the arena to the encoder/decoder forwards (still
+  `malloc` internally — thread-safe but with churn) so the *whole* pipeline is
+  per-request-scratch and fully concurrency-clean. deps: E2.9b · Verify: parity
+  unchanged; no per-request heap churn outside the arena.
+
 ## Post-1.0 (north star)
 
 - **AceStep 1.5 module** — add `aria_dit_acestep.c` (+ its AE) behind the
