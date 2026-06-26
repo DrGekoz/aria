@@ -47,19 +47,20 @@ We support (or are building toward) the following backends:
 
 ## Status
 
-**Early.** This is a young project and the code reflects that. The honest state:
+**Working end-to-end (small-music, CPU).** `aria` loads Stable Audio 3 and
+generates audio from a text prompt, entirely in C — every stage parity-checked
+against the `stable-audio-tools` PyTorch reference:
 
-- **Working today:** the library + CLI build clean and dependency-free; the
-  safetensors loader reads the real Stable Audio 3 weights; WAV I/O; the CPU op
-  kernels; the model-module registry; and a parity harness that validates C
-  output against the `stable-audio-tools` PyTorch reference. The first
-  conditioner (`seconds_total`) is parity-validated.
-- **In progress:** the DiT forward, the taae_v2 autoencoder, the T5Gemma text
-  encoder, and the pingpong sampler — i.e. actual end-to-end generation.
+- **text → tokens** (GemmaTokenizer BPE, exact id parity) →
+- **T5Gemma encoder** (12-layer Gemma2 encoder, ~0.15% rel) →
+- **DiT denoiser** (20 blocks, ~1e-5) over the **pingpong sampler** (LogSNR
+  schedule, ~6e-8) → **taae_v2 decoder** (latent→audio, ~1e-4) → stereo WAV.
 
-So aria can load and inspect a model and round-trip audio, but it does **not yet
-generate**. The full plan, broken into atomic, individually-verifiable tasks
-with priorities and dependencies, is in [ROADMAP.md](ROADMAP.md). This software
+CPU-only, AVX2/FMA + OpenMP, zero-copy mmap weights. ~9 s for a 2 s/8-step clip.
+
+- **Not yet:** CUDA backend, int8/q4 quantization, continue/inpaint, the medium
+  model. See [ROADMAP.md](ROADMAP.md) for the atomic, individually-verifiable
+  task list with priorities and dependencies. This software
 is developed with **strong assistance from large language models**, with a human
 leading the ideas, testing, and debugging. We say so openly because it shaped how
 the project was built.
@@ -114,13 +115,19 @@ The CPU build must stay warning-clean under `-Wall -Wextra`.
 ## Usage
 
 ```sh
-# Inspect a model (works today)
+# one-time: export the tokenizer to a compact binary aria loads at runtime
+python scripts/export_tokenizer.py models/small-music
+
+# text -> audio
+./aria -m models/small-music -p "warm romantic piano, slow, tender" -d 15 -s 8 --seed 0 -o out.wav
+
+# unconditional, or from a precomputed [256,768] prompt embedding
+./aria -m models/small-music --uncond -d 10 -o out.wav
+./aria -m models/small-music --prompt-embed prompt.atns -d 10 -o out.wav
+
+# inspect
 ./aria -m models/small-music --info
 ./aria -m models/small-music --list-tensors pretransform.
-./aria --wav-roundtrip in.wav out.wav
-
-# Text-to-audio (in progress — Phase 1)
-./aria -m models/small-music -p "warm romantic piano, slow, tender" -d 15 -s 8 -o out.wav
 ```
 
 `-m <dir>` is any directory with `model_config.json` and `model.safetensors`

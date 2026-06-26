@@ -7,6 +7,8 @@
 #include "aria_sa3.h"
 #include "aria_sa3_dit.h"
 #include "aria_sa3_dec.h"
+#include "aria_t5enc.h"
+#include "aria_tokenizer.h"
 #include "aria_sampler.h"
 #include "aria_cond.h"
 #include "aria_parity.h"
@@ -26,7 +28,27 @@ typedef struct {
     const float *sec_b;  /* [768] */
     float sec_min, sec_max;
     int sample_rate;
+    /* text path (lazily loaded on first text prompt) */
+    aria_t5enc *enc;
+    aria_tokenizer *tok;
 } sa3_state;
+
+/* Load the T5Gemma encoder + tokenizer on demand (text prompts only). */
+static int sa3_ensure_text(aria_ctx *ctx, sa3_state *st) {
+    if (st->enc && st->tok) return 0;
+    if (!st->enc) st->enc = aria_t5enc_load(ctx->model_dir, "t5gemma-b-b-ul2", ctx->sf);
+    if (!st->tok) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/t5gemma-b-b-ul2/aria_tokenizer.bin", ctx->model_dir);
+        st->tok = aria_tokenizer_load(path);
+    }
+    if (!st->enc || !st->tok) {
+        aria_set_error("generate: text prompts need the T5Gemma weights and the exported "
+                       "tokenizer (run: python scripts/export_tokenizer.py <model_dir>)");
+        return -1;
+    }
+    return 0;
+}
 
 static int sa3_detect(const char *model_type) {
     return strcmp(model_type, "diffusion_cond_inpaint") == 0 ||
@@ -76,6 +98,8 @@ static void sa3_unload(void *state) {
     if (!st) return;
     aria_sa3_dit_free(st->dit);
     aria_sa3_dec_free(st->dec);
+    if (st->enc) aria_t5enc_free(st->enc);
+    if (st->tok) aria_tokenizer_free(st->tok);
     free(st);   /* sec_w/sec_b are borrowed from the mmap */
     return;
 }
@@ -90,15 +114,20 @@ static void sa3_denoise(void *c, const float *x, float t, float *v, int n) {
 
 static int sa3_generate(aria_ctx *ctx, void *state,
                         const aria_gen_params *p, aria_audio **out) {
-    (void)ctx;
     sa3_state *st = state;
     const int ED = 768;       /* cond_token_dim */
     const int N_PROMPT = 256; /* T5Gemma tokens */
 
-    /* prompt embedding [256,768]: precomputed file, or zeros (unconditional) */
+    /* prompt embedding [256,768]: text -> tokenize+encode, or precomputed file, or zeros */
     float *prompt = calloc((size_t)N_PROMPT * ED, sizeof(float));
     aria_parity_tensor pe; int have_pe = 0;
-    if (p->prompt_embed_path) {
+    if (p->prompt && p->prompt[0]) {
+        if (sa3_ensure_text(ctx, st) != 0) { free(prompt); return -1; }
+        int ids[256];
+        int n_real = aria_tokenizer_encode(st->tok, p->prompt, ids, N_PROMPT);
+        if (n_real < 0) { aria_set_error("generate: tokenization failed"); free(prompt); return -1; }
+        aria_t5enc_encode(st->enc, prompt, ids, N_PROMPT, n_real);
+    } else if (p->prompt_embed_path) {
         if (aria_parity_load(p->prompt_embed_path, &pe) != 0 || pe.ndim != 2 ||
             pe.shape[0] != N_PROMPT || pe.shape[1] != ED) {
             aria_set_error("generate: prompt-embed must be a [256,768] .atns file");
@@ -106,10 +135,8 @@ static int sa3_generate(aria_ctx *ctx, void *state,
         }
         memcpy(prompt, pe.data, (size_t)N_PROMPT * ED * sizeof(float));
         have_pe = 1;
-    } else if (p->prompt && p->prompt[0]) {
-        aria_set_error("generate: text prompts need T5Gemma (not yet ported); pass a precomputed --prompt-embed");
-        free(prompt); return -1;
     }
+    /* else: unconditional (zeros) */
 
     /* seconds_total embedding [768] -> cross token + global cond */
     float sec_emb[768];
