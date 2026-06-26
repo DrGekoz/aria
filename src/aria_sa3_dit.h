@@ -17,6 +17,9 @@
 #ifndef ARIA_SA3_DIT_H
 #define ARIA_SA3_DIT_H
 
+#include "aria_safetensors.h"
+#include "aria_sa3.h"
+
 /* Two-layer MLP: Linear(in_dim->mid, W0,b0) -> SiLU -> Linear(mid->out_dim, W2,b2),
  * applied to N rows. b0/b2 may be NULL (no bias). out [N, out_dim]. */
 void aria_sa3_mlp2(float *out, const float *in, int N, int in_dim, int mid, int out_dim,
@@ -44,5 +47,23 @@ void aria_dit_block_forward(float *x, int S, int dim, int num_heads, int head_di
                             const float *global_cond,
                             const float *rope_cos, const float *rope_sin, int rot_dim,
                             const aria_dit_block_w *w);
+
+/* ---- full DiT model ---- */
+
+typedef struct aria_sa3_dit aria_sa3_dit;
+
+/* Load all DiT weights (model.model.*) from sf using cfg. Returns NULL on a
+ * missing tensor. Weights are copied to f32 buffers owned by the model. */
+aria_sa3_dit *aria_sa3_dit_load(safetensors_file_t *sf, const aria_sa3_config *cfg);
+void aria_sa3_dit_free(aria_sa3_dit *m);
+
+/* Denoiser forward (matches DiffusionTransformer._forward, batch=1).
+ *   x_CT, out_CT: latent [io_channels, T] (channel-major).
+ *   t: diffusion timestep scalar.
+ *   cross_768: [n_cond, cond_token_dim] raw cross-attn cond (pre to_cond_embed).
+ *   global_768: [global_cond_dim] raw global cond (seconds, pre to_global_embed).
+ * Returns velocity in out_CT. */
+void aria_sa3_dit_forward(const aria_sa3_dit *m, float *out_CT, const float *x_CT, int T,
+                          float t, const float *cross_768, int n_cond, const float *global_768);
 
 #endif /* ARIA_SA3_DIT_H */

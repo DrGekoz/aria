@@ -172,6 +172,47 @@ def dump_dit_block(model_dir, out_dir):
     print(f"dumped DiT block-0 reference to {d} (S={S}, Sc={Sc})")
 
 
+def dump_dit_full(model_dir, out_dir):
+    """Full DiT denoiser_forward: instantiate the real DiffusionTransformer from
+    the config, load model.model.* weights, run _forward on seeded synthetic
+    conditioning (bypasses T5Gemma). C must reproduce the velocity output."""
+    from stable_audio_tools.models.dit import DiffusionTransformer
+
+    cfg = json.load(open(os.path.join(model_dir, "model_config.json")))
+    dcfg = cfg["model"]["diffusion"]["config"]
+    objective = cfg["model"]["diffusion"].get("diffusion_objective", "rf_denoiser")
+    dit = DiffusionTransformer(diffusion_objective=objective, **dcfg).eval()
+
+    prefix = "model.model."
+    sd = {}
+    with safe_open(os.path.join(model_dir, "model.safetensors"), framework="pt") as f:
+        for k in f.keys():
+            if k.startswith(prefix):
+                sd[k[len(prefix):]] = f.get_tensor(k)
+    missing, unexpected = dit.load_state_dict(sd, strict=False)
+    missing = [x for x in missing if "rope" not in x and "inv_freq" not in x]
+    if missing:
+        print(f"  WARNING dit missing keys: {missing[:8]}{'...' if len(missing) > 8 else ''}")
+
+    torch.manual_seed(5)
+    T, n_cond = 16, 257
+    x = torch.randn(1, dcfg["io_channels"], T)
+    t = torch.tensor([0.3])
+    cross = torch.randn(1, n_cond, dcfg["cond_token_dim"])
+    glob = torch.randn(1, dcfg["global_cond_dim"])
+    with torch.no_grad():
+        out = dit._forward(x, t, cross_attn_cond=cross, global_embed=glob)
+
+    d = os.path.join(out_dir, "dit")
+    os.makedirs(d, exist_ok=True)
+    save_atns(os.path.join(d, "full_x.atns"), x.squeeze(0).float().cpu().numpy())       # [C,T]
+    save_atns(os.path.join(d, "full_cross.atns"), cross.squeeze(0).float().cpu().numpy())  # [257,768]
+    save_atns(os.path.join(d, "full_global.atns"), glob.squeeze(0).float().cpu().numpy())  # [768]
+    save_atns(os.path.join(d, "full_out.atns"), out.squeeze(0).float().cpu().numpy())     # [C,T]
+    save_atns(os.path.join(d, "full_t.atns"), np.array([0.3], dtype=np.float32))
+    print(f"dumped full DiT denoiser reference to {d} (T={T})")
+
+
 if __name__ == "__main__":
     model_dir = sys.argv[1]
     out_dir = sys.argv[2] if len(sys.argv) > 2 else "parity_dumps"
@@ -179,3 +220,4 @@ if __name__ == "__main__":
     dump_number_cond(model_dir, out_dir)
     dump_ops(out_dir)
     dump_dit_block(model_dir, out_dir)
+    dump_dit_full(model_dir, out_dir)

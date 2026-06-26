@@ -67,7 +67,7 @@ test: $(LIB)
 PYTHON    ?= ../sa3-sf-api/.venv/bin/python
 ARIA_MODEL ?=
 DUMPS     ?= build/parity_dumps
-PARITY_TESTS := test_number_cond test_attn test_dit
+PARITY_TESTS := test_number_cond test_attn test_dit test_dit_full
 parity: $(LIB)
 	@test -n "$(ARIA_MODEL)" || { echo "usage: make parity ARIA_MODEL=<model dir>"; exit 1; }
 	$(PYTHON) scripts/dump_phase1.py "$(ARIA_MODEL)" "$(DUMPS)"
