@@ -5,6 +5,7 @@
 #include "aria_sa3_dit.h"
 #include "aria_ops.h"
 #include "aria_cond.h"
+#include "aria_arena.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,72 +68,64 @@ static void gate_sigmoid(float *y, const float *gate, int S, int dim) {
     }
 }
 
-void aria_dit_block_forward(float *x, int S, int dim, int num_heads, int head_dim, int inner,
-                            const float *context, int Sc, int dim_ctx,
-                            const float *global_cond,
-                            const float *rope_cos, const float *rope_sin, int rot_dim,
-                            const aria_dit_block_w *w) {
-    int H = num_heads, hd = head_dim;
+/* Block forward with the cross-attention K/V already projected and head-split
+ * (cross_k/cross_v are [H, Sc, hd]; cross_k is post-k_norm). All temporaries come
+ * from `ar` (save/restore-scoped), so the hot loop never malloc/frees. */
+static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
+                           const float *cross_k, const float *cross_v, int Sc,
+                           const float *global_cond,
+                           const float *rope_cos, const float *rope_sin, int rot_dim,
+                           const aria_dit_block_w *w, aria_arena *ar) {
     const float eps_norm = 1e-5f, eps_qk = 1e-6f;
+    size_t mark = aria_arena_save(ar);
 
     /* modulation = to_scale_shift_gate + global_cond, chunked into 6 [dim] slices */
-    float *mod = malloc((size_t)6 * dim * sizeof(float));
+    float *mod = aria_arena_floats(ar, (size_t)6 * dim);
     for (int i = 0; i < 6 * dim; i++) mod[i] = w->to_scale_shift_gate[i] + global_cond[i];
     const float *scale_self = mod, *shift_self = mod + dim, *gate_self = mod + 2 * dim;
     const float *scale_ff = mod + 3 * dim, *shift_ff = mod + 4 * dim, *gate_ff = mod + 5 * dim;
 
-    float *residual = malloc((size_t)S * dim * sizeof(float));
-    float *h = malloc((size_t)S * dim * sizeof(float));
-    float *o = malloc((size_t)S * dim * sizeof(float));
-    float *merged = malloc((size_t)S * dim * sizeof(float));
-    float *qh = malloc((size_t)H * S * hd * sizeof(float));
-    float *kh = malloc((size_t)H * S * hd * sizeof(float));
-    float *vh = malloc((size_t)H * S * hd * sizeof(float));
-    float *ao = malloc((size_t)H * S * hd * sizeof(float));
+    float *residual = aria_arena_floats(ar, (size_t)S * dim);
+    float *h        = aria_arena_floats(ar, (size_t)S * dim);
+    float *o        = aria_arena_floats(ar, (size_t)S * dim);
+    float *merged   = aria_arena_floats(ar, (size_t)S * dim);
+    float *qh       = aria_arena_floats(ar, (size_t)H * S * hd);
+    float *kh       = aria_arena_floats(ar, (size_t)H * S * hd);
+    float *vh       = aria_arena_floats(ar, (size_t)H * S * hd);
+    float *ao       = aria_arena_floats(ar, (size_t)H * S * hd);
+    float *scores   = aria_arena_floats(ar, (size_t)S * (S > Sc ? S : Sc));
 
     /* ---------- self-attention ---------- */
     memcpy(residual, x, (size_t)S * dim * sizeof(float));
     aria_rmsnorm(h, x, w->pre_norm, S, dim, eps_norm);
     adaln_modulate(h, scale_self, shift_self, S, dim);
     {
-        float *qkv = malloc((size_t)S * 3 * dim * sizeof(float));
+        float *qkv = aria_arena_floats(ar, (size_t)S * 3 * dim);
         aria_linear(qkv, h, w->sa_to_qkv, NULL, S, dim, 3 * dim);
         extract_heads(qh, qkv, S, H, hd, 3 * dim, 0);
         extract_heads(kh, qkv, S, H, hd, 3 * dim, dim);
         extract_heads(vh, qkv, S, H, hd, 3 * dim, 2 * dim);
-        free(qkv);
     }
     aria_rmsnorm(qh, qh, w->sa_q_norm, H * S, hd, eps_qk);
     aria_rmsnorm(kh, kh, w->sa_k_norm, H * S, hd, eps_qk);
     aria_rope_apply(qh, rope_cos, rope_sin, H, S, hd, rot_dim);
     aria_rope_apply(kh, rope_cos, rope_sin, H, S, hd, rot_dim);
-    aria_attention(ao, qh, kh, vh, H, S, S, hd, NULL);
+    aria_attention(ao, qh, kh, vh, H, S, S, hd, NULL, scores);
     merge_heads(merged, ao, S, H, hd);
     aria_linear(o, merged, w->sa_to_out, NULL, S, dim, dim);
     gate_sigmoid(o, gate_self, S, dim);
     for (size_t i = 0; i < (size_t)S * dim; i++) x[i] = residual[i] + o[i];
 
-    /* ---------- cross-attention (no rope, no gate) ---------- */
+    /* ---------- cross-attention (cached K/V, no rope, no gate) ---------- */
     memcpy(residual, x, (size_t)S * dim * sizeof(float));
     aria_rmsnorm(h, x, w->cross_norm, S, dim, eps_norm);
     {
-        float *q = malloc((size_t)S * dim * sizeof(float));
+        float *q = aria_arena_floats(ar, (size_t)S * dim);
         aria_linear(q, h, w->ca_to_q, NULL, S, dim, dim);
         extract_heads(qh, q, S, H, hd, dim, 0);
-        free(q);
-        float *kv = malloc((size_t)Sc * 2 * dim * sizeof(float));
-        aria_linear(kv, context, w->ca_to_kv, NULL, Sc, dim_ctx, 2 * dim);
-        float *kc = malloc((size_t)H * Sc * hd * sizeof(float));
-        float *vc = malloc((size_t)H * Sc * hd * sizeof(float));
-        float *aoc = malloc((size_t)H * S * hd * sizeof(float));
-        extract_heads(kc, kv, Sc, H, hd, 2 * dim, 0);
-        extract_heads(vc, kv, Sc, H, hd, 2 * dim, dim);
-        free(kv);
         aria_rmsnorm(qh, qh, w->ca_q_norm, H * S, hd, eps_qk);
-        aria_rmsnorm(kc, kc, w->ca_k_norm, H * Sc, hd, eps_qk);
-        aria_attention(aoc, qh, kc, vc, H, S, Sc, hd, NULL);
-        merge_heads(merged, aoc, S, H, hd);
-        free(kc); free(vc); free(aoc);
+        aria_attention(ao, qh, cross_k, cross_v, H, S, Sc, hd, NULL, scores);
+        merge_heads(merged, ao, S, H, hd);
     }
     aria_linear(o, merged, w->ca_to_out, NULL, S, dim, dim);
     for (size_t i = 0; i < (size_t)S * dim; i++) x[i] = residual[i] + o[i];
@@ -141,12 +134,41 @@ void aria_dit_block_forward(float *x, int S, int dim, int num_heads, int head_di
     memcpy(residual, x, (size_t)S * dim * sizeof(float));
     aria_rmsnorm(h, x, w->ff_norm, S, dim, eps_norm);
     adaln_modulate(h, scale_ff, shift_ff, S, dim);
-    aria_ff_glu(o, h, S, dim, inner, dim, w->ff_in_w, w->ff_in_b, w->ff_out_w, w->ff_out_b);
+    {
+        float *ffs = aria_arena_floats(ar, (size_t)S * 3 * inner);
+        aria_ff_glu(o, h, S, dim, inner, dim, w->ff_in_w, w->ff_in_b, w->ff_out_w, w->ff_out_b, ffs);
+    }
     gate_sigmoid(o, gate_ff, S, dim);
     for (size_t i = 0; i < (size_t)S * dim; i++) x[i] = residual[i] + o[i];
 
-    free(mod); free(residual); free(h); free(o); free(merged);
-    free(qh); free(kh); free(vh); free(ao);
+    aria_arena_restore(ar, mark);
+}
+
+/* Standalone block forward (used by the block parity test): projects the cross
+ * K/V from `context` here, then runs the shared core on a private arena. */
+void aria_dit_block_forward(float *x, int S, int dim, int num_heads, int head_dim, int inner,
+                            const float *context, int Sc, int dim_ctx,
+                            const float *global_cond,
+                            const float *rope_cos, const float *rope_sin, int rot_dim,
+                            const aria_dit_block_w *w) {
+    int H = num_heads, hd = head_dim;
+    float *kv = malloc((size_t)Sc * 2 * dim * sizeof(float));
+    float *cross_k = malloc((size_t)H * Sc * hd * sizeof(float));
+    float *cross_v = malloc((size_t)H * Sc * hd * sizeof(float));
+    aria_linear(kv, context, w->ca_to_kv, NULL, Sc, dim_ctx, 2 * dim);
+    extract_heads(cross_k, kv, Sc, H, hd, 2 * dim, 0);
+    extract_heads(cross_v, kv, Sc, H, hd, 2 * dim, dim);
+    aria_rmsnorm(cross_k, cross_k, w->ca_k_norm, H * Sc, hd, 1e-6f);
+    free(kv);
+
+    aria_arena ar;
+    size_t cap = ((size_t)6 * dim + 24 * (size_t)S * dim + (size_t)S * (S > Sc ? S : Sc)
+                  + (1u << 18)) * sizeof(float);
+    aria_arena_init(&ar, cap);
+    dit_block_core(x, S, dim, H, hd, inner, cross_k, cross_v, Sc, global_cond,
+                   rope_cos, rope_sin, rot_dim, w, &ar);
+    aria_arena_free(&ar);
+    free(cross_k); free(cross_v);
 }
 
 /* ---------------- full DiT model ---------------- */
@@ -252,58 +274,121 @@ static void transpose_tc_ct(float *dst, const float *src, int T, int C) {
             dst[(size_t)c * T + t] = src[(size_t)t * C + c];
 }
 
-void aria_sa3_dit_forward(const aria_sa3_dit *m, float *out_CT, const float *x_CT, int T,
-                          float t, const float *cross_768, int n_cond, const float *global_768) {
-    int C = m->io_ch, ed = m->ed, Mt = m->n_mem, S = Mt + T, rot = m->rot_dim;
+/* ---------------- per-request context ----------------
+ * Immutable model state (weights) lives in aria_sa3_dit; everything that is
+ * scratch or step-invariant for one generation lives here, so the N denoising
+ * steps reuse a single arena and never reproject the constant prompt context. */
+struct aria_sa3_dit_req {
+    const aria_sa3_dit *m;
+    int T, S, n_cond;
+    aria_arena arena;
+    float *cross_ed;        /* [n_cond, ed]  to_cond_embed(prompt) */
+    float *global_seconds;  /* [ed]          to_global_embed(seconds) (timestep added per step) */
+    float *rope_cos, *rope_sin;             /* [S, rot/2] */
+    float **cross_k, **cross_v;             /* [depth] each [H, n_cond, hd]; cross_k post k_norm */
+};
 
-    /* conditioning embeddings */
-    float *cross_ed = malloc((size_t)n_cond * ed * sizeof(float));
-    aria_sa3_mlp2(cross_ed, cross_768, n_cond, m->cond_dim, ed, ed, m->to_cond0, NULL, m->to_cond2, NULL);
+aria_sa3_dit_req *aria_sa3_dit_req_begin(const aria_sa3_dit *m, int T,
+                                         const float *cross_768, int n_cond,
+                                         const float *global_768) {
+    int ed = m->ed, H = m->num_heads, hd = m->head_dim, dim = ed;
+    int S = m->n_mem + T, rot = m->rot_dim, depth = m->depth;
+    aria_sa3_dit_req *r = calloc(1, sizeof(*r));
+    if (!r) return NULL;
+    r->m = m; r->T = T; r->S = S; r->n_cond = n_cond;
 
-    float *global_ed = malloc((size_t)ed * sizeof(float));
-    aria_sa3_mlp2(global_ed, global_768, 1, m->cond_dim, ed, ed, m->to_global0, NULL, m->to_global2, NULL);
-    float *ts = malloc((size_t)ed * sizeof(float));
-    aria_sa3_timestep_embed(ts, t, m->ts_feat_dim, ed, m->to_ts0_w, m->to_ts0_b, m->to_ts2_w, m->to_ts2_b);
-    for (int i = 0; i < ed; i++) global_ed[i] += ts[i];
+    /* step-invariant conditioning */
+    r->cross_ed = malloc((size_t)n_cond * ed * sizeof(float));
+    aria_sa3_mlp2(r->cross_ed, cross_768, n_cond, m->cond_dim, ed, ed, m->to_cond0, NULL, m->to_cond2, NULL);
+    r->global_seconds = malloc((size_t)ed * sizeof(float));
+    aria_sa3_mlp2(r->global_seconds, global_768, 1, m->cond_dim, ed, ed, m->to_global0, NULL, m->to_global2, NULL);
 
-    float *gcond = malloc((size_t)6 * ed * sizeof(float));
-    aria_sa3_mlp2(gcond, global_ed, 1, ed, ed, 6 * ed, m->gce0_w, m->gce0_b, m->gce2_w, m->gce2_b);
+    r->rope_cos = malloc((size_t)S * (rot / 2) * sizeof(float));
+    r->rope_sin = malloc((size_t)S * (rot / 2) * sizeof(float));
+    aria_rope_freqs(r->rope_cos, r->rope_sin, S, rot, 10000.0f);
+
+    /* per-block cross-attention K/V: projected once from cross_ed (constant across
+     * all steps), head-split, with k_norm folded into the cached K. */
+    r->cross_k = calloc((size_t)depth, sizeof(float *));
+    r->cross_v = calloc((size_t)depth, sizeof(float *));
+    float *kv = malloc((size_t)n_cond * 2 * dim * sizeof(float));
+    for (int b = 0; b < depth; b++) {
+        const aria_dit_block_w *w = &m->blocks[b];
+        aria_linear(kv, r->cross_ed, w->ca_to_kv, NULL, n_cond, ed, 2 * dim);
+        r->cross_k[b] = malloc((size_t)H * n_cond * hd * sizeof(float));
+        r->cross_v[b] = malloc((size_t)H * n_cond * hd * sizeof(float));
+        extract_heads(r->cross_k[b], kv, n_cond, H, hd, 2 * dim, 0);
+        extract_heads(r->cross_v[b], kv, n_cond, H, hd, 2 * dim, dim);
+        aria_rmsnorm(r->cross_k[b], r->cross_k[b], w->ca_k_norm, H * n_cond, hd, 1e-6f);
+    }
+    free(kv);
+
+    /* arena holds the persistent residual stream + step input scratch + one block's
+     * worth of temporaries (blocks save/restore, so only one is live at a time). */
+    int inner = m->inner;
+    size_t block_floats = (size_t)6 * dim + 24 * (size_t)S * dim + (size_t)S * (S > n_cond ? S : n_cond);
+    (void)inner;  /* 3*S*inner == 12*S*dim is already inside the 24*S*dim bound */
+    size_t step_floats  = (size_t)S * ed + 8 * (size_t)T * m->io_ch + 8 * (size_t)ed;
+    aria_arena_init(&r->arena, (block_floats + step_floats + (1u << 20)) * sizeof(float));
+    return r;
+}
+
+void aria_sa3_dit_step(const aria_sa3_dit *m, aria_sa3_dit_req *r,
+                       float *out_CT, const float *x_CT, float t) {
+    int C = m->io_ch, ed = m->ed, Mt = m->n_mem, S = r->S, T = r->T, rot = m->rot_dim;
+    aria_arena *ar = &r->arena;
+    size_t mark = aria_arena_save(ar);
+
+    /* global_cond = global_cond_embedder(global_seconds + timestep_embed(t)) */
+    float *g = aria_arena_floats(ar, (size_t)ed);
+    aria_sa3_timestep_embed(g, t, m->ts_feat_dim, ed, m->to_ts0_w, m->to_ts0_b, m->to_ts2_w, m->to_ts2_b);
+    for (int i = 0; i < ed; i++) g[i] += r->global_seconds[i];
+    float *gcond = aria_arena_floats(ar, (size_t)6 * ed);
+    aria_sa3_mlp2(gcond, g, 1, ed, ed, 6 * ed, m->gce0_w, m->gce0_b, m->gce2_w, m->gce2_b);
 
     /* preprocess_conv(x) + x  (1x1 conv over channels), x: [C,T] -> [T,C] */
-    float *xtc = malloc((size_t)T * C * sizeof(float));
+    float *xtc = aria_arena_floats(ar, (size_t)T * C);
     transpose_ct_tc(xtc, x_CT, C, T);
-    float *pre = malloc((size_t)T * C * sizeof(float));
+    float *pre = aria_arena_floats(ar, (size_t)T * C);
     aria_linear(pre, xtc, m->preprocess, NULL, T, C, C);
     for (size_t i = 0; i < (size_t)T * C; i++) xtc[i] += pre[i];
-    free(pre);
 
     /* project_in [T,C] -> [T,ed], prepend memory tokens -> seq [S,ed] */
-    float *seq = malloc((size_t)S * ed * sizeof(float));
+    float *seq = aria_arena_floats(ar, (size_t)S * ed);
     memcpy(seq, m->memory_tokens, (size_t)Mt * ed * sizeof(float));
     aria_linear(seq + (size_t)Mt * ed, xtc, m->project_in, NULL, T, C, ed);
-    free(xtc);
-
-    /* rope over the full sequence */
-    float *cosb = malloc((size_t)S * (rot / 2) * sizeof(float));
-    float *sinb = malloc((size_t)S * (rot / 2) * sizeof(float));
-    aria_rope_freqs(cosb, sinb, S, rot, 10000.0f);
 
     for (int b = 0; b < m->depth; b++)
-        aria_dit_block_forward(seq, S, ed, m->num_heads, m->head_dim, m->inner,
-                               cross_ed, n_cond, ed, gcond, cosb, sinb, rot, &m->blocks[b]);
+        dit_block_core(seq, S, ed, m->num_heads, m->head_dim, m->inner,
+                       r->cross_k[b], r->cross_v[b], r->n_cond, gcond,
+                       r->rope_cos, r->rope_sin, rot, &m->blocks[b], ar);
 
     /* strip memory tokens, project_out [T,ed] -> [T,C] */
-    float *outtc = malloc((size_t)T * C * sizeof(float));
+    float *outtc = aria_arena_floats(ar, (size_t)T * C);
     aria_linear(outtc, seq + (size_t)Mt * ed, m->project_out, NULL, T, ed, C);
 
     /* postprocess_conv(out) + out */
-    float *postc = malloc((size_t)T * C * sizeof(float));
+    float *postc = aria_arena_floats(ar, (size_t)T * C);
     aria_linear(postc, outtc, m->postprocess, NULL, T, C, C);
     for (size_t i = 0; i < (size_t)T * C; i++) outtc[i] += postc[i];
-    free(postc);
 
     transpose_tc_ct(out_CT, outtc, T, C);
+    aria_arena_restore(ar, mark);
+}
 
-    free(cross_ed); free(global_ed); free(ts); free(gcond);
-    free(seq); free(cosb); free(sinb); free(outtc);
+void aria_sa3_dit_req_end(aria_sa3_dit_req *r) {
+    if (!r) return;
+    aria_arena_free(&r->arena);
+    free(r->cross_ed); free(r->global_seconds); free(r->rope_cos); free(r->rope_sin);
+    if (r->cross_k) for (int b = 0; b < r->m->depth; b++) free(r->cross_k[b]);
+    if (r->cross_v) for (int b = 0; b < r->m->depth; b++) free(r->cross_v[b]);
+    free(r->cross_k); free(r->cross_v);
+    free(r);
+}
+
+void aria_sa3_dit_forward(const aria_sa3_dit *m, float *out_CT, const float *x_CT, int T,
+                          float t, const float *cross_768, int n_cond, const float *global_768) {
+    aria_sa3_dit_req *r = aria_sa3_dit_req_begin(m, T, cross_768, n_cond, global_768);
+    aria_sa3_dit_step(m, r, out_CT, x_CT, t);
+    aria_sa3_dit_req_end(r);
 }

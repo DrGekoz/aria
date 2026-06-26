@@ -57,12 +57,22 @@ typedef struct aria_sa3_dit aria_sa3_dit;
 aria_sa3_dit *aria_sa3_dit_load(safetensors_file_t *sf, const aria_sa3_config *cfg);
 void aria_sa3_dit_free(aria_sa3_dit *m);
 
-/* Denoiser forward (matches DiffusionTransformer._forward, batch=1).
- *   x_CT, out_CT: latent [io_channels, T] (channel-major).
- *   t: diffusion timestep scalar.
- *   cross_768: [n_cond, cond_token_dim] raw cross-attn cond (pre to_cond_embed).
- *   global_768: [global_cond_dim] raw global cond (seconds, pre to_global_embed).
- * Returns velocity in out_CT. */
+/* Per-request context: a reusable scratch arena plus the step-invariant state
+ * cached once and reused across all denoising steps -- cross_ed (to_cond_embed),
+ * RoPE tables, to_global_embed(seconds), and the per-block cross-attention K/V
+ * (the prompt context is constant across steps, so it is projected just once). */
+typedef struct aria_sa3_dit_req aria_sa3_dit_req;
+
+aria_sa3_dit_req *aria_sa3_dit_req_begin(const aria_sa3_dit *m, int T,
+                                         const float *cross_768, int n_cond,
+                                         const float *global_768);
+/* one denoising step: out_CT = velocity(x_CT, t), reusing the request's caches. */
+void aria_sa3_dit_step(const aria_sa3_dit *m, aria_sa3_dit_req *req,
+                       float *out_CT, const float *x_CT, float t);
+void aria_sa3_dit_req_end(aria_sa3_dit_req *req);
+
+/* One-shot denoiser forward (matches DiffusionTransformer._forward, batch=1) =
+ * begin + one step + end. x_CT/out_CT: latent [io_channels, T] (channel-major). */
 void aria_sa3_dit_forward(const aria_sa3_dit *m, float *out_CT, const float *x_CT, int T,
                           float t, const float *cross_768, int n_cond, const float *global_768);
 

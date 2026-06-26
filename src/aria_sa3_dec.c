@@ -90,8 +90,8 @@ static void taae_block_forward(float *xc, int N, const taae_block_w *w,
     aria_rope_apply(qd, rcos, rsin, H, N, hd, DEC_ROT);
     aria_rope_apply(k,  rcos, rsin, H, N, hd, DEC_ROT);
     aria_rope_apply(kd, rcos, rsin, H, N, hd, DEC_ROT);
-    aria_attention(ob, q,  k,  v, H, N, N, hd, NULL);
-    aria_attention(od, qd, kd, v, H, N, N, hd, NULL);
+    aria_attention(ob, q,  k,  v, H, N, N, hd, NULL, NULL);
+    aria_attention(od, qd, kd, v, H, N, N, hd, NULL, NULL);
     for (size_t i = 0; i < (size_t)H * N * hd; i++) ob[i] -= od[i];
     merge_heads(merged, ob, N, H, hd);
     aria_linear(o, merged, w->to_out, NULL, N, D, D);
@@ -100,7 +100,7 @@ static void taae_block_forward(float *xc, int N, const taae_block_w *w,
     /* feed-forward (SwiGLU) */
     memcpy(res, xc, (size_t)N * D * sizeof(float));
     aria_dynamic_tanh(h, xc, w->ff_alpha, w->ff_gamma, w->ff_beta, N, D);
-    aria_ff_glu(o, h, N, D, DEC_INNER, D, w->ff_in_w, w->ff_in_b, w->ff_out_w, w->ff_out_b);
+    aria_ff_glu(o, h, N, D, DEC_INNER, D, w->ff_in_w, w->ff_in_b, w->ff_out_w, w->ff_out_b, NULL);
     for (size_t i = 0; i < (size_t)N * D; i++) xc[i] = res[i] + o[i];
 
     free(h); free(res); free(qkv); free(q); free(k); free(v); free(qd); free(kd);

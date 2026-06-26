@@ -57,7 +57,7 @@ int main(void) {
         int H = (int)q.shape[0], Nq = (int)q.shape[1], D = (int)q.shape[2];
         int Nk = (int)k.shape[1];
         float *out = malloc((size_t)o.numel * sizeof(float));
-        aria_attention(out, q.data, k.data, v.data, H, Nq, Nk, D, NULL);
+        aria_attention(out, q.data, k.data, v.data, H, Nq, Nk, D, NULL, NULL);
         compare("attention", out, o.data, o.numel);
         free(out);
         aria_parity_free(&q); aria_parity_free(&k); aria_parity_free(&v); aria_parity_free(&o);
@@ -73,7 +73,7 @@ int main(void) {
         int two_inner = (int)Win.shape[0], inner = two_inner / 2;
         int dim_out = (int)Wout.shape[0];
         float *out = malloc((size_t)N * dim_out * sizeof(float));
-        aria_ff_glu(out, x.data, N, dim, inner, dim_out, Win.data, bin.data, Wout.data, bout.data);
+        aria_ff_glu(out, x.data, N, dim, inner, dim_out, Win.data, bin.data, Wout.data, bout.data, NULL);
         compare("ff_glu", out, y.data, (int64_t)N * dim_out);
         free(out);
         aria_parity_free(&x); aria_parity_free(&y); aria_parity_free(&Win);

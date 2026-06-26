@@ -66,9 +66,10 @@ void aria_rope_apply(float *x, const float *cos_t, const float *sin_t,
 
 /* Multi-head scaled-dot-product attention, bidirectional (non-causal).
  * q [H,Nq,D], k/v [H,Nk,D], out [H,Nq,D]. scale = 1/sqrt(D) (SDPA default).
- * Optional additive mask [Nq,Nk] (e.g. -inf for padding) or NULL. */
+ * Optional additive mask [Nq,Nk] (e.g. -inf for padding) or NULL.
+ * scratch: [Nq*Nk] floats, or NULL to malloc internally. */
 void aria_attention(float *out, const float *q, const float *k, const float *v,
-                    int H, int Nq, int Nk, int D, const float *mask);
+                    int H, int Nq, int Nk, int D, const float *mask, float *scratch);
 
 /* ---- conv1d (stride 1, pre-folded weights) ---- */
 
@@ -82,10 +83,10 @@ void aria_conv1d(float *out, const float *in, const float *w, const float *bias,
 
 /* FeedForward: proj x[N,dim] -> [N,2*inner] via W_in[2*inner,dim](+b_in),
  * GLU combine value*SiLU(gate) (value = first half), then W_out[dim_out,inner]
- * (+b_out) -> out[N,dim_out]. Allocates internal scratch. */
+ * (+b_out) -> out[N,dim_out]. scratch: [N*3*inner] floats, or NULL to malloc. */
 void aria_ff_glu(float *out, const float *x, int N, int dim, int inner, int dim_out,
                  const float *W_in, const float *b_in,
-                 const float *W_out, const float *b_out);
+                 const float *W_out, const float *b_out, float *scratch);
 
 /* ---- softmax over rows ---- */
 /* In-place row softmax. x is [rows, cols]. Optional additive mask [rows,cols]

@@ -104,12 +104,13 @@ static void sa3_unload(void *state) {
     return;
 }
 
-/* denoiser closure for the pingpong sampler */
-typedef struct { const aria_sa3_dit *dit; const float *cross; const float *global; int T; int n_cond; } sa3_dctx;
+/* denoiser closure for the pingpong sampler: one request context, reused across
+ * all steps (cross_ed / RoPE / per-block cross K/V are cached in the req). */
+typedef struct { const aria_sa3_dit *dit; aria_sa3_dit_req *req; } sa3_dctx;
 static void sa3_denoise(void *c, const float *x, float t, float *v, int n) {
     (void)n;
     const sa3_dctx *d = c;
-    aria_sa3_dit_forward(d->dit, v, x, d->T, t, d->cross, d->n_cond, d->global);
+    aria_sa3_dit_step(d->dit, d->req, v, x, t);
 }
 
 static int sa3_generate(aria_ctx *ctx, void *state,
@@ -165,8 +166,10 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     float *sched = malloc((size_t)(steps + 1) * sizeof(float));
     aria_logsnr_schedule(sched, steps, 1.0f, -6.2f, 2000.0f, 1.0f, 2.0f, (float)T);
 
-    sa3_dctx dc = { st->dit, cross, sec_emb, T, n_cond };
+    aria_sa3_dit_req *req = aria_sa3_dit_req_begin(st->dit, T, cross, n_cond, sec_emb);
+    sa3_dctx dc = { st->dit, req };
     aria_pingpong(x, n, sched, steps, sa3_denoise, &dc, &rng, NULL);
+    aria_sa3_dit_req_end(req);
 
     /* decode -> interleaved stereo */
     float *audio = malloc((size_t)2 * T * 4096 * sizeof(float));

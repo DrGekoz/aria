@@ -303,9 +303,9 @@ void aria_rope_apply(float *x, const float *cos_t, const float *sin_t,
 }
 
 void aria_attention(float *out, const float *q, const float *k, const float *v,
-                    int H, int Nq, int Nk, int D, const float *mask) {
+                    int H, int Nq, int Nk, int D, const float *mask, float *scratch) {
     float scale = 1.0f / sqrtf((float)D);
-    float *scores = malloc((size_t)Nq * Nk * sizeof(float));
+    float *scores = scratch ? scratch : malloc((size_t)Nq * Nk * sizeof(float));
     if (!scores) return;
     for (int h = 0; h < H; h++) {
         const float *qh = q + (size_t)h * Nq * D;
@@ -318,7 +318,7 @@ void aria_attention(float *out, const float *q, const float *k, const float *v,
         aria_softmax_inplace(scores, Nq, Nk, mask);
         aria_matmul(oh, scores, vh, Nq, Nk, D);
     }
-    free(scores);
+    if (!scratch) free(scores);
 }
 
 void aria_conv1d(float *out, const float *in, const float *w, const float *bias,
@@ -346,10 +346,10 @@ void aria_conv1d(float *out, const float *in, const float *w, const float *bias,
 
 void aria_ff_glu(float *out, const float *x, int N, int dim, int inner, int dim_out,
                  const float *W_in, const float *b_in,
-                 const float *W_out, const float *b_out) {
-    float *proj = malloc((size_t)N * 2 * inner * sizeof(float));
-    float *gated = malloc((size_t)N * inner * sizeof(float));
-    if (!proj || !gated) { free(proj); free(gated); return; }
+                 const float *W_out, const float *b_out, float *scratch) {
+    float *proj  = scratch ? scratch : malloc((size_t)N * 2 * inner * sizeof(float));
+    float *gated = scratch ? scratch + (size_t)N * 2 * inner : malloc((size_t)N * inner * sizeof(float));
+    if (!proj || !gated) { if (!scratch) { free(proj); free(gated); } return; }
     aria_linear(proj, x, W_in, b_in, N, dim, 2 * inner);
     for (int n = 0; n < N; n++) {
         const float *pr = proj + (size_t)n * 2 * inner;
@@ -357,8 +357,7 @@ void aria_ff_glu(float *out, const float *x, int N, int dim, int inner, int dim_
         aria_silu_gate(gated + (size_t)n * inner, pr + inner, pr, inner);
     }
     aria_linear(out, gated, W_out, b_out, N, inner, dim_out);
-    free(proj);
-    free(gated);
+    if (!scratch) { free(proj); free(gated); }
 }
 
 void aria_add(float *y, const float *a, const float *b, int n) {
