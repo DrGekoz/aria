@@ -24,6 +24,7 @@ int8/q4 quantization, as a library + CLI — all parity-gated.
 | **M4** | CUDA end-to-end generation | E8.5 |
 | **M5** | Quantized (Q4) — medium fits low VRAM | E9.4 |
 | **M6** | medium model end-to-end | E10.2 |
+| **M7** | Steering (TasteSteer): latent + DiT-residual + cond-space injection, training-free | E12.7 |
 | **v1.0.0** | Release checklist green | E11.7 |
 
 ## Status snapshot
@@ -147,7 +148,26 @@ M2.
 - ⬜ **E11.4** **P2** CPU perf pass (SIMD hot paths, threading). deps: E2.9 · Verify: benchmark targets, parity unchanged.
 - ⬜ **E11.5** **P1** Docs: README usage, model-prep guide, AGENTS current. Verify: a fresh user can build + generate.
 - ⬜ **E11.6** **P2** CI (`make test` on push) + parity smoke. Verify: CI green.
-- ⬜ **E11.7** **P1** **v1.0.0 checklist**: small-music + medium · text→audio + continue + inpaint · CPU + CUDA · Q8/Q4 · all parity green · docs. **← v1.0.0**
+- ⬜ **E11.7** **P1** **v1.0.0 checklist**: small-music + medium · text→audio + continue + inpaint · CPU + CUDA · Q8/Q4 · steering hooks (E12, recommended — research driver) · all parity green · docs. **← v1.0.0**
+
+## E12 — Steering (TasteSteer: training-free activation/representation steering)
+
+Why: this runtime is the efficient inference vehicle for taste steering of SA3
+(SAME-latent vs DiT-residual, steering-vs-LoRA, training-free core). The C runtime
+exposes every intermediate tensor, so steering is an elementwise `x += α·d` at a
+known op boundary plus a spec struct. **Can start as soon as M1 lands** and runs
+in parallel with E7/E8/E9. Directions are `.atns` vectors; the parity harness
+doubles as the activation-extraction path.
+
+- ⬜ **E12.1** **P1** Steering spec + dispatch: `aria_steer` struct (`site`, `layer`, `dir`, `scale`, `step_lo/hi`) + a steer set threaded through `aria_generate`; orchestrator applies steers at registered hooks. deps: E6.4 · Verify: empty/scale-0 steer set ⇒ bitwise-identical output vs unsteered; non-zero scale changes output deterministically.
+- ⬜ **E12.2** **P1** Diffusion-latent steering (256-D SAME arm) hook in the sampler loop, with step-window gating. deps: E12.1, E6.3 · Verify: unit test — injecting known `d` adds exactly `α·d` to `x` only within `[step_lo,step_hi]`; α=0 ≡ unsteered.
+- ⬜ **E12.3** **P1** DiT residual-stream steering (per-layer 1024-D arm) hook after the chosen layer's residual add. deps: E12.1, E4.4 · Verify: steering layer L perturbs activations from L onward only; per-layer add matches expected; α=0 ≡ unsteered.
+- ⬜ **E12.4** **P1** Conditioning-space steering (global adaLN 1024-D + cross-attn cond tokens) hook. deps: E12.1, E1.4, E1.5 · Verify: direction on `global_cond` shifts modulation params deterministically; α=0 ≡ unsteered.
+- ⬜ **E12.5** `∥` **P2** Pre-decode latent steering hook (output-space nudge). deps: E12.1, E5.4 · Verify: direction added to latent pre-decode; α=0 ≡ unsteered.
+- ⬜ **E12.6** **P1** `.atns` activation extraction at each site (mean-pooled taps) so contrastive directions (e.g. sweet − neutral) can be built from C runs. deps: E12.2–E12.4 · Verify: tapped activation matches the site's parity dump; contrastive direction is reproducible across runs.
+- ⬜ **E12.7** **P1** CLI `--steer site:layer:dir.atns:scale:lo-hi` (repeatable) + direction loader. deps: E12.1 · Verify: parses multiple steers; produces measurably different, logged output. **← M7**
+- ⬜ **E12.8** `∥` **P2** Steering validation sweep (scale/layer/site) scored with the taste regressor (wav2taste / sonic-taste-regressor). deps: E12.7 · Verify: taste metric responds monotonically-ish to scale for a known direction; reproducible.
+- ⬜ **E12.9** **P2** (stretch) LoRA-style steering arm: `aria_linear_lora` op + adapter loader on chosen projections (the steering-vs-LoRA comparison). deps: E2.x, E4.4 · Verify: loaded adapter matches a Python LoRA forward within tol; zero-rank ≡ base.
 
 ## Post-1.0 (north star)
 
