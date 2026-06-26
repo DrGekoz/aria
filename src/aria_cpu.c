@@ -14,19 +14,34 @@
 #include <omp.h>
 #endif
 
+/* y[M,N] = x[M,K] @ W^T + b, W=[N,K] (PyTorch Linear).
+ * Blocked over output columns (NB) so each weight panel (NB*K) stays in L2 and is
+ * reused across all M rows; the inner dot is vectorized via omp-simd reduction
+ * (the float reduction won't auto-vectorize under strict FP otherwise). The
+ * vectorized summation order differs slightly from a scalar sweep -- within the
+ * parity tolerances. */
 void aria_linear(float *y, const float *x, const float *W, const float *b,
                  int M, int K, int N) {
+    const int NB = 32;                 /* NB*K*4 bytes ~ L2-resident weight panel */
+    int n_tiles = (N + NB - 1) / NB;
     #ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(dynamic)
     #endif
-    for (int m = 0; m < M; m++) {
-        const float *xr = x + (size_t)m * K;
-        float *yr = y + (size_t)m * N;
-        for (int n = 0; n < N; n++) {
-            const float *wr = W + (size_t)n * K;
-            float acc = b ? b[n] : 0.0f;
-            for (int k = 0; k < K; k++) acc += xr[k] * wr[k];
-            yr[n] = acc;
+    for (int tile = 0; tile < n_tiles; tile++) {
+        int n0 = tile * NB;
+        int n1 = (n0 + NB < N) ? n0 + NB : N;
+        for (int m = 0; m < M; m++) {
+            const float *xr = x + (size_t)m * K;
+            float *yr = y + (size_t)m * N;
+            for (int n = n0; n < n1; n++) {
+                const float *wr = W + (size_t)n * K;
+                float acc = b ? b[n] : 0.0f;
+                #ifdef _OPENMP
+                #pragma omp simd reduction(+:acc)
+                #endif
+                for (int k = 0; k < K; k++) acc += xr[k] * wr[k];
+                yr[n] = acc;
+            }
         }
     }
 }
