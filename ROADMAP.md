@@ -195,10 +195,12 @@ complementary strategies:
   durations pad to max-T or fall back to E13.1. deps: E13.1, E4.4 · Verify: a
   B-batch matches B singletons within parity tol; throughput/sample beats E13.1
   at the same core count.
-- ⬜ **E13.3** **P1** Extend the arena to the encoder/decoder forwards (still
-  `malloc` internally — thread-safe but with churn) so the *whole* pipeline is
-  per-request-scratch and fully concurrency-clean. deps: E2.9b · Verify: parity
-  unchanged; no per-request heap churn outside the arena.
+- ✅ **E13.3** **P1** Extend the arena to the encoder/decoder forwards. taae decoder
+  block (`taae_block_forward`, the ~650-call/gen hot path) now draws all scratch
+  from a save/restore arena instead of 12 `malloc`/`free`s per call; the T5Gemma
+  encoder uses one allocate-once arena for its whole forward. Whole pipeline is now
+  per-request-scratch with no hot-path heap churn. Bit-identical output; parity
+  green (test_dec / test_t5enc / test_e2e). ~12% faster end-to-end (interleaved A/B).
 
 ## Post-1.0 (north star)
 

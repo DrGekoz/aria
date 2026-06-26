@@ -4,6 +4,7 @@
 
 #include "aria_t5enc.h"
 #include "aria_ops.h"
+#include "aria_arena.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,37 +60,45 @@ void aria_t5enc_encode(const aria_t5enc *e, float *cond, const int *ids, int seq
     const int D = T5_D, H = T5_H, hd = T5_HD, I = T5_I;
     float normalizer = sqrtf((float)D);
 
-    float *h = malloc((size_t)seq * D * sizeof(float));
+    /* one per-request scratch arena (allocate-once: every buffer lives the whole
+     * forward, so no save/restore -- just bump-allocate and free at the end). */
+    aria_arena arena;
+    size_t fl = 9 * (size_t)seq * D + 2 * (size_t)seq * seq + 2 * (size_t)seq * I
+                + (size_t)seq * T5_ROT + 4096;
+    aria_arena_init(&arena, fl * sizeof(float));
+    aria_arena *ar = &arena;
+
+    float *h = aria_arena_floats(ar, (size_t)seq * D);
     for (int p = 0; p < seq; p++) {
         const uint16_t *row = e->embed_bf16 + (size_t)ids[p] * D;
         float *hr = h + (size_t)p * D;
         for (int j = 0; j < D; j++) hr[j] = bf16_to_f32(row[j]) * normalizer;
     }
 
-    float *rcos = malloc((size_t)seq * (T5_ROT / 2) * sizeof(float));
-    float *rsin = malloc((size_t)seq * (T5_ROT / 2) * sizeof(float));
+    float *rcos = aria_arena_floats(ar, (size_t)seq * (T5_ROT / 2));
+    float *rsin = aria_arena_floats(ar, (size_t)seq * (T5_ROT / 2));
     aria_rope_freqs(rcos, rsin, seq, T5_ROT, 10000.0f);
 
     /* padding mask bias [seq,seq] (per key, broadcast over queries) */
     float *maskmat = NULL;
     if (n_real < seq) {
-        maskmat = malloc((size_t)seq * seq * sizeof(float));
+        maskmat = aria_arena_floats(ar, (size_t)seq * seq);
         for (int q = 0; q < seq; q++)
             for (int k = 0; k < seq; k++)
                 maskmat[(size_t)q * seq + k] = (k < n_real) ? 0.0f : -3.4e38f;
     }
 
-    float *res = malloc((size_t)seq * D * sizeof(float));
-    float *a = malloc((size_t)seq * D * sizeof(float));
-    float *proj = malloc((size_t)seq * D * sizeof(float));
-    float *qh = malloc((size_t)H * seq * hd * sizeof(float));
-    float *kh = malloc((size_t)H * seq * hd * sizeof(float));
-    float *vh = malloc((size_t)H * seq * hd * sizeof(float));
-    float *oh = malloc((size_t)H * seq * hd * sizeof(float));
-    float *merged = malloc((size_t)seq * D * sizeof(float));
-    float *scores = malloc((size_t)seq * seq * sizeof(float));
-    float *gate = malloc((size_t)seq * I * sizeof(float));
-    float *up = malloc((size_t)seq * I * sizeof(float));
+    float *res = aria_arena_floats(ar, (size_t)seq * D);
+    float *a = aria_arena_floats(ar, (size_t)seq * D);
+    float *proj = aria_arena_floats(ar, (size_t)seq * D);
+    float *qh = aria_arena_floats(ar, (size_t)H * seq * hd);
+    float *kh = aria_arena_floats(ar, (size_t)H * seq * hd);
+    float *vh = aria_arena_floats(ar, (size_t)H * seq * hd);
+    float *oh = aria_arena_floats(ar, (size_t)H * seq * hd);
+    float *merged = aria_arena_floats(ar, (size_t)seq * D);
+    float *scores = aria_arena_floats(ar, (size_t)seq * seq);
+    float *gate = aria_arena_floats(ar, (size_t)seq * I);
+    float *up = aria_arena_floats(ar, (size_t)seq * I);
 
     for (int li = 0; li < T5_L; li++) {
         const t5_layer *L = &e->layers[li];
@@ -138,8 +147,7 @@ void aria_t5enc_encode(const aria_t5enc *e, float *cond, const int *ids, int seq
         else            memcpy(cond + (size_t)p * D, e->padding_embedding, (size_t)D * sizeof(float));
     }
 
-    free(h); free(rcos); free(rsin); free(maskmat); free(res); free(a); free(proj);
-    free(qh); free(kh); free(vh); free(oh); free(merged); free(scores); free(gate); free(up);
+    aria_arena_free(&arena);
 }
 
 /* ---- loader ---- */
