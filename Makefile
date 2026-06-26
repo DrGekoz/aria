@@ -27,6 +27,7 @@ LIB_SRCS := \
   $(SRC)/aria_cpu.c \
   $(SRC)/aria_cond.c \
   $(SRC)/aria_parity.c \
+  $(SRC)/aria_sa3_config.c \
   $(SRC)/aria.c \
   $(SRC)/aria_model_sa3.c
 
@@ -50,7 +51,7 @@ aria: $(BUILD)/main.o $(LIB)
 	$(CC) $(CFLAGS) -I$(SRC) $< -L$(BUILD) -laria $(LDFLAGS) -o $@
 
 # ---- tests ----
-TESTS := test_ops test_wav
+TESTS := test_ops test_wav test_config
 test: $(LIB)
 	@set -e; \
 	for t in $(TESTS); do \
@@ -65,7 +66,7 @@ test: $(LIB)
 PYTHON    ?= ../sa3-sf-api/.venv/bin/python
 ARIA_MODEL ?=
 DUMPS     ?= build/parity_dumps
-PARITY_TESTS := test_number_cond
+PARITY_TESTS := test_number_cond test_attn
 parity: $(LIB)
 	@test -n "$(ARIA_MODEL)" || { echo "usage: make parity ARIA_MODEL=<model dir>"; exit 1; }
 	$(PYTHON) scripts/dump_phase1.py "$(ARIA_MODEL)" "$(DUMPS)"

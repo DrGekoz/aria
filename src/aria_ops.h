@@ -42,6 +42,35 @@ void aria_gelu_tanh(float *x, int n);     /* gelu_pytorch_tanh */
 /* SiLU-gated FFN combine: out[i] = silu(gate[i]) * up[i], n elements. */
 void aria_silu_gate(float *out, const float *gate, const float *up, int n);
 
+/* ---- rotary position embedding (rotate-half, GPT-NeoX style) ---- */
+
+/* Precompute cos/sin tables [n, rot_dim/2] for integer positions 0..n-1.
+ * inv_freq[i] = 1 / base^(2i/rot_dim). Matches stable_audio_tools RotaryEmbedding
+ * (base 10000, interpolation_factor 1). cos_t/sin_t hold n*(rot_dim/2) floats. */
+void aria_rope_freqs(float *cos_t, float *sin_t, int n, int rot_dim, float base);
+
+/* Apply RoPE in place to x laid out [H, N, D] (head-major). Rotates the first
+ * rot_dim (<= D) dims with pairing (i, i+rot_dim/2); dims >= rot_dim untouched. */
+void aria_rope_apply(float *x, const float *cos_t, const float *sin_t,
+                     int H, int N, int D, int rot_dim);
+
+/* ---- attention ---- */
+
+/* Multi-head scaled-dot-product attention, bidirectional (non-causal).
+ * q [H,Nq,D], k/v [H,Nk,D], out [H,Nq,D]. scale = 1/sqrt(D) (SDPA default).
+ * Optional additive mask [Nq,Nk] (e.g. -inf for padding) or NULL. */
+void aria_attention(float *out, const float *q, const float *k, const float *v,
+                    int H, int Nq, int Nk, int D, const float *mask);
+
+/* ---- GLU/SwiGLU feed-forward ---- */
+
+/* FeedForward: proj x[N,dim] -> [N,2*inner] via W_in[2*inner,dim](+b_in),
+ * GLU combine value*SiLU(gate) (value = first half), then W_out[dim_out,inner]
+ * (+b_out) -> out[N,dim_out]. Allocates internal scratch. */
+void aria_ff_glu(float *out, const float *x, int N, int dim, int inner, int dim_out,
+                 const float *W_in, const float *b_in,
+                 const float *W_out, const float *b_out);
+
 /* ---- softmax over rows ---- */
 /* In-place row softmax. x is [rows, cols]. Optional additive mask [rows,cols]
  * (e.g. -inf for padding) when mask != NULL. */

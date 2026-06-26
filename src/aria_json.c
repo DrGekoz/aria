@@ -23,25 +23,71 @@ char *aria_read_file(const char *path, size_t *out_len) {
     return buf;
 }
 
-/* Locate the position just after the colon following "key". Returns NULL if
- * not found. Naive first-match scan -- adequate for flat config fields. */
-static const char *find_key(const char *json, const char *key) {
+/* Locate the value position just after the colon following "key", searching
+ * only within [start, end) (end NULL = to the NUL terminator). Naive first-match
+ * scan that respects the bound -- adequate for config fields. */
+static const char *find_key_b(const char *start, const char *end, const char *key) {
     size_t klen = strlen(key);
-    const char *p = json;
-    while ((p = strchr(p, '"')) != NULL) {
-        const char *start = p + 1;
-        if (strncmp(start, key, klen) == 0 && start[klen] == '"') {
-            const char *q = start + klen + 1;
-            while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
-            if (*q == ':') {
+    const char *e = end ? end : (start + strlen(start));
+    const char *p = start;
+    while (p < e) {
+        if (*p != '"') { p++; continue; }
+        const char *ks = p + 1;
+        if (ks + klen < e && strncmp(ks, key, klen) == 0 && ks[klen] == '"') {
+            const char *q = ks + klen + 1;
+            while (q < e && (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r')) q++;
+            if (q < e && *q == ':') {
                 q++;
-                while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+                while (q < e && (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r')) q++;
                 return q;
             }
         }
-        p = start;
+        p = ks;
     }
     return NULL;
+}
+
+static const char *find_key(const char *json, const char *key) {
+    return find_key_b(json, NULL, key);
+}
+
+int aria_json_object(const char *start, const char *end, const char *key,
+                     const char **obj_start, const char **obj_end) {
+    const char *v = find_key_b(start, end, key);
+    if (!v || *v != '{') return -1;
+    const char *p = v;
+    int depth = 0;
+    const char *e = end ? end : (v + strlen(v));
+    while (p < e) {
+        if (*p == '{') depth++;
+        else if (*p == '}') { depth--; if (depth == 0) { *obj_start = v; *obj_end = p + 1; return 0; } }
+        p++;
+    }
+    return -1;
+}
+
+int aria_json_get_number_in(const char *start, const char *end, const char *key, double *out) {
+    const char *v = find_key_b(start, end, key);
+    if (!v) return -1;
+    char *e = NULL;
+    double d = strtod(v, &e);
+    if (e == v) return -1;
+    *out = d;
+    return 0;
+}
+
+int aria_json_get_string_in(const char *start, const char *end, const char *key,
+                            char *out, size_t outlen) {
+    const char *v = find_key_b(start, end, key);
+    if (!v || *v != '"') return -1;
+    v++;
+    size_t i = 0;
+    while (*v && *v != '"' && i < outlen - 1) {
+        if (*v == '\\' && v[1]) v++;
+        out[i++] = *v++;
+    }
+    out[i] = '\0';
+    return 0;
 }
 
 int aria_json_get_string(const char *json, const char *key, char *out, size_t outlen) {

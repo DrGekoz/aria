@@ -19,4 +19,17 @@ int aria_json_get_string(const char *json, const char *key, char *out, size_t ou
 /* Find the first "key": <number> and store as double. Returns 0 on success. */
 int aria_json_get_number(const char *json, const char *key, double *out);
 
+/* ---- scoped variants: search only within [start, end) (end NULL = to NUL) ----
+ * Needed because nested configs reuse key names (e.g. "io_channels", "config").
+ */
+
+/* Locate "key": { ... } and return the brace-balanced object span:
+ * *obj_start points at '{', *obj_end just past the matching '}'. Returns 0/-1. */
+int aria_json_object(const char *start, const char *end, const char *key,
+                     const char **obj_start, const char **obj_end);
+
+int aria_json_get_number_in(const char *start, const char *end, const char *key, double *out);
+int aria_json_get_string_in(const char *start, const char *end, const char *key,
+                            char *out, size_t outlen);
+
 #endif /* ARIA_JSON_H */

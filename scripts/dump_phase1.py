@@ -75,8 +75,61 @@ def dump_number_cond(model_dir, out_dir):
           f"canonical(f64)-vs-torch(f32) worst dev = {worst_torch_dev:.3e}")
 
 
+def dump_ops(out_dir):
+    """Op-level references with seeded synthetic inputs, driving the real
+    stable_audio_tools ops. Inputs are dumped too, so C consumes identical data."""
+    import torch.nn.functional as F
+    from stable_audio_tools.models.transformer import (
+        RotaryEmbedding, apply_rotary_pos_emb, FeedForward,
+    )
+
+    d = os.path.join(out_dir, "ops")
+    os.makedirs(d, exist_ok=True)
+
+    def save(name, t):
+        save_atns(os.path.join(d, name), t.detach().float().cpu().numpy())
+
+    # --- RoPE (rotate-half) : H=2, N=6, D=64, rot_dim=64 ---
+    torch.manual_seed(0)
+    H, N, D, rot = 2, 6, 64, 64
+    q = torch.randn(H, N, D)
+    rotary = RotaryEmbedding(rot)
+    freqs, _ = rotary.forward_from_seq_len(N)
+    q_rot = apply_rotary_pos_emb(q, freqs)
+    save("rope_q_in.atns", q)
+    save("rope_q_out.atns", q_rot)
+
+    # --- attention (SDPA) : H=2, Nq=4, Nk=6, D=8 ---
+    torch.manual_seed(1)
+    H, Nq, Nk, Dh = 2, 4, 6, 8
+    qa = torch.randn(H, Nq, Dh)
+    ka = torch.randn(H, Nk, Dh)
+    va = torch.randn(H, Nk, Dh)
+    out = F.scaled_dot_product_attention(qa, ka, va, is_causal=False)
+    save("attn_q.atns", qa)
+    save("attn_k.atns", ka)
+    save("attn_v.atns", va)
+    save("attn_out.atns", out)
+
+    # --- GLU/SwiGLU FeedForward : dim=64, mult=4 -> inner=256 ---
+    torch.manual_seed(2)
+    dim, mult, Nf = 64, 4, 5
+    ff = FeedForward(dim, mult=mult, glu=True, zero_init_output=False, no_bias=False).eval()
+    x = torch.randn(1, Nf, dim)
+    with torch.no_grad():
+        y = ff(x)
+    save("ff_x.atns", x.squeeze(0))
+    save("ff_y.atns", y.squeeze(0))
+    save("ff_Win.atns", ff.ff[0].proj.weight)   # [2*inner, dim]
+    save("ff_bin.atns", ff.ff[0].proj.bias)     # [2*inner]
+    save("ff_Wout.atns", ff.ff[2].weight)       # [dim, inner]
+    save("ff_bout.atns", ff.ff[2].bias)         # [dim]
+    print(f"dumped op references (rope/attn/ff) to {d}")
+
+
 if __name__ == "__main__":
     model_dir = sys.argv[1]
     out_dir = sys.argv[2] if len(sys.argv) > 2 else "parity_dumps"
     os.makedirs(out_dir, exist_ok=True)
     dump_number_cond(model_dir, out_dir)
+    dump_ops(out_dir)
