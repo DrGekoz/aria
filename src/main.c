@@ -24,8 +24,11 @@ static void usage(const char *prog) {
         "  %s -m <model_dir> --info\n"
         "  %s -m <model_dir> --list-tensors [prefix]\n"
         "  %s --wav-roundtrip <in.wav> <out.wav>\n"
-        "  %s -m <model_dir> -p \"prompt\" -d <seconds> -s <steps> -o out.wav   (Phase 1)\n",
-        prog, prog, prog, prog);
+        "  %s -m <dir> --uncond -d <seconds> -s <steps> --seed <n> -o out.wav\n"
+        "  %s -m <dir> --prompt-embed <prompt.atns> -d <seconds> -o out.wav\n"
+        "    (text prompts need T5Gemma, not yet ported; precompute the [256,768]\n"
+        "     prompt embedding offline and pass it with --prompt-embed)\n",
+        prog, prog, prog, prog, prog);
 }
 
 static int cmd_wav_roundtrip(const char *in, const char *out) {
@@ -46,11 +49,13 @@ int main(int argc, char **argv) {
 
     const char *model_dir = NULL;
     const char *prompt = NULL;
+    const char *prompt_embed = NULL;
     const char *out_path = "out.wav";
     const char *list_prefix = NULL;
     int do_info = 0, do_list = 0, do_generate = 0;
     float seconds = 15.0f;
     int steps = 8;
+    long long seed = -1;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--wav-roundtrip") == 0 && i + 2 < argc) {
@@ -64,6 +69,12 @@ int main(int argc, char **argv) {
             if (i + 1 < argc && argv[i + 1][0] != '-') list_prefix = argv[++i];
         } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
             prompt = argv[++i]; do_generate = 1;
+        } else if (strcmp(argv[i], "--prompt-embed") == 0 && i + 1 < argc) {
+            prompt_embed = argv[++i]; do_generate = 1;
+        } else if (strcmp(argv[i], "--uncond") == 0) {
+            do_generate = 1;
+        } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+            seed = atoll(argv[++i]);
         } else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
             seconds = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
@@ -93,8 +104,10 @@ int main(int argc, char **argv) {
     } else if (do_generate) {
         aria_gen_params p = ARIA_GEN_PARAMS_DEFAULT;
         p.prompt = prompt;
+        p.prompt_embed_path = prompt_embed;
         p.seconds_total = seconds;
         p.steps = steps;
+        p.seed = seed;
         aria_audio *audio = NULL;
         rc = aria_generate(ctx, &p, &audio);
         if (rc == 0 && audio) {

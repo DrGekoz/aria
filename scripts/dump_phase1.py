@@ -304,6 +304,62 @@ def dump_taae_block(model_dir, out_dir):
         print(f"  (skipping standalone taae block dump: {type(e).__name__}: {e})")
 
 
+def dump_e2e(model_dir, out_dir):
+    """End-to-end: init noise -> pingpong(DiT denoiser) -> latent -> decode -> audio,
+    with explicit injected per-step noise (matches the C aria_pingpong path)."""
+    from stable_audio_tools.models.dit import DiffusionTransformer
+    from stable_audio_tools.inference.sampling import build_schedule, LogSNRShift
+    from safetensors.torch import load_file
+
+    cfg = json.load(open(os.path.join(model_dir, "model_config.json")))
+    dcfg = cfg["model"]["diffusion"]["config"]
+    objective = cfg["model"]["diffusion"].get("diffusion_objective", "rf_denoiser")
+    dit = DiffusionTransformer(diffusion_objective=objective, **dcfg).eval()
+    sd = load_file(os.path.join(model_dir, "model.safetensors"))
+    dit_sd = {k[len("model.model."):]: v for k, v in sd.items() if k.startswith("model.model.")}
+    dit.load_state_dict(dit_sd, strict=False)
+    ae = _load_decoder_ae(model_dir)
+
+    torch.manual_seed(11)
+    T, steps = 16, 8
+    # unconditional (zero) conditioning so the rf_denoiser converges toward the
+    # data manifold -> an in-distribution latent the decoder handles stably.
+    cross = torch.zeros(1, 257, 768)
+    glob = torch.zeros(1, 768)
+    init_noise = torch.randn(1, 256, T)
+    step_noise = torch.randn(steps, 256, T)
+    shift = LogSNRShift(anchor_length=2000, anchor_logsnr=-6.2, rate=1.0, logsnr_end=2.0)
+    sched = build_schedule(steps=steps, sigma_max=1.0, dist_shift=shift, effective_seq_len=T)
+
+    orig = torch.randn_like
+    torch.randn_like = lambda x, *a, **k: torch.zeros_like(x)
+    try:
+        with torch.no_grad():
+            x = init_noise.clone()
+            for i in range(steps):
+                tc = sched[i].item(); tn = sched[i + 1].item()
+                v = dit._forward(x, torch.tensor([tc]), cross_attn_cond=cross, global_embed=glob)
+                denoised = x - tc * v
+                x = (1 - tn) * denoised + tn * step_noise[i:i + 1]
+            latent = x
+            z = ae.bottleneck.decode(latent)
+            dec = ae.decoder(z)
+            audio = ae.pretransform.decode(dec)
+    finally:
+        torch.randn_like = orig
+
+    d = os.path.join(out_dir, "e2e")
+    os.makedirs(d, exist_ok=True)
+    save_atns(os.path.join(d, "cross.atns"), cross.squeeze(0).float().cpu().numpy())
+    save_atns(os.path.join(d, "global.atns"), glob.squeeze(0).float().cpu().numpy())
+    save_atns(os.path.join(d, "init_noise.atns"), init_noise.squeeze(0).float().cpu().numpy())
+    save_atns(os.path.join(d, "step_noise.atns"), step_noise.float().cpu().numpy())
+    save_atns(os.path.join(d, "sched.atns"), sched.float().cpu().numpy())
+    save_atns(os.path.join(d, "latent.atns"), latent.squeeze(0).float().cpu().numpy())
+    save_atns(os.path.join(d, "audio.atns"), audio.squeeze(0).float().cpu().numpy())
+    print(f"dumped end-to-end reference to {d} (T={T}, steps={steps})")
+
+
 if __name__ == "__main__":
     model_dir = sys.argv[1]
     out_dir = sys.argv[2] if len(sys.argv) > 2 else "parity_dumps"
@@ -315,3 +371,4 @@ if __name__ == "__main__":
     dump_schedule(out_dir)
     dump_taae_block(model_dir, out_dir)
     dump_decoder(model_dir, out_dir)
+    dump_e2e(model_dir, out_dir)
