@@ -18,6 +18,27 @@
 #include <cblas.h>   /* optional: route GEMM to OpenBLAS/Accelerate/MKL */
 #endif
 
+#if defined(__AVX2__) && defined(__FMA__)
+#include <immintrin.h>
+#define ARIA_AVX2 1
+/* register-tile dimensions (output rows x cols held in ymm accumulators):
+ * regs used = NR (weight vecs) + 1 (x vec) + MR*NR (accumulators) <= 16 */
+#ifndef ARIA_MR
+#define ARIA_MR 4
+#endif
+#ifndef ARIA_NR
+#define ARIA_NR 3
+#endif
+static inline float aria_hsum256(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+    lo = _mm_add_ss(lo, _mm_shuffle_ps(lo, lo, 0x1));
+    return _mm_cvtss_f32(lo);
+}
+#endif
+
 /* y[M,N] = x[M,K] @ W^T + b, W=[N,K] (PyTorch Linear).
  * Blocked over output columns (NB) so each weight panel (NB*K) stays in L2 and is
  * reused across all M rows; the inner dot is vectorized via omp-simd reduction
@@ -29,6 +50,45 @@
  * matmuls (one of their dims is head_dim=64). Gate on the contracted/output dims
  * being large, not on total flops (attention grows with sequence length too). */
 #define ARIA_BLAS_BIG(K, N) ((K) >= 128 && (N) >= 128)
+
+/* simd dot for edge tiles */
+static inline float aria_dot(const float *a, const float *w, int K) {
+    float acc = 0.0f;
+    #ifdef _OPENMP
+    #pragma omp simd reduction(+:acc)
+    #endif
+    for (int k = 0; k < K; k++) acc += a[k] * w[k];
+    return acc;
+}
+
+#ifdef ARIA_AVX2
+/* MR x NR output tile, vectorized over K (8 lanes), MR*NR ymm accumulators for ILP.
+ * y[(m+i),(n+j)] = dot(x[m+i], W[n+j]) + b[n+j], for i<MR, j<NR. */
+static inline void aria_microkernel(float *y, const float *x, const float *W, const float *b,
+                                    int m, int n, int K, int N) {
+    __m256 acc[ARIA_MR][ARIA_NR];
+    const float *xp[ARIA_MR], *wp[ARIA_NR];
+    for (int i = 0; i < ARIA_MR; i++) { xp[i] = x + (size_t)(m + i) * K;
+        for (int j = 0; j < ARIA_NR; j++) acc[i][j] = _mm256_setzero_ps(); }
+    for (int j = 0; j < ARIA_NR; j++) wp[j] = W + (size_t)(n + j) * K;
+    int k = 0;
+    for (; k + 8 <= K; k += 8) {
+        __m256 wv[ARIA_NR];
+        for (int j = 0; j < ARIA_NR; j++) wv[j] = _mm256_loadu_ps(wp[j] + k);
+        for (int i = 0; i < ARIA_MR; i++) {
+            __m256 xv = _mm256_loadu_ps(xp[i] + k);
+            for (int j = 0; j < ARIA_NR; j++) acc[i][j] = _mm256_fmadd_ps(xv, wv[j], acc[i][j]);
+        }
+    }
+    for (int i = 0; i < ARIA_MR; i++)
+        for (int j = 0; j < ARIA_NR; j++) {
+            float s = aria_hsum256(acc[i][j]);
+            for (int kk = k; kk < K; kk++) s += xp[i][kk] * wp[j][kk];  /* K%8 tail */
+            if (b) s += b[n + j];
+            y[(size_t)(m + i) * N + (n + j)] = s;
+        }
+}
+#endif
 
 void aria_linear(float *y, const float *x, const float *W, const float *b,
                  int M, int K, int N) {
@@ -46,6 +106,34 @@ void aria_linear(float *y, const float *x, const float *W, const float *b,
         return;
     }
 #endif
+#ifdef ARIA_AVX2
+    {
+        const int MR = ARIA_MR, NR = ARIA_NR;
+        int Mfull = M - (M % MR);
+        int Nfull = N - (N % NR);
+        int NBN = ((48 + NR - 1) / NR) * NR;       /* ~L2 weight panel, multiple of NR */
+        int n_chunks = (Nfull > 0) ? (Nfull + NBN - 1) / NBN : 0;
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(dynamic)
+        #endif
+        for (int c = 0; c < n_chunks; c++) {
+            int cn0 = c * NBN;
+            int cn1 = cn0 + NBN < Nfull ? cn0 + NBN : Nfull;
+            for (int mm = 0; mm < Mfull; mm += MR)
+                for (int nn = cn0; nn < cn1; nn += NR)
+                    aria_microkernel(y, x, W, b, mm, nn, K, N);
+        }
+        /* N-edge: cols [Nfull,N) for rows [0,Mfull) */
+        for (int m = 0; m < Mfull; m++)
+            for (int n = Nfull; n < N; n++)
+                y[(size_t)m * N + n] = aria_dot(x + (size_t)m * K, W + (size_t)n * K, K) + (b ? b[n] : 0.0f);
+        /* M-edge: rows [Mfull,M) for all cols */
+        for (int m = Mfull; m < M; m++)
+            for (int n = 0; n < N; n++)
+                y[(size_t)m * N + n] = aria_dot(x + (size_t)m * K, W + (size_t)n * K, K) + (b ? b[n] : 0.0f);
+        return;
+    }
+#else
     const int NB = 32;                 /* NB*K*4 bytes ~ L2-resident weight panel */
     int n_tiles = (N + NB - 1) / NB;
     #ifdef _OPENMP
@@ -58,16 +146,13 @@ void aria_linear(float *y, const float *x, const float *W, const float *b,
             const float *xr = x + (size_t)m * K;
             float *yr = y + (size_t)m * N;
             for (int n = n0; n < n1; n++) {
-                const float *wr = W + (size_t)n * K;
                 float acc = b ? b[n] : 0.0f;
-                #ifdef _OPENMP
-                #pragma omp simd reduction(+:acc)
-                #endif
-                for (int k = 0; k < K; k++) acc += xr[k] * wr[k];
+                acc += aria_dot(xr, W + (size_t)n * K, K);
                 yr[n] = acc;
             }
         }
     }
+#endif
 }
 
 void aria_matmul(float *C, const float *A, const float *B, int M, int K, int N) {

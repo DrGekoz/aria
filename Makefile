@@ -39,9 +39,14 @@ LIB_SRCS := \
 LIB_OBJS := $(patsubst $(SRC)/%.c,$(BUILD)/%.o,$(LIB_SRCS))
 LIB := $(BUILD)/libaria.a
 
-.PHONY: all cpu clean test cuda blas
+.PHONY: all cpu clean test cuda blas bench
 all: cpu
 cpu: aria
+
+# GEMM microbenchmark on the dominant SA3 shapes (no model load)
+bench: $(LIB)
+	$(CC) $(CFLAGS) -I$(SRC) tests/bench_gemm.c -L$(BUILD) -laria $(LDFLAGS) -o $(BUILD)/bench_gemm
+	$(BUILD)/bench_gemm
 
 # Optional CPU acceleration: route GEMM to a BLAS (OpenBLAS here; on macOS use
 # LDLIBS="-framework Accelerate"). Keeps the pure-C build as the default.
