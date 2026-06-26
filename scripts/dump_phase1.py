@@ -360,6 +360,37 @@ def dump_e2e(model_dir, out_dir):
     print(f"dumped end-to-end reference to {d} (T={T}, steps={steps})")
 
 
+def dump_t5enc(model_dir, out_dir):
+    """T5Gemma encoder reference via the real T5GemmaConditioner: dump token ids,
+    pre-padding last_hidden, and final (post learned-padding) [256,768]."""
+    from stable_audio_tools.models.conditioners import T5GemmaConditioner
+    from safetensors.torch import load_file
+    nc = T5GemmaConditioner(output_dim=768, max_length=256, padding_mode="learned",
+                            repo_id="stabilityai/stable-audio-3-small-music",
+                            subfolder="t5gemma-b-b-ul2").eval()
+    nc.model = nc.model.float()   # fp32 reference to match the fp32 C runtime (weights are bf16 on disk)
+    sd = load_file(os.path.join(model_dir, "model.safetensors"))
+    with torch.no_grad():
+        nc.padding_embedding.copy_(sd["conditioner.conditioners.prompt.padding_embedding"])
+
+    prompts = ["warm romantic piano", "Amen break 174 BPM", "lofi house loop"]
+    d = os.path.join(out_dir, "t5enc")
+    os.makedirs(d, exist_ok=True)
+    for idx, prompt in enumerate(prompts):
+        enc = nc.tokenizer([prompt], truncation=True, max_length=256,
+                           padding="max_length", return_tensors="pt")
+        ids = enc["input_ids"]; am = enc["attention_mask"]
+        with torch.no_grad():
+            last_hidden = nc.model(input_ids=ids, attention_mask=am.bool()).last_hidden_state
+            cond_final = nc([prompt], device="cpu")[0]   # [1,256,768] post learned-padding
+        n_real = int(am.sum().item())
+        save_atns(os.path.join(d, f"ids_{idx}.atns"), ids[0].float().cpu().numpy())
+        save_atns(os.path.join(d, f"nreal_{idx}.atns"), np.array([n_real], dtype=np.float32))
+        save_atns(os.path.join(d, f"last_hidden_{idx}.atns"), last_hidden[0].float().cpu().numpy())
+        save_atns(os.path.join(d, f"cond_{idx}.atns"), cond_final[0].float().cpu().numpy())
+    print(f"dumped t5gemma encoder reference to {d} ({len(prompts)} prompts)")
+
+
 if __name__ == "__main__":
     model_dir = sys.argv[1]
     out_dir = sys.argv[2] if len(sys.argv) > 2 else "parity_dumps"
@@ -372,3 +403,4 @@ if __name__ == "__main__":
     dump_taae_block(model_dir, out_dir)
     dump_decoder(model_dir, out_dir)
     dump_e2e(model_dir, out_dir)
+    dump_t5enc(model_dir, out_dir)

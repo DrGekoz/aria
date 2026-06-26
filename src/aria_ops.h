@@ -35,6 +35,14 @@ void aria_dynamic_tanh(float *y, const float *x, float alpha,
                        const float *weight, const float *bias,
                        int rows, int dim);
 
+/* Gemma RMSNorm: y = x / sqrt(mean(x^2)+eps) * (1 + weight). Note the (1+weight):
+ * Gemma stores zero-centered norm gains. Computed in fp32. */
+void aria_gemma_rmsnorm(float *y, const float *x, const float *weight,
+                        int rows, int dim, float eps);
+
+/* Attention-logit softcapping: s[i] = cap * tanh(s[i] / cap), n elements. */
+void aria_softcap(float *s, int n, float cap);
+
 /* ---- activations (in-place over n elements) ---- */
 void aria_silu(float *x, int n);          /* x * sigmoid(x) */
 void aria_gelu_tanh(float *x, int n);     /* gelu_pytorch_tanh */

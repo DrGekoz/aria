@@ -94,6 +94,25 @@ void aria_dynamic_tanh(float *y, const float *x, float alpha,
     }
 }
 
+void aria_gemma_rmsnorm(float *y, const float *x, const float *weight,
+                        int rows, int dim, float eps) {
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int r = 0; r < rows; r++) {
+        const float *xr = x + (size_t)r * dim;
+        float *yr = y + (size_t)r * dim;
+        double ss = 0.0;
+        for (int i = 0; i < dim; i++) ss += (double)xr[i] * xr[i];
+        float inv = (float)(1.0 / sqrt(ss / dim + eps));
+        for (int i = 0; i < dim; i++) yr[i] = xr[i] * inv * (1.0f + weight[i]);
+    }
+}
+
+void aria_softcap(float *s, int n, float cap) {
+    for (int i = 0; i < n; i++) s[i] = cap * tanhf(s[i] / cap);
+}
+
 void aria_silu(float *x, int n) {
     for (int i = 0; i < n; i++) {
         float v = x[i];
