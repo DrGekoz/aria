@@ -21,9 +21,9 @@ typedef struct {
     aria_sa3_config cfg;
     aria_sa3_dit *dit;
     aria_sa3_dec *dec;
-    /* seconds_total NumberConditioner */
-    float *sec_w;        /* [768,256] (owned) */
-    float *sec_b;        /* [768] (owned) */
+    /* seconds_total NumberConditioner (borrowed from the mmap) */
+    const float *sec_w;  /* [768,256] */
+    const float *sec_b;  /* [768] */
     float sec_min, sec_max;
     int sample_rate;
 } sa3_state;
@@ -56,8 +56,8 @@ static void *sa3_load(aria_ctx *ctx, safetensors_file_t *sf, const char *config_
     const safetensor_t *tw = safetensors_find(sf, "conditioner.conditioners.seconds_total.embedder.embedding.1.weight");
     const safetensor_t *tb = safetensors_find(sf, "conditioner.conditioners.seconds_total.embedder.embedding.1.bias");
     if (!tw || !tb) { aria_set_error("sa3_load: missing seconds_total conditioner"); goto fail; }
-    st->sec_w = safetensors_get_f32(sf, tw);
-    st->sec_b = safetensors_get_f32(sf, tb);
+    st->sec_w = safetensors_f32_ptr(sf, tw);
+    st->sec_b = safetensors_f32_ptr(sf, tb);
     /* min/max from config (seconds_total conditioner) */
     double mn = 0.0, mx = 384.0;
     aria_json_get_number(config_json, "min_val", &mn);
@@ -67,7 +67,7 @@ static void *sa3_load(aria_ctx *ctx, safetensors_file_t *sf, const char *config_
 
 fail:
     aria_sa3_dit_free(st->dit); aria_sa3_dec_free(st->dec);
-    free(st->sec_w); free(st->sec_b); free(st);
+    free(st);
     return NULL;
 }
 
@@ -76,8 +76,8 @@ static void sa3_unload(void *state) {
     if (!st) return;
     aria_sa3_dit_free(st->dit);
     aria_sa3_dec_free(st->dec);
-    free(st->sec_w); free(st->sec_b);
-    free(st);
+    free(st);   /* sec_w/sec_b are borrowed from the mmap */
+    return;
 }
 
 /* denoiser closure for the pingpong sampler */

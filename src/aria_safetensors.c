@@ -314,6 +314,11 @@ float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t) 
     return out;
 }
 
+const float *safetensors_f32_ptr(const safetensors_file_t *sf, const safetensor_t *t) {
+    if (!sf || !t || t->dtype != DTYPE_F32) return NULL;
+    return (const float *)safetensors_data(sf, t);
+}
+
 void safetensor_print(const safetensor_t *t) {
     const char *names[] = {"F32", "F16", "BF16", "I32", "I64", "BOOL"};
     const char *dn = (t->dtype >= 0 && t->dtype <= 5) ? names[t->dtype] : "UNKNOWN";

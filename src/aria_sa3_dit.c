@@ -158,21 +158,15 @@ struct aria_sa3_dit {
     const float *to_ts0_w, *to_ts0_b, *to_ts2_w, *to_ts2_b;
     const float *gce0_w, *gce0_b, *gce2_w, *gce2_b;
     aria_dit_block_w *blocks;
-    float **owned;
-    int n_owned, cap_owned;
     int failed;
 };
 
+/* zero-copy: borrow the F32 weight directly from the mmap (valid while sf open) */
 static const float *track(aria_sa3_dit *m, safetensors_file_t *sf, const char *name) {
     const safetensor_t *t = safetensors_find(sf, name);
     if (!t) { fprintf(stderr, "aria_sa3_dit_load: missing tensor %s\n", name); m->failed = 1; return NULL; }
-    float *p = safetensors_get_f32(sf, t);
-    if (!p) { m->failed = 1; return NULL; }
-    if (m->n_owned == m->cap_owned) {
-        m->cap_owned = m->cap_owned ? m->cap_owned * 2 : 512;
-        m->owned = realloc(m->owned, (size_t)m->cap_owned * sizeof(float *));
-    }
-    m->owned[m->n_owned++] = p;
+    const float *p = safetensors_f32_ptr(sf, t);
+    if (!p) { fprintf(stderr, "aria_sa3_dit_load: %s is not F32\n", name); m->failed = 1; return NULL; }
     return p;
 }
 
@@ -241,9 +235,7 @@ aria_sa3_dit *aria_sa3_dit_load(safetensors_file_t *sf, const aria_sa3_config *c
 
 void aria_sa3_dit_free(aria_sa3_dit *m) {
     if (!m) return;
-    for (int i = 0; i < m->n_owned; i++) free(m->owned[i]);
-    free(m->owned);
-    free(m->blocks);
+    free(m->blocks);   /* weights are borrowed from the mmap; nothing else to free */
     free(m);
 }
 

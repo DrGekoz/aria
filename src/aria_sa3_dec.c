@@ -36,7 +36,6 @@ struct aria_sa3_dec {
     taae_block_w blocks[6];
     float *mapping_w;                    /* folded [512,768,3] (owned) */
     const float *mapping_b;              /* [512] */
-    float **owned; int n_owned, cap_owned;
     int failed;
 };
 
@@ -216,16 +215,12 @@ void aria_sa3_dec_block_test(const aria_sa3_dec *m, int idx, float *xc, int N) {
 }
 
 /* ---- loader ---- */
+/* zero-copy: borrow the F32 weight directly from the mmap (valid while sf open) */
 static const float *track(aria_sa3_dec *m, safetensors_file_t *sf, const char *name) {
     const safetensor_t *t = safetensors_find(sf, name);
     if (!t) { fprintf(stderr, "aria_sa3_dec_load: missing %s\n", name); m->failed = 1; return NULL; }
-    float *p = safetensors_get_f32(sf, t);
-    if (!p) { m->failed = 1; return NULL; }
-    if (m->n_owned == m->cap_owned) {
-        m->cap_owned = m->cap_owned ? m->cap_owned * 2 : 256;
-        m->owned = realloc(m->owned, (size_t)m->cap_owned * sizeof(float *));
-    }
-    m->owned[m->n_owned++] = p;
+    const float *p = safetensors_f32_ptr(sf, t);
+    if (!p) { fprintf(stderr, "aria_sa3_dec_load: %s is not F32\n", name); m->failed = 1; return NULL; }
     return p;
 }
 static float track_scalar(aria_sa3_dec *m, safetensors_file_t *sf, const char *name) {
@@ -285,8 +280,6 @@ aria_sa3_dec *aria_sa3_dec_load(safetensors_file_t *sf) {
 
 void aria_sa3_dec_free(aria_sa3_dec *m) {
     if (!m) return;
-    for (int i = 0; i < m->n_owned; i++) free(m->owned[i]);
-    free(m->owned);
-    free(m->mapping_w);
+    free(m->mapping_w);   /* the folded conv weight is the only owned buffer */
     free(m);
 }

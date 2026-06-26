@@ -65,6 +65,11 @@ const void *safetensors_data(const safetensors_file_t *sf, const safetensor_t *t
 /* Tensor data as a newly allocated f32 array (caller frees). Converts F16/BF16. */
 float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t);
 
+/* Zero-copy pointer into the mmap'd F32 tensor data (no copy; valid while the
+ * file is open). Returns NULL if the tensor is not F32. Tensor data is 4-byte
+ * aligned, fine for (unaligned) SIMD loads. */
+const float *safetensors_f32_ptr(const safetensors_file_t *sf, const safetensor_t *t);
+
 int64_t safetensor_numel(const safetensor_t *t);
 
 void safetensor_print(const safetensor_t *t);
