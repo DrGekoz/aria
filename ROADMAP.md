@@ -124,8 +124,8 @@ M2.
 
 ## E8 — CUDA backend (parallelizable track)
 
-- ⬜ **E8.1** **P1** `aria_gpu.h` + device alloc/copy + Makefile cuda wiring (sm_86/sm_61). deps: op surface stable (E2.*) · Verify: `make cuda` builds, trivial kernel runs.
-- ⬜ **E8.2** `∥` **P1** CUDA gemm/linear (fp32 sm_61; fp16 sm_86). deps: E8.1 · Verify: cuda-vs-cpu parity.
+- ✅ **E8.1** **P1** `aria_gpu.h` (device alloc/copy/sync + C-callable surface) + Makefile `cuda`/`test_cuda` wiring. nvcc 11.2 via `-ccbin gcc-9` (host gcc≤10), cudart at `/usr/lib/cuda/lib64`, `CUDA_ARCH ?= sm_61` (RTX 3070: `make cuda CUDA_ARCH=sm_86`). `make cuda` builds `libaria.a`+CLI; device detected (GT 1030, sm_61, 2 GB).
+- ✅ **E8.2** **P1** CUDA gemm/linear: shared-memory tiled `aria_gemm_nt` (`y = x @ W^T + b`, device-pointer kernel + host wrapper). `make test_cuda` parity vs CPU on the DiT/encoder shapes + edge cases (odd dims, single row): maxdiff ≤ 1.8e-5. *Note:* GT 1030 (2 GB) is **validation-only** — it can't hold the 2.27 GB model and its fp32 won't beat the AVX2 CPU; real GPU speed is the RTX 3070 (sm_86, 8 GB). fp16 (sm_86) compute lands with E8.3/E9.
 - ⬜ **E8.3** `∥` **P1** CUDA attention + rope + rmsnorm + softmax + activations. deps: E8.1 · Verify: per-op cuda-vs-cpu parity.
 - ⬜ **E8.4** `∥` **P1** CUDA conv1d. deps: E8.1 · Verify: parity.
 - ⬜ **E8.5** **P1** Per-component device placement + load/free orchestration (DiT on GPU; enc/dec CPU-or-GPU; fit budget). deps: E8.2–8.4 · Verify: CUDA generation == CPU. **← M4**

@@ -37,10 +37,11 @@ LIB_SRCS := \
   $(SRC)/aria.c \
   $(SRC)/aria_model_sa3.c
 
-LIB_OBJS := $(patsubst $(SRC)/%.c,$(BUILD)/%.o,$(LIB_SRCS))
+EXTRA_LIB_OBJS ?=
+LIB_OBJS := $(patsubst $(SRC)/%.c,$(BUILD)/%.o,$(LIB_SRCS)) $(EXTRA_LIB_OBJS)
 LIB := $(BUILD)/libaria.a
 
-.PHONY: all cpu clean test cuda blas bench
+.PHONY: all cpu clean test cuda test_cuda blas bench
 all: cpu
 cpu: aria
 
@@ -98,14 +99,29 @@ parity: $(LIB)
 	done; \
 	echo "parity passed"
 
-# ---- CUDA (Phase 3) ----
-CUDA_ARCH ?= sm_86
+# ---- CUDA backend (E8) ----
+# Local dev box: GT 1030 (sm_61), CUDA 11.2 at /usr/lib/cuda (needs host gcc <= 10).
+# RTX 3070: make cuda CUDA_ARCH=sm_86. The pure-C build stays the default.
+NVCC       ?= /usr/lib/cuda/bin/nvcc
+CUDA_HOME  ?= /usr/lib/cuda
+CUDA_CCBIN ?= gcc-9
+CUDA_ARCH  ?= sm_61
+CUDA_CFLAGS  := $(CSTD) $(DEFS) $(WARN) -O3 -march=native -mavx2 -mfma -fopenmp -DARIA_CUDA
+CUDA_LDFLAGS := -fopenmp -lm -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
+
+# build the lib (+ aria_cuda.o) and CLI with the CUDA backend linked in
 cuda:
-	@if [ ! -f $(SRC)/aria_cuda.cu ]; then \
-	  echo "CUDA backend (aria_cuda.cu) lands in Phase 3. CPU build: 'make'."; exit 1; \
-	fi
-	$(MAKE) all CFLAGS="$(CSTD) $(WARN) -O3 -fopenmp -DARIA_CUDA" \
-	  EXTRA_OBJS="$(BUILD)/aria_cuda.o" CUDA_ARCH=$(CUDA_ARCH)
+	rm -f $(BUILD)/*.o $(BUILD)/libaria.a aria   # CFLAGS change; keep dumps
+	$(NVCC) -ccbin $(CUDA_CCBIN) -arch=$(CUDA_ARCH) -O3 -I$(SRC) -c $(SRC)/aria_cuda.cu -o $(BUILD)/aria_cuda.o
+	$(MAKE) aria CFLAGS="$(CUDA_CFLAGS)" LDFLAGS="$(CUDA_LDFLAGS)" EXTRA_LIB_OBJS="$(BUILD)/aria_cuda.o"
+
+# CUDA op parity vs CPU (skips cleanly if no device)
+test_cuda:
+	rm -f $(BUILD)/*.o $(BUILD)/libaria.a
+	$(NVCC) -ccbin $(CUDA_CCBIN) -arch=$(CUDA_ARCH) -O3 -I$(SRC) -c $(SRC)/aria_cuda.cu -o $(BUILD)/aria_cuda.o
+	$(MAKE) $(LIB) CFLAGS="$(CUDA_CFLAGS)" EXTRA_LIB_OBJS="$(BUILD)/aria_cuda.o"
+	$(CC) $(CUDA_CFLAGS) -I$(SRC) tests/test_cuda.c -L$(BUILD) -laria $(CUDA_LDFLAGS) -o $(BUILD)/test_cuda
+	$(BUILD)/test_cuda
 
 clean:
 	rm -rf $(BUILD) aria
