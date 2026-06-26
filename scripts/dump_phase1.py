@@ -172,6 +172,20 @@ def dump_dit_block(model_dir, out_dir):
     print(f"dumped DiT block-0 reference to {d} (S={S}, Sc={Sc})")
 
 
+def dump_schedule(out_dir):
+    """LogSNR schedule reference (build_schedule + LogSNRShift) for fixed params."""
+    from stable_audio_tools.inference.sampling import build_schedule, LogSNRShift
+    d = os.path.join(out_dir, "sampler")
+    os.makedirs(d, exist_ok=True)
+    shift = LogSNRShift(anchor_length=2000, anchor_logsnr=-6.2, rate=1.0, logsnr_end=2.0)
+    for steps, seq_len in [(8, 323), (8, 1293), (16, 512)]:
+        sched = build_schedule(steps=steps, sigma_max=1.0, dist_shift=shift,
+                               effective_seq_len=seq_len, include_endpoint=True)
+        save_atns(os.path.join(d, f"sched_s{steps}_L{seq_len}.atns"),
+                  sched.float().cpu().numpy())
+    print(f"dumped LogSNR schedules to {d}")
+
+
 def dump_dit_full(model_dir, out_dir):
     """Full DiT denoiser_forward: instantiate the real DiffusionTransformer from
     the config, load model.model.* weights, run _forward on seeded synthetic
@@ -221,3 +235,4 @@ if __name__ == "__main__":
     dump_ops(out_dir)
     dump_dit_block(model_dir, out_dir)
     dump_dit_full(model_dir, out_dir)
+    dump_schedule(out_dir)
