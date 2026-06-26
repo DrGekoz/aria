@@ -1,0 +1,11 @@
+build/
+aria
+*.o
+*.a
+*.wav
+*.bin
+*.npy
+scratch/
+
+# Python
+__pycache__/
