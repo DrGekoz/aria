@@ -13,6 +13,9 @@
 #include "aria_cond.h"
 #include "aria_parity.h"
 #include "aria_json.h"
+#ifdef ARIA_CUDA
+#include "aria_gpu.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -105,11 +108,22 @@ static void sa3_unload(void *state) {
 }
 
 /* denoiser closure for the pingpong sampler: one request context, reused across
- * all steps (cross_ed / RoPE / per-block cross K/V are cached in the req). */
-typedef struct { const aria_sa3_dit *dit; aria_sa3_dit_req *req; } sa3_dctx;
+ * all steps (cross_ed / RoPE / per-block cross K/V are cached in the req). The
+ * device path runs the DiT on the GPU (gcond computed on the host per step). */
+typedef struct {
+    const aria_sa3_dit *dit; aria_sa3_dit_req *req;
+    aria_cuda_dit *cdit; const float *global_seconds; float *gcond;
+} sa3_dctx;
 static void sa3_denoise(void *c, const float *x, float t, float *v, int n) {
     (void)n;
     const sa3_dctx *d = c;
+#ifdef ARIA_CUDA
+    if (d->cdit) {
+        aria_sa3_dit_global_cond(d->dit, d->global_seconds, t, d->gcond);
+        aria_cuda_dit_step(d->cdit, v, x, d->gcond);
+        return;
+    }
+#endif
     aria_sa3_dit_step(d->dit, d->req, v, x, t);
 }
 
@@ -167,8 +181,26 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     aria_logsnr_schedule(sched, steps, 1.0f, -6.2f, 2000.0f, 1.0f, 2.0f, (float)T);
 
     aria_sa3_dit_req *req = aria_sa3_dit_req_begin(st->dit, T, cross, n_cond, sec_emb);
-    sa3_dctx dc = { st->dit, req };
+    sa3_dctx dc = { st->dit, req, NULL, NULL, NULL };
+#ifdef ARIA_CUDA
+    if (p->device == ARIA_DEVICE_CUDA && aria_cuda_available()) {
+        aria_sa3_dit_view view; aria_sa3_dit_get_view(st->dit, &view);
+        dc.cdit = aria_cuda_dit_create(&view);
+        if (dc.cdit) {
+            aria_sa3_dit_req_view rv; aria_sa3_dit_req_get_view(req, &rv);
+            aria_cuda_dit_set_request(dc.cdit, &rv);
+            dc.global_seconds = rv.global_seconds;
+            dc.gcond = malloc((size_t)6 * view.ed * sizeof(float));
+            fprintf(stderr, "[aria] DiT: GPU device-resident (fp16 weights)\n");
+        } else {
+            fprintf(stderr, "[aria] DiT: GPU unavailable/insufficient VRAM, using CPU\n");
+        }
+    }
+#endif
     aria_pingpong(x, n, sched, steps, sa3_denoise, &dc, &rng, NULL);
+#ifdef ARIA_CUDA
+    if (dc.cdit) { aria_cuda_dit_free(dc.cdit); free(dc.gcond); }
+#endif
     aria_sa3_dit_req_end(req);
 
     /* decode -> interleaved stereo */

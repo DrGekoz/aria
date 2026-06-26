@@ -22,6 +22,8 @@ extern "C" {
 
 typedef struct aria_ctx aria_ctx;
 
+typedef enum { ARIA_DEVICE_CPU = 0, ARIA_DEVICE_CUDA = 1 } aria_device;
+
 typedef struct {
     const char *prompt;             /* text prompt (Phase 1) */
     const char *prompt_embed_path;  /* optional precomputed cross-attn embedding, f32 [256,768] */
@@ -29,9 +31,10 @@ typedef struct {
     int   steps;                    /* denoising steps (default 8) */
     float cfg_scale;                /* CFG scale (default 1.0 = off) */
     int64_t seed;                   /* RNG seed (-1 = random) */
+    aria_device device;             /* DiT backend: CPU (default) or CUDA (E8.5) */
 } aria_gen_params;
 
-#define ARIA_GEN_PARAMS_DEFAULT { NULL, NULL, 15.0f, 8, 1.0f, 0 }
+#define ARIA_GEN_PARAMS_DEFAULT { NULL, NULL, 15.0f, 8, 1.0f, 0, ARIA_DEVICE_CPU }
 
 /* Load a model from a directory containing model_config.json + model.safetensors.
  * Returns NULL on error (see aria_last_error()). */

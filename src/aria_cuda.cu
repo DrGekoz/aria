@@ -8,8 +8,11 @@
  */
 
 #include "aria_gpu.h"
+#include "aria_sa3_dit.h"
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cstdio>
+#include <cstdlib>
 
 #define CK(call) do {                                                        \
     cudaError_t err_ = (call);                                               \
@@ -299,4 +302,318 @@ extern "C" void aria_cuda_conv1d(float *out, const float *in, const float *w, co
     float *db = bias ? d_in(bias, Cout) : NULL, *dout = d_new((size_t)Cout * L);
     k_conv1d<<<nblocks((size_t)Cout * L), THREADS>>>(dout, din, dw, db, Cin, Cout, K, pad, L); CK(cudaGetLastError());
     cudaFree(din); cudaFree(dw); if (db) cudaFree(db); d_out(out, dout, (size_t)Cout * L);
+}
+
+/* ===================== device-resident DiT (E8.5) =====================
+ * Weights live on the device as fp16 (fp32 compute: loaded and converted in the
+ * GEMM); activations stay fp32 in a device bump arena. The denoise loop runs on
+ * the device -- only the per-step latent (x in) and velocity (v out) cross the
+ * bus. Encoder/decoder stay on the CPU. Mirrors aria_sa3_dit.c step/block_core. */
+
+__global__ void k_f32_to_f16(__half *o, const float *in, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) o[i] = __float2half(in[i]);
+}
+static __half *upload_f16(const float *h, size_t n) {
+    float *tmp = NULL; __half *d = NULL;
+    if (cudaMalloc(&tmp, n * sizeof(float)) != cudaSuccess) return NULL;
+    if (cudaMalloc(&d, n * sizeof(__half)) != cudaSuccess) { cudaFree(tmp); return NULL; }
+    cudaMemcpy(tmp, h, n * sizeof(float), cudaMemcpyHostToDevice);
+    k_f32_to_f16<<<nblocks(n), THREADS>>>(d, tmp, n);
+    cudaFree(tmp);
+    return d;
+}
+static float *upload_f32(const float *h, size_t n) {
+    float *d = NULL; if (cudaMalloc(&d, n * sizeof(float)) != cudaSuccess) return NULL;
+    cudaMemcpy(d, h, n * sizeof(float), cudaMemcpyHostToDevice); return d;
+}
+
+/* y[M,N] = x[M,K] @ W[N,K]^T + b ; W is fp16 (converted on load), x/y/b fp32. */
+__global__ void k_gemm_f16w(float *y, const float *x, const __half *W, const float *b, int M, int K, int N) {
+    __shared__ float xs[TILE][TILE], ws[TILE][TILE];
+    int ty = threadIdx.y, tx = threadIdx.x;
+    int row = blockIdx.y * TILE + ty, col = blockIdx.x * TILE + tx;
+    float acc = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += TILE) {
+        int kx = k0 + tx, ky = k0 + ty;
+        xs[ty][tx] = (row < M && kx < K) ? x[(size_t)row * K + kx] : 0.0f;
+        ws[ty][tx] = (col < N && ky < K) ? __half2float(W[(size_t)col * K + ky]) : 0.0f;
+        __syncthreads();
+        #pragma unroll
+        for (int i = 0; i < TILE; i++) acc += xs[ty][i] * ws[i][tx];
+        __syncthreads();
+    }
+    if (row < M && col < N) y[(size_t)row * N + col] = acc + (b ? b[col] : 0.0f);
+}
+static void gemm_f16w(float *y, const float *x, const __half *W, const float *b, int M, int K, int N) {
+    dim3 blk(TILE, TILE), grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
+    k_gemm_f16w<<<grid, blk>>>(y, x, W, b, M, K, N);
+}
+
+/* ---- glue kernels (device pointers) ---- */
+__global__ void k_add(float *y, const float *a, const float *b, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) y[i] = a[i] + b[i];
+}
+__global__ void k_transpose(float *dst, const float *src, int A, int B) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;   /* a*B+b over A*B -> dst[b*A+a] */
+    if (idx >= (size_t)A * B) return;
+    int a = (int)(idx / B), b = (int)(idx % B);
+    dst[(size_t)b * A + a] = src[idx];
+}
+__global__ void k_adaln(float *y, const float *scale, const float *shift, int S, int dim) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)S * dim) return;
+    int i = (int)(idx % dim);
+    y[idx] = y[idx] * (1.0f + scale[i]) + shift[i];
+}
+__global__ void k_gate(float *y, const float *gate, int S, int dim) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)S * dim) return;
+    int i = (int)(idx % dim);
+    y[idx] *= 1.0f / (1.0f + expf(-(1.0f - gate[i])));
+}
+__global__ void k_extract_heads(float *dst, const float *src, int S, int H, int hd, int stride, int off) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;   /* (h*S+s)*hd+d */
+    if (idx >= (size_t)H * S * hd) return;
+    int d = (int)(idx % hd), s = (int)((idx / hd) % S), h = (int)(idx / ((size_t)hd * S));
+    dst[idx] = src[(size_t)s * stride + off + (size_t)h * hd + d];
+}
+__global__ void k_merge_heads(float *dst, const float *src, int S, int H, int hd) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;   /* src (h*S+s)*hd+d */
+    if (idx >= (size_t)H * S * hd) return;
+    int d = (int)(idx % hd), s = (int)((idx / hd) % S), h = (int)(idx / ((size_t)hd * S));
+    dst[(size_t)s * H * hd + (size_t)h * hd + d] = src[idx];
+}
+__global__ void k_ff_silugate(float *out, const float *proj, int S, int inner) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;   /* s*inner+i */
+    if (idx >= (size_t)S * inner) return;
+    int s = (int)(idx / inner), i = (int)(idx % inner);
+    const float *pr = proj + (size_t)s * 2 * inner;
+    float g = pr[inner + i];
+    out[idx] = (g / (1.0f + expf(-g))) * pr[i];
+}
+
+/* multi-head SDPA on device-resident fp32 activations (scale 1/sqrt(D)). */
+static void attn_dev(float *out, const float *q, const float *k, const float *v,
+                     int H, int Nq, int Nk, int D, float *scores) {
+    float scale = 1.0f / sqrtf((float)D);
+    dim3 sblk(TILE, TILE), sgrid((Nk + TILE - 1) / TILE, (Nq + TILE - 1) / TILE);
+    dim3 oblk(TILE, TILE), ogrid((D + TILE - 1) / TILE, (Nq + TILE - 1) / TILE);
+    for (int h = 0; h < H; h++) {
+        const float *qh = q + (size_t)h * Nq * D, *kh = k + (size_t)h * Nk * D, *vh = v + (size_t)h * Nk * D;
+        float *oh = out + (size_t)h * Nq * D;
+        aria_gemm_nt<<<sgrid, sblk>>>(scores, qh, kh, NULL, Nq, D, Nk);
+        k_scale<<<nblocks((size_t)Nq * Nk), THREADS>>>(scores, scores, scale, Nq * Nk);
+        k_softmax<<<nblocks(Nq), THREADS>>>(scores, Nq, Nk, NULL);
+        k_matmul<<<ogrid, oblk>>>(oh, scores, vh, Nq, Nk, D);
+    }
+}
+
+/* ---- device bump arena (pointer arithmetic only) ---- */
+struct darena { char *base; size_t cap, used; };
+static float *da_alloc(darena *a, size_t nf) {
+    size_t off = (a->used + 63) & ~((size_t)63);
+    a->used = off + nf * sizeof(float);
+    return (float *)(a->base + off);
+}
+static size_t da_save(darena *a) { return a->used; }
+static void da_restore(darena *a, size_t m) { a->used = m; }
+
+struct blk_dev {
+    const float *pre_norm, *cross_norm, *ff_norm, *sa_q_norm, *sa_k_norm, *ca_q_norm;
+    const float *ssg, *ff_in_b, *ff_out_b;
+    __half *sa_to_qkv, *sa_to_out, *ca_to_q, *ca_to_out, *ff_in_w, *ff_out_w;
+};
+
+struct aria_cuda_dit {
+    int depth, ed, H, hd, inner, io_ch, n_mem, rot;
+    __half *preprocess, *postprocess, *project_in, *project_out;
+    float *memory_tokens;
+    blk_dev *blocks;
+    /* per-request */
+    int T, S, n_cond, have_req;
+    float *dx, *dv, *dgcond, *rope_cos, *rope_sin;
+    float **cross_k, **cross_v;
+    darena arena;
+};
+
+static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
+    int S = h->S, ed = h->ed, H = h->H, hd = h->hd, dim = ed, inner = h->inner, Sc = h->n_cond, rot = h->rot;
+    blk_dev *w = &h->blocks[blk];
+    darena *ar = &h->arena; size_t mark = da_save(ar);
+    int nSd = (int)nblocks((size_t)S * dim);
+
+    float *mod = da_alloc(ar, 6 * dim);
+    k_add<<<nblocks((size_t)6 * dim), THREADS>>>(mod, w->ssg, h->dgcond, 6 * dim);
+    float *scale_self = mod, *shift_self = mod + dim, *gate_self = mod + 2 * dim;
+    float *scale_ff = mod + 3 * dim, *shift_ff = mod + 4 * dim, *gate_ff = mod + 5 * dim;
+    float *residual = da_alloc(ar, (size_t)S * dim), *hh = da_alloc(ar, (size_t)S * dim);
+    float *o = da_alloc(ar, (size_t)S * dim), *merged = da_alloc(ar, (size_t)S * dim);
+    float *qh = da_alloc(ar, (size_t)H * S * hd), *kh = da_alloc(ar, (size_t)H * S * hd);
+    float *vh = da_alloc(ar, (size_t)H * S * hd), *ao = da_alloc(ar, (size_t)H * S * hd);
+    float *scores = da_alloc(ar, (size_t)S * (S > Sc ? S : Sc));
+    int nHShd = (int)nblocks((size_t)H * S * hd);
+
+    /* self-attention */
+    cudaMemcpy(residual, seq, (size_t)S * dim * sizeof(float), cudaMemcpyDeviceToDevice);
+    k_rmsnorm<<<nblocks(S), THREADS>>>(hh, seq, w->pre_norm, S, dim, 1e-5f, 0);
+    k_adaln<<<nSd, THREADS>>>(hh, scale_self, shift_self, S, dim);
+    float *qkv = da_alloc(ar, (size_t)S * 3 * dim);
+    gemm_f16w(qkv, hh, w->sa_to_qkv, NULL, S, dim, 3 * dim);
+    k_extract_heads<<<nHShd, THREADS>>>(qh, qkv, S, H, hd, 3 * dim, 0);
+    k_extract_heads<<<nHShd, THREADS>>>(kh, qkv, S, H, hd, 3 * dim, dim);
+    k_extract_heads<<<nHShd, THREADS>>>(vh, qkv, S, H, hd, 3 * dim, 2 * dim);
+    k_rmsnorm<<<nblocks((size_t)H * S), THREADS>>>(qh, qh, w->sa_q_norm, H * S, hd, 1e-6f, 0);
+    k_rmsnorm<<<nblocks((size_t)H * S), THREADS>>>(kh, kh, w->sa_k_norm, H * S, hd, 1e-6f, 0);
+    k_rope<<<nblocks((size_t)H * S), THREADS>>>(qh, h->rope_cos, h->rope_sin, H, S, hd, rot);
+    k_rope<<<nblocks((size_t)H * S), THREADS>>>(kh, h->rope_cos, h->rope_sin, H, S, hd, rot);
+    attn_dev(ao, qh, kh, vh, H, S, S, hd, scores);
+    k_merge_heads<<<nHShd, THREADS>>>(merged, ao, S, H, hd);
+    gemm_f16w(o, merged, w->sa_to_out, NULL, S, dim, dim);
+    k_gate<<<nSd, THREADS>>>(o, gate_self, S, dim);
+    k_add<<<nSd, THREADS>>>(seq, residual, o, (size_t)S * dim);
+
+    /* cross-attention (cached K/V) */
+    cudaMemcpy(residual, seq, (size_t)S * dim * sizeof(float), cudaMemcpyDeviceToDevice);
+    k_rmsnorm<<<nblocks(S), THREADS>>>(hh, seq, w->cross_norm, S, dim, 1e-5f, 0);
+    float *q = da_alloc(ar, (size_t)S * dim);
+    gemm_f16w(q, hh, w->ca_to_q, NULL, S, dim, dim);
+    k_extract_heads<<<nHShd, THREADS>>>(qh, q, S, H, hd, dim, 0);
+    k_rmsnorm<<<nblocks((size_t)H * S), THREADS>>>(qh, qh, w->ca_q_norm, H * S, hd, 1e-6f, 0);
+    attn_dev(ao, qh, h->cross_k[blk], h->cross_v[blk], H, S, Sc, hd, scores);
+    k_merge_heads<<<nHShd, THREADS>>>(merged, ao, S, H, hd);
+    gemm_f16w(o, merged, w->ca_to_out, NULL, S, dim, dim);
+    k_add<<<nSd, THREADS>>>(seq, residual, o, (size_t)S * dim);
+
+    /* feed-forward (GLU) */
+    cudaMemcpy(residual, seq, (size_t)S * dim * sizeof(float), cudaMemcpyDeviceToDevice);
+    k_rmsnorm<<<nblocks(S), THREADS>>>(hh, seq, w->ff_norm, S, dim, 1e-5f, 0);
+    k_adaln<<<nSd, THREADS>>>(hh, scale_ff, shift_ff, S, dim);
+    float *proj = da_alloc(ar, (size_t)S * 2 * inner), *gated = da_alloc(ar, (size_t)S * inner);
+    gemm_f16w(proj, hh, w->ff_in_w, w->ff_in_b, S, dim, 2 * inner);
+    k_ff_silugate<<<nblocks((size_t)S * inner), THREADS>>>(gated, proj, S, inner);
+    gemm_f16w(o, gated, w->ff_out_w, w->ff_out_b, S, inner, dim);
+    k_gate<<<nSd, THREADS>>>(o, gate_ff, S, dim);
+    k_add<<<nSd, THREADS>>>(seq, residual, o, (size_t)S * dim);
+
+    da_restore(ar, mark);
+}
+
+extern "C" aria_cuda_dit *aria_cuda_dit_create(const aria_sa3_dit_view *v) {
+    if (!aria_cuda_available()) return NULL;
+    int ed = v->ed, inner = v->inner;
+    /* rough fit check: fp16 weights ~ depth * (12*ed*ed-ish) */
+    size_t need = (size_t)v->depth * ((size_t)3 * ed * ed + 3 * (size_t)ed * ed + (size_t)2 * inner * ed
+                  + (size_t)inner * ed) * sizeof(__half) + (64u << 20);
+    size_t freeb = 0, totb = 0; cudaMemGetInfo(&freeb, &totb);
+    if (freeb < need) { fprintf(stderr, "aria_cuda_dit: need ~%zu MiB, only %zu free\n", need >> 20, freeb >> 20); return NULL; }
+
+    aria_cuda_dit *h = (aria_cuda_dit *)calloc(1, sizeof(aria_cuda_dit));
+    h->depth = v->depth; h->ed = ed; h->H = v->num_heads; h->hd = v->head_dim;
+    h->inner = inner; h->io_ch = v->io_ch; h->n_mem = v->n_mem; h->rot = v->rot_dim;
+    int C = v->io_ch;
+    h->preprocess  = upload_f16(v->preprocess,  (size_t)C * C);
+    h->postprocess = upload_f16(v->postprocess, (size_t)C * C);
+    h->project_in  = upload_f16(v->project_in,  (size_t)ed * C);
+    h->project_out = upload_f16(v->project_out, (size_t)C * ed);
+    h->memory_tokens = upload_f32(v->memory_tokens, (size_t)v->n_mem * ed);
+    h->blocks = (blk_dev *)calloc(v->depth, sizeof(blk_dev));
+    int ok = h->preprocess && h->postprocess && h->project_in && h->project_out && h->memory_tokens;
+    for (int b = 0; b < v->depth && ok; b++) {
+        const aria_dit_block_w *s = &v->blocks[b]; blk_dev *d = &h->blocks[b];
+        d->pre_norm   = upload_f32(s->pre_norm, ed);
+        d->cross_norm = upload_f32(s->cross_norm, ed);
+        d->ff_norm    = upload_f32(s->ff_norm, ed);
+        d->sa_q_norm  = upload_f32(s->sa_q_norm, h->hd);
+        d->sa_k_norm  = upload_f32(s->sa_k_norm, h->hd);
+        d->ca_q_norm  = upload_f32(s->ca_q_norm, h->hd);
+        d->ssg        = upload_f32(s->to_scale_shift_gate, (size_t)6 * ed);
+        d->ff_in_b    = upload_f32(s->ff_in_b, (size_t)2 * inner);
+        d->ff_out_b   = upload_f32(s->ff_out_b, ed);
+        d->sa_to_qkv  = upload_f16(s->sa_to_qkv, (size_t)3 * ed * ed);
+        d->sa_to_out  = upload_f16(s->sa_to_out, (size_t)ed * ed);
+        d->ca_to_q    = upload_f16(s->ca_to_q, (size_t)ed * ed);
+        d->ca_to_out  = upload_f16(s->ca_to_out, (size_t)ed * ed);
+        d->ff_in_w    = upload_f16(s->ff_in_w, (size_t)2 * inner * ed);
+        d->ff_out_w   = upload_f16(s->ff_out_w, (size_t)ed * inner);
+        ok = d->sa_to_qkv && d->sa_to_out && d->ca_to_q && d->ca_to_out && d->ff_in_w && d->ff_out_w
+             && d->ssg && d->pre_norm;
+    }
+    if (!ok) { aria_cuda_dit_free(h); return NULL; }
+    return h;
+}
+
+extern "C" void aria_cuda_dit_set_request(aria_cuda_dit *h, const aria_sa3_dit_req_view *rv) {
+    int ed = h->ed, C = h->io_ch, S = rv->S, T = rv->T, H = h->H, hd = h->hd, n_cond = rv->n_cond, rh = h->rot / 2;
+    h->T = T; h->S = S; h->n_cond = n_cond;
+    cudaMalloc(&h->dx, (size_t)C * T * sizeof(float));
+    cudaMalloc(&h->dv, (size_t)C * T * sizeof(float));
+    cudaMalloc(&h->dgcond, (size_t)6 * ed * sizeof(float));
+    h->rope_cos = upload_f32(rv->rope_cos, (size_t)S * rh);
+    h->rope_sin = upload_f32(rv->rope_sin, (size_t)S * rh);
+    h->cross_k = (float **)calloc(h->depth, sizeof(float *));
+    h->cross_v = (float **)calloc(h->depth, sizeof(float *));
+    for (int b = 0; b < h->depth; b++) {
+        h->cross_k[b] = upload_f32(rv->cross_k[b], (size_t)H * n_cond * hd);
+        h->cross_v[b] = upload_f32(rv->cross_v[b], (size_t)H * n_cond * hd);
+    }
+    /* device arena: one block's peak + step buffers (mirrors the CPU sizing) */
+    size_t block_floats = (size_t)6 * ed + 24 * (size_t)S * ed + (size_t)S * (S > n_cond ? S : n_cond);
+    size_t step_floats = (size_t)S * ed + 8 * (size_t)T * C + 8 * (size_t)ed;
+    h->arena.cap = (block_floats + step_floats + (1u << 20)) * sizeof(float);
+    h->arena.used = 0;
+    cudaMalloc(&h->arena.base, h->arena.cap);
+    h->have_req = 1;
+}
+
+extern "C" void aria_cuda_dit_step(aria_cuda_dit *h, float *v_CT, const float *x_CT, const float *gcond) {
+    int C = h->io_ch, ed = h->ed, Mt = h->n_mem, S = h->S, T = h->T;
+    cudaMemcpy(h->dx, x_CT, (size_t)C * T * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(h->dgcond, gcond, (size_t)6 * ed * sizeof(float), cudaMemcpyHostToDevice);
+    darena *ar = &h->arena; size_t mark = da_save(ar);
+
+    float *xtc = da_alloc(ar, (size_t)T * C);
+    k_transpose<<<nblocks((size_t)C * T), THREADS>>>(xtc, h->dx, C, T);   /* [C,T]->[T,C] */
+    float *pre = da_alloc(ar, (size_t)T * C);
+    gemm_f16w(pre, xtc, h->preprocess, NULL, T, C, C);
+    k_add<<<nblocks((size_t)T * C), THREADS>>>(xtc, xtc, pre, (size_t)T * C);
+
+    float *seq = da_alloc(ar, (size_t)S * ed);
+    cudaMemcpy(seq, h->memory_tokens, (size_t)Mt * ed * sizeof(float), cudaMemcpyDeviceToDevice);
+    gemm_f16w(seq + (size_t)Mt * ed, xtc, h->project_in, NULL, T, C, ed);
+
+    for (int b = 0; b < h->depth; b++) dit_block_dev(h, seq, b);
+
+    float *outtc = da_alloc(ar, (size_t)T * C);
+    gemm_f16w(outtc, seq + (size_t)Mt * ed, h->project_out, NULL, T, ed, C);
+    float *postc = da_alloc(ar, (size_t)T * C);
+    gemm_f16w(postc, outtc, h->postprocess, NULL, T, C, C);
+    k_add<<<nblocks((size_t)T * C), THREADS>>>(outtc, outtc, postc, (size_t)T * C);
+    k_transpose<<<nblocks((size_t)T * C), THREADS>>>(h->dv, outtc, T, C);  /* [T,C]->[C,T] */
+
+    da_restore(ar, mark);
+    cudaMemcpy(v_CT, h->dv, (size_t)C * T * sizeof(float), cudaMemcpyDeviceToHost);
+}
+
+extern "C" void aria_cuda_dit_free(aria_cuda_dit *h) {
+    if (!h) return;
+    cudaFree(h->preprocess); cudaFree(h->postprocess); cudaFree(h->project_in); cudaFree(h->project_out);
+    cudaFree(h->memory_tokens);
+    if (h->blocks) for (int b = 0; b < h->depth; b++) {
+        blk_dev *d = &h->blocks[b];
+        cudaFree((void *)d->pre_norm); cudaFree((void *)d->cross_norm); cudaFree((void *)d->ff_norm);
+        cudaFree((void *)d->sa_q_norm); cudaFree((void *)d->sa_k_norm); cudaFree((void *)d->ca_q_norm);
+        cudaFree((void *)d->ssg); cudaFree((void *)d->ff_in_b); cudaFree((void *)d->ff_out_b);
+        cudaFree(d->sa_to_qkv); cudaFree(d->sa_to_out); cudaFree(d->ca_to_q);
+        cudaFree(d->ca_to_out); cudaFree(d->ff_in_w); cudaFree(d->ff_out_w);
+    }
+    free(h->blocks);
+    if (h->have_req) {
+        cudaFree(h->dx); cudaFree(h->dv); cudaFree(h->dgcond);
+        cudaFree(h->rope_cos); cudaFree(h->rope_sin); cudaFree(h->arena.base);
+        if (h->cross_k) for (int b = 0; b < h->depth; b++) cudaFree(h->cross_k[b]);
+        if (h->cross_v) for (int b = 0; b < h->depth; b++) cudaFree(h->cross_v[b]);
+        free(h->cross_k); free(h->cross_v);
+    }
+    free(h);
 }

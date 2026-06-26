@@ -392,3 +392,26 @@ void aria_sa3_dit_forward(const aria_sa3_dit *m, float *out_CT, const float *x_C
     aria_sa3_dit_step(m, r, out_CT, x_CT, t);
     aria_sa3_dit_req_end(r);
 }
+
+void aria_sa3_dit_get_view(const aria_sa3_dit *m, aria_sa3_dit_view *v) {
+    v->depth = m->depth; v->ed = m->ed; v->num_heads = m->num_heads; v->head_dim = m->head_dim;
+    v->inner = m->inner; v->io_ch = m->io_ch; v->n_mem = m->n_mem; v->rot_dim = m->rot_dim;
+    v->preprocess = m->preprocess; v->postprocess = m->postprocess;
+    v->project_in = m->project_in; v->project_out = m->project_out; v->memory_tokens = m->memory_tokens;
+    v->blocks = m->blocks;
+}
+
+void aria_sa3_dit_req_get_view(const aria_sa3_dit_req *r, aria_sa3_dit_req_view *v) {
+    v->T = r->T; v->S = r->S; v->n_cond = r->n_cond; v->depth = r->m->depth;
+    v->global_seconds = r->global_seconds; v->rope_cos = r->rope_cos; v->rope_sin = r->rope_sin;
+    v->cross_k = r->cross_k; v->cross_v = r->cross_v;
+}
+
+void aria_sa3_dit_global_cond(const aria_sa3_dit *m, const float *global_seconds, float t, float *gcond) {
+    int ed = m->ed;
+    float *g = malloc((size_t)ed * sizeof(float));
+    aria_sa3_timestep_embed(g, t, m->ts_feat_dim, ed, m->to_ts0_w, m->to_ts0_b, m->to_ts2_w, m->to_ts2_b);
+    for (int i = 0; i < ed; i++) g[i] += global_seconds[i];
+    aria_sa3_mlp2(gcond, g, 1, ed, ed, 6 * ed, m->gce0_w, m->gce0_b, m->gce2_w, m->gce2_b);
+    free(g);
+}

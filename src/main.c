@@ -28,11 +28,11 @@ static void usage(const char *prog) {
         "  %s -m <model_dir> --info\n"
         "  %s -m <model_dir> --list-tensors [prefix]\n"
         "  %s --wav-roundtrip <in.wav> <out.wav>\n"
-        "  %s -m <dir> --uncond -d <seconds> -s <steps> --seed <n> -o out.wav\n"
+        "  %s -m <dir> -p \"prompt\" -d <seconds> -s <steps> --seed <n> [--device cpu|cuda] -o out.wav\n"
+        "  %s -m <dir> --uncond -d <seconds> -o out.wav\n"
         "  %s -m <dir> --prompt-embed <prompt.atns> -d <seconds> -o out.wav\n"
-        "    (text prompts need T5Gemma, not yet ported; precompute the [256,768]\n"
-        "     prompt embedding offline and pass it with --prompt-embed)\n",
-        prog, prog, prog, prog, prog);
+        "    --device cuda runs the DiT device-resident on the GPU (fp16 weights; E8.5)\n",
+        prog, prog, prog, prog, prog, prog);
 }
 
 static int cmd_wav_roundtrip(const char *in, const char *out) {
@@ -66,6 +66,7 @@ int main(int argc, char **argv) {
     float seconds = 15.0f;
     int steps = 8;
     long long seed = -1;
+    aria_device device = ARIA_DEVICE_CPU;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--wav-roundtrip") == 0 && i + 2 < argc) {
@@ -91,6 +92,9 @@ int main(int argc, char **argv) {
             steps = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             out_path = argv[++i];
+        } else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
+            const char *d = argv[++i];
+            device = (strcmp(d, "cuda") == 0 || strcmp(d, "gpu") == 0) ? ARIA_DEVICE_CUDA : ARIA_DEVICE_CPU;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]); return 0;
         } else {
@@ -118,6 +122,7 @@ int main(int argc, char **argv) {
         p.seconds_total = seconds;
         p.steps = steps;
         p.seed = seed;
+        p.device = device;
         aria_audio *audio = NULL;
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);

@@ -20,6 +20,10 @@
 #include "aria_safetensors.h"
 #include "aria_sa3.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Two-layer MLP: Linear(in_dim->mid, W0,b0) -> SiLU -> Linear(mid->out_dim, W2,b2),
  * applied to N rows. b0/b2 may be NULL (no bias). out [N, out_dim]. */
 void aria_sa3_mlp2(float *out, const float *in, int N, int in_dim, int mid, int out_dim,
@@ -82,5 +86,38 @@ void aria_sa3_dit_req_end(aria_sa3_dit_req *req);
  * begin + one step + end. x_CT/out_CT: latent [io_channels, T] (channel-major). */
 void aria_sa3_dit_forward(const aria_sa3_dit *m, float *out_CT, const float *x_CT, int T,
                           float t, const float *cross_768, int n_cond, const float *global_768);
+
+/* ---- read-only views (so the CUDA backend can upload weights/caches) ---- */
+typedef struct {
+    int depth, ed, num_heads, head_dim, inner, io_ch, n_mem, rot_dim;
+    const float *preprocess, *postprocess, *project_in, *project_out, *memory_tokens;
+    const aria_dit_block_w *blocks;   /* [depth] */
+} aria_sa3_dit_view;
+void aria_sa3_dit_get_view(const aria_sa3_dit *m, aria_sa3_dit_view *v);
+
+typedef struct {
+    int T, S, n_cond, depth;
+    const float *global_seconds, *rope_cos, *rope_sin;
+    float *const *cross_k, *const *cross_v;   /* [depth] each [H, n_cond, head_dim] */
+} aria_sa3_dit_req_view;
+void aria_sa3_dit_req_get_view(const aria_sa3_dit_req *r, aria_sa3_dit_req_view *v);
+
+/* Helper: gcond[6*ed] = global_cond_embedder(global_seconds + timestep_embed(t)).
+ * (Used by the CUDA path to compute the per-step modulation on the host.) */
+void aria_sa3_dit_global_cond(const aria_sa3_dit *m, const float *global_seconds, float t, float *gcond);
+
+/* ---- CUDA device-resident DiT (E8.5; implemented in aria_cuda.cu) ----
+ * Weights are uploaded once as fp16 (fp32 compute); the denoise loop runs on the
+ * device, only the per-step latent/velocity cross the bus. All host pointers. */
+typedef struct aria_cuda_dit aria_cuda_dit;
+aria_cuda_dit *aria_cuda_dit_create(const aria_sa3_dit_view *v);   /* NULL if no device / no fit */
+void aria_cuda_dit_free(aria_cuda_dit *h);
+void aria_cuda_dit_set_request(aria_cuda_dit *h, const aria_sa3_dit_req_view *rv);
+/* v_CT = velocity(x_CT, gcond); x_CT/v_CT are [io_channels, T], gcond is [6*ed]. */
+void aria_cuda_dit_step(aria_cuda_dit *h, float *v_CT, const float *x_CT, const float *gcond);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* ARIA_SA3_DIT_H */
