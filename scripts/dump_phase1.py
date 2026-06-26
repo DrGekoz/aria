@@ -227,6 +227,83 @@ def dump_dit_full(model_dir, out_dir):
     print(f"dumped full DiT denoiser reference to {d} (T={T})")
 
 
+def _load_decoder_ae(model_dir):
+    from safetensors.torch import load_file
+    from stable_audio_tools.models.autoencoders import create_autoencoder_from_config
+    cfg = json.load(open(os.path.join(model_dir, "model_config.json")))
+    ae_cfg = cfg["model"]["pretransform"]["config"]
+    ae = create_autoencoder_from_config(
+        {"model": ae_cfg, "sample_rate": cfg["sample_rate"]}).eval()
+    sd = load_file(os.path.join(model_dir, "model.safetensors"))
+    prefix = "pretransform.model."
+    ae_sd = {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
+    missing, unexpected = ae.load_state_dict(ae_sd, strict=False)
+    missing = [x for x in missing if "encoder" not in x and "inv_freq" not in x]
+    if missing:
+        print(f"  WARNING decoder missing keys: {missing[:8]}{'...' if len(missing) > 8 else ''}")
+    # neutralize noise so the reference is deterministic (matches the C path)
+    for mod in ae.modules():
+        if hasattr(mod, "noise_regularize"):
+            mod.noise_regularize = False
+        if hasattr(mod, "mask_noise"):
+            mod.mask_noise = 0.0
+    return ae
+
+
+def dump_decoder(model_dir, out_dir):
+    """Staged taae_v2 decode reference (softnorm -> SAMEDecoder -> unpatch)."""
+    ae = _load_decoder_ae(model_dir)
+    d = os.path.join(out_dir, "dec")
+    os.makedirs(d, exist_ok=True)
+
+    orig_randn_like = torch.randn_like
+    torch.randn_like = lambda x, *a, **k: torch.zeros_like(x)  # belt-and-suspenders determinism
+    try:
+        torch.manual_seed(0)
+        T = 16
+        latent = torch.randn(1, 256, T)
+        with torch.no_grad():
+            z = ae.bottleneck.decode(latent)        # [1,256,T]
+            dec = ae.decoder(z)                     # [1,512,16T]
+            audio = ae.pretransform.decode(dec)     # [1,2,4096T]
+    finally:
+        torch.randn_like = orig_randn_like
+
+    save_atns(os.path.join(d, "latent.atns"), latent.squeeze(0).float().cpu().numpy())
+    save_atns(os.path.join(d, "after_softnorm.atns"), z.squeeze(0).float().cpu().numpy())
+    save_atns(os.path.join(d, "after_decoder.atns"), dec.squeeze(0).float().cpu().numpy())
+    save_atns(os.path.join(d, "audio.atns"), audio.squeeze(0).float().cpu().numpy())
+    print(f"dumped taae decoder stages to {d} (T={T})")
+
+
+def dump_taae_block(model_dir, out_dir):
+    """Standalone transformers[0] block of the decoder resampling stack (best-effort,
+    for localization). Skipped if the block can't be constructed standalone."""
+    try:
+        from stable_audio_tools.models.transformer import TransformerBlock
+        from safetensors.torch import load_file
+        blk = TransformerBlock(768, dim_heads=64, cross_attend=False, norm_type="dyt",
+                               attn_kwargs={"qk_norm": "dyt", "differential": True},
+                               add_rope=True).eval()
+        sd = load_file(os.path.join(model_dir, "model.safetensors"))
+        prefix = "pretransform.model.decoder.layers.3.transformers.0."
+        bsd = {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)
+               and "inv_freq" not in k}
+        blk.load_state_dict(bsd, strict=False)
+        torch.manual_seed(7)
+        N = 34
+        x = torch.randn(1, N, 768)
+        with torch.no_grad():
+            out = blk(x)
+        d = os.path.join(out_dir, "dec")
+        os.makedirs(d, exist_ok=True)
+        save_atns(os.path.join(d, "block_x.atns"), x.squeeze(0).float().cpu().numpy())
+        save_atns(os.path.join(d, "block_out.atns"), out.squeeze(0).float().cpu().numpy())
+        print(f"dumped taae block-0 reference to {d} (N={N})")
+    except Exception as e:
+        print(f"  (skipping standalone taae block dump: {type(e).__name__}: {e})")
+
+
 if __name__ == "__main__":
     model_dir = sys.argv[1]
     out_dir = sys.argv[2] if len(sys.argv) > 2 else "parity_dumps"
@@ -236,3 +313,5 @@ if __name__ == "__main__":
     dump_dit_block(model_dir, out_dir)
     dump_dit_full(model_dir, out_dir)
     dump_schedule(out_dir)
+    dump_taae_block(model_dir, out_dir)
+    dump_decoder(model_dir, out_dir)

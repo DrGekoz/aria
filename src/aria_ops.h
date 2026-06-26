@@ -62,6 +62,14 @@ void aria_rope_apply(float *x, const float *cos_t, const float *sin_t,
 void aria_attention(float *out, const float *q, const float *k, const float *v,
                     int H, int Nq, int Nk, int D, const float *mask);
 
+/* ---- conv1d (stride 1, pre-folded weights) ---- */
+
+/* out[Cout,L] = conv1d(in[Cin,L]) with weight w[Cout,Cin,K], zero-padded `pad`
+ * each side, stride 1 (length preserving when 2*pad == K-1). bias [Cout] or NULL.
+ * Weight-normalized convs must have weight_g/weight_v folded before calling. */
+void aria_conv1d(float *out, const float *in, const float *w, const float *bias,
+                 int Cin, int Cout, int K, int pad, int L);
+
 /* ---- GLU/SwiGLU feed-forward ---- */
 
 /* FeedForward: proj x[N,dim] -> [N,2*inner] via W_in[2*inner,dim](+b_in),

@@ -171,6 +171,29 @@ void aria_attention(float *out, const float *q, const float *k, const float *v,
     free(scores);
 }
 
+void aria_conv1d(float *out, const float *in, const float *w, const float *bias,
+                 int Cin, int Cout, int K, int pad, int L) {
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int o = 0; o < Cout; o++) {
+        const float *wo = w + (size_t)o * Cin * K;
+        float *outo = out + (size_t)o * L;
+        for (int t = 0; t < L; t++) {
+            float acc = bias ? bias[o] : 0.0f;
+            for (int i = 0; i < Cin; i++) {
+                const float *wi = wo + (size_t)i * K;
+                const float *ini = in + (size_t)i * L;
+                for (int k = 0; k < K; k++) {
+                    int ti = t + k - pad;
+                    if (ti >= 0 && ti < L) acc += wi[k] * ini[ti];
+                }
+            }
+            outo[t] = acc;
+        }
+    }
+}
+
 void aria_ff_glu(float *out, const float *x, int N, int dim, int inner, int dim_out,
                  const float *W_in, const float *b_in,
                  const float *W_out, const float *b_out) {
