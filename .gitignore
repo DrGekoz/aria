@@ -7,5 +7,10 @@ aria
 *.npy
 scratch/
 
+# Models and parity dumps (never commit weights)
+models/
+*.safetensors
+*.atns
+
 # Python
 __pycache__/
