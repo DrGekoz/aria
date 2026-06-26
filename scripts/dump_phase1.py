@@ -127,9 +127,55 @@ def dump_ops(out_dir):
     print(f"dumped op references (rope/attn/ff) to {d}")
 
 
+def dump_dit_block(model_dir, out_dir):
+    """Load DiT block 0's real weights into a TransformerBlock and dump a
+    seeded forward (inputs + output). C loads the same weights from the model
+    and must reproduce the output -- validates both name mapping and the block."""
+    from stable_audio_tools.models.transformer import TransformerBlock, RotaryEmbedding
+
+    dim, num_heads, head_dim = 1024, 16, 64
+    block = TransformerBlock(
+        dim, dim_heads=head_dim, cross_attend=True, dim_context=dim,
+        global_cond_dim=dim, local_add_cond_dim=257,
+        norm_type="rms_norm", norm_kwargs={"force_fp32": True},
+        attn_kwargs={"qk_norm": "rms", "differential": False},
+        ff_kwargs={"mult": 4.0},
+    ).eval()
+
+    prefix = "model.model.transformer.layers.0."
+    sd = {}
+    with safe_open(os.path.join(model_dir, "model.safetensors"), framework="pt") as f:
+        for k in f.keys():
+            if k.startswith(prefix):
+                sd[k[len(prefix):]] = f.get_tensor(k)
+    missing, unexpected = block.load_state_dict(sd, strict=False)
+    missing = [m for m in missing if "rope" not in m]  # rope buffer is recomputed
+    if missing:
+        print(f"  WARNING block0 missing keys: {missing}")
+
+    torch.manual_seed(3)
+    S, Sc = 40, 257
+    x = torch.randn(1, S, dim)
+    context = torch.randn(1, Sc, dim)
+    global_cond = torch.randn(1, 6 * dim)  # already passed through global_cond_embedder
+    rope = RotaryEmbedding(max(head_dim // 2, 32)).forward_from_seq_len(S)
+    with torch.no_grad():
+        out = block(x, context=context, global_cond=global_cond,
+                    rotary_pos_emb=rope, local_add_cond=None)
+
+    d = os.path.join(out_dir, "dit")
+    os.makedirs(d, exist_ok=True)
+    save_atns(os.path.join(d, "block0_x.atns"), x.squeeze(0).float().cpu().numpy())
+    save_atns(os.path.join(d, "block0_context.atns"), context.squeeze(0).float().cpu().numpy())
+    save_atns(os.path.join(d, "block0_global.atns"), global_cond.squeeze(0).float().cpu().numpy())
+    save_atns(os.path.join(d, "block0_out.atns"), out.squeeze(0).float().cpu().numpy())
+    print(f"dumped DiT block-0 reference to {d} (S={S}, Sc={Sc})")
+
+
 if __name__ == "__main__":
     model_dir = sys.argv[1]
     out_dir = sys.argv[2] if len(sys.argv) > 2 else "parity_dumps"
     os.makedirs(out_dir, exist_ok=True)
     dump_number_cond(model_dir, out_dir)
     dump_ops(out_dir)
+    dump_dit_block(model_dir, out_dir)
