@@ -126,8 +126,8 @@ M2.
 
 - ✅ **E8.1** **P1** `aria_gpu.h` (device alloc/copy/sync + C-callable surface) + Makefile `cuda`/`test_cuda` wiring. nvcc 11.2 via `-ccbin gcc-9` (host gcc≤10), cudart at `/usr/lib/cuda/lib64`, `CUDA_ARCH ?= sm_61` (RTX 3070: `make cuda CUDA_ARCH=sm_86`). `make cuda` builds `libaria.a`+CLI; device detected (GT 1030, sm_61, 2 GB).
 - ✅ **E8.2** **P1** CUDA gemm/linear: shared-memory tiled `aria_gemm_nt` (`y = x @ W^T + b`, device-pointer kernel + host wrapper). `make test_cuda` parity vs CPU on the DiT/encoder shapes + edge cases (odd dims, single row): maxdiff ≤ 1.8e-5. *Note:* GT 1030 (2 GB) is **validation-only** — it can't hold the 2.27 GB model and its fp32 won't beat the AVX2 CPU; real GPU speed is the RTX 3070 (sm_86, 8 GB). fp16 (sm_86) compute lands with E8.3/E9.
-- ⬜ **E8.3** `∥` **P1** CUDA attention + rope + rmsnorm + softmax + activations. deps: E8.1 · Verify: per-op cuda-vs-cpu parity.
-- ⬜ **E8.4** `∥` **P1** CUDA conv1d. deps: E8.1 · Verify: parity.
+- ✅ **E8.3** **P1** CUDA hot ops: matmul, rmsnorm, gemma_rmsnorm, dynamic_tanh, softcap, silu, gelu_tanh, silu_gate, softmax (masked), rope, multi-head attention (gemm_nt+scale+softmax+matmul). Correctness-first kernels (norms use fp64 accum to match CPU). `make test_cuda` per-op parity on GT 1030: norms exact (0.0), rest ≤ 1.3e-4.
+- ✅ **E8.4** **P1** CUDA conv1d (stride-1, pre-folded weights). Parity ≤ 1.4e-6.
 - ⬜ **E8.5** **P1** Per-component device placement + load/free orchestration (DiT on GPU; enc/dec CPU-or-GPU; fit budget). deps: E8.2–8.4 · Verify: CUDA generation == CPU. **← M4**
 - ⬜ **E8.6** **P2** SSD weight streaming for VRAM-exceeding components (GT 1030). deps: E8.5 · Verify: medium runs on 2 GB.
 

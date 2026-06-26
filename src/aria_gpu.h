@@ -35,6 +35,24 @@ void aria_cuda_linear_dev(float *dy, const float *dx, const float *dW, const flo
 void aria_cuda_linear(float *y, const float *x, const float *W, const float *b,
                       int M, int K, int N);
 
+/* ---- remaining hot ops (E8.3/E8.4); host-pointer wrappers mirror aria_ops.h ---- */
+void aria_cuda_matmul(float *C, const float *A, const float *B, int M, int K, int N);
+void aria_cuda_rmsnorm(float *y, const float *x, const float *w, int rows, int dim, float eps);
+void aria_cuda_gemma_rmsnorm(float *y, const float *x, const float *w, int rows, int dim, float eps);
+void aria_cuda_dynamic_tanh(float *y, const float *x, float alpha,
+                            const float *w, const float *b, int rows, int dim);
+void aria_cuda_softcap(float *s, int n, float cap);
+void aria_cuda_silu(float *x, int n);
+void aria_cuda_gelu_tanh(float *x, int n);
+void aria_cuda_silu_gate(float *out, const float *gate, const float *up, int n);
+void aria_cuda_softmax(float *x, int rows, int cols, const float *mask);
+void aria_cuda_rope_apply(float *x, const float *cos_t, const float *sin_t,
+                          int H, int N, int D, int rot_dim);
+void aria_cuda_attention(float *out, const float *q, const float *k, const float *v,
+                         int H, int Nq, int Nk, int D, const float *mask);
+void aria_cuda_conv1d(float *out, const float *in, const float *w, const float *bias,
+                      int Cin, int Cout, int K, int pad, int L);
+
 #ifdef __cplusplus
 }
 #endif
