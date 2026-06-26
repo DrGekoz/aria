@@ -39,9 +39,17 @@ LIB_SRCS := \
 LIB_OBJS := $(patsubst $(SRC)/%.c,$(BUILD)/%.o,$(LIB_SRCS))
 LIB := $(BUILD)/libaria.a
 
-.PHONY: all cpu clean test cuda
+.PHONY: all cpu clean test cuda blas
 all: cpu
 cpu: aria
+
+# Optional CPU acceleration: route GEMM to a BLAS (OpenBLAS here; on macOS use
+# LDLIBS="-framework Accelerate"). Keeps the pure-C build as the default.
+BLAS_LIB ?= -lopenblas
+blas:
+	rm -f $(BUILD)/*.o $(BUILD)/libaria.a aria   # rebuild objects (CFLAGS change); keep dumps
+	$(MAKE) all CFLAGS="$(CSTD) $(DEFS) $(WARN) $(OPT) -DARIA_BLAS" \
+	            LDFLAGS="-fopenmp -lm $(BLAS_LIB)"
 
 $(BUILD):
 	@mkdir -p $(BUILD)

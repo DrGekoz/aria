@@ -19,9 +19,16 @@ backend selection).
 
 ## Golden rules
 
-1. **No third-party dependencies.** Standard C11 + libm + OpenMP (a compiler
-   feature) only. CUDA (and its runtime/cuBLAS) is allowed **only** inside the
-   `#ifdef ARIA_CUDA` backend. No BLAS, no libsndfile, no json libs, no curl.
+1. **Dependency-free by default; optional accelerated backends behind build
+   flags.** The default build (`make`) uses only standard C11 + libm + OpenMP and
+   must always work and stay the reference. Performance backends may link a
+   platform GEMM library **only behind a compile flag**, never in the default
+   path, and must keep the pure-C fallback compiled in: `-DARIA_BLAS`
+   (`cblas_sgemm` from OpenBLAS/MKL/Accelerate), `-DARIA_CUDA` (cuda + cuBLAS),
+   Metal/MPS on macOS. We borrow only GEMM/kernels, never a framework — no
+   libsndfile, no JSON libs, no curl, no ONNX/LibTorch/ggml-as-a-dep. Note: a
+   *pthread*-threaded BLAS oversubscribes against OpenMP; prefer the OpenMP build
+   of the BLAS (or pin `OMP_NUM_THREADS=1`) so one threading runtime owns the cores.
 2. **CPU-first.** The CPU path is the primary, highest-quality target and must
    always build and pass with `make` / `make test` (no GPU). CUDA is an optional
    accelerator.
@@ -42,9 +49,10 @@ backend selection).
 ## Build & test
 
 ```sh
-make                       # CPU build -> ./aria + build/libaria.a
+make                       # CPU build (pure C) -> ./aria + build/libaria.a
 make test                  # hermetic unit tests (no model, no GPU). MUST stay green.
 make parity ARIA_MODEL=<model_dir>   # parity tests vs PyTorch dumps (needs the venv)
+make blas                  # CPU + BLAS GEMM (cblas_sgemm); pure-C fallback kept
 make cuda CUDA_ARCH=sm_86  # CUDA build (Phase 3); sm_61 for the GT 1030
 make clean
 ```

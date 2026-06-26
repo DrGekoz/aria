@@ -16,6 +16,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#if defined(ARIA_BLAS) && defined(_OPENMP)
+#include <omp.h>
+#endif
 
 static void usage(const char *prog) {
     fprintf(stderr,
@@ -45,6 +49,12 @@ static int cmd_wav_roundtrip(const char *in, const char *out) {
 }
 
 int main(int argc, char **argv) {
+#if defined(ARIA_BLAS) && defined(_OPENMP)
+    /* The installed OpenBLAS uses its own pthread pool; let it own the cores and
+     * keep aria's OpenMP single-threaded to avoid oversubscription. (With the
+     * OpenMP build of OpenBLAS, both share one runtime and this isn't needed.) */
+    omp_set_num_threads(1);
+#endif
     if (argc < 2) { usage(argv[0]); return 1; }
 
     const char *model_dir = NULL;
@@ -109,10 +119,15 @@ int main(int argc, char **argv) {
         p.steps = steps;
         p.seed = seed;
         aria_audio *audio = NULL;
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
         rc = aria_generate(ctx, &p, &audio);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double gen_s = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
         if (rc == 0 && audio) {
             aria_wav_write(out_path, audio, 32);
-            printf("wrote %s (%.2fs)\n", out_path, (double)audio->num_frames / audio->sample_rate);
+            printf("wrote %s (%.2fs audio, generated in %.2fs)\n",
+                   out_path, (double)audio->num_frames / audio->sample_rate, gen_s);
             aria_audio_free(audio);
         } else {
             fprintf(stderr, "generate error: %s\n", aria_last_error());

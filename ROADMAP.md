@@ -79,7 +79,8 @@ M2.
 - ⬜ **E2.6** **P1** Differential attention (q,k base/diff split; `attn(base) − λ·attn(diff)`). deps: E2.2 · Verify: parity (taae + medium DiT). *High-risk — confirm formula from transformer.py.*
 - ⬜ **E2.7** `∥` **P0** conv1d (weight-normalized; kernel/stride/pad). deps: — · Verify: parity vs torch Conv1d.
 - ⬜ **E2.8** `∥` **P0** GLU/SiLU-gated FFN helper (`ff.0.proj[2·inner]` → silu-gate → `ff.2`). deps: — · Verify: parity vs a DiT FFN.
-- ⬜ **E2.9** **P2** Blocked + threaded gemm (replace naive loop; keep parity). deps: E0.4 · Verify: `test_ops` green + benchmark speedup.
+- 🟡 **E2.9** **P1** Fast GEMM. Done: blocked + omp-simd loop (6.6× over naive); optional `-DARIA_BLAS` `cblas_sgemm` backend (dimension-gated so the tiny per-head attention matmuls stay hand-written), pure-C fallback kept. **Finding:** pthread-OpenBLAS oversubscribes vs OpenMP → ~no net win here; PyTorch's ~3× edge is MKL/oneDNN. **Next (the real levers):** (a) a **register-blocked AVX2 microkernel** with weight packing (dependency-free, ~⅔ of MKL) and/or (b) link an **OpenMP-build BLAS / MKL / Accelerate** so one threading runtime owns the cores; (c) batch the per-head attention so it's BLAS-friendly. deps: E0.4 · Verify: `test_ops` + parity green + benchmark vs `stable-audio-tools` CPU.
+- ⬜ **E2.10** **P2** Hardware-adaptive backend selection: compile-time (`make` / `blas` / `cuda` / `mps`) + runtime device detection behind the one `aria_ops.h` surface; a fat binary can bundle CPU+CUDA and pick at runtime. deps: E2.9, E8 · Verify: each backend produces matching audio; auto-picks the best available.
 
 ## E3 — T5Gemma text encoder + tokenizer (parallel track, off critical path)
 
@@ -110,7 +111,7 @@ M2.
 - ⬜ **E6.2** `∥` **P0** RNG: xoshiro256** + Gaussian. deps: — · Verify: distribution stats; Philox parity later (E11.3).
 - ⬜ **E6.3** **P0** Pingpong loop `x ← (1−t_next)(x − t·v) + t_next·noise`. deps: E4.4, E6.1 · Verify: with **injected Python noise**, latent parity vs `sample_flow_pingpong`.
 - ⬜ **E6.4** **P0** End-to-end `text→audio` (precomputed emb + injected noise): cond → init noise → sampler → decoder → WAV. deps: E1.4, E1.5, E3.5, E4.4, E5.4, E6.3 · Verify: C WAV vs Python WAV (waveform MSE under tol). **← M1**
-- ⬜ **E6.5** **P1** CFG (cond/uncond batch + guidance) for `cfg_scale>1` / base checkpoints. deps: E6.3 · Verify: parity with cfg>1.
+- ⬜ **E6.5** **P2** CFG + `--cfg` CLI flag: cond/uncond two-pass guidance `v = v_uncond + cfg·(v_cond − v_uncond)` for `cfg_scale > 1` (≈2× cost/step; runs the denoiser twice with a null/empty prompt). **Only worthwhile on BASE checkpoints** — the post-trained/distilled small-music is tuned for `cfg = 1.0` (CFG off), so `cfg > 1` there is out-of-distribution and not recommended. deps: E6.3 · Verify: parity vs the `stable_audio_tools` CFG path on a base checkpoint. (`--seed` is already implemented.)
 
 ## E7 — continue / inpaint
 

@@ -14,14 +14,38 @@
 #include <omp.h>
 #endif
 
+#ifdef ARIA_BLAS
+#include <cblas.h>   /* optional: route GEMM to OpenBLAS/Accelerate/MKL */
+#endif
+
 /* y[M,N] = x[M,K] @ W^T + b, W=[N,K] (PyTorch Linear).
  * Blocked over output columns (NB) so each weight panel (NB*K) stays in L2 and is
  * reused across all M rows; the inner dot is vectorized via omp-simd reduction
  * (the float reduction won't auto-vectorize under strict FP otherwise). The
  * vectorized summation order differs slightly from a scalar sweep -- within the
  * parity tolerances. */
+/* Route only the big projection/FFN GEMMs to BLAS: multithreaded sgemm has
+ * per-call thread-pool overhead that dwarfs the work for the per-head attention
+ * matmuls (one of their dims is head_dim=64). Gate on the contracted/output dims
+ * being large, not on total flops (attention grows with sequence length too). */
+#define ARIA_BLAS_BIG(K, N) ((K) >= 128 && (N) >= 128)
+
 void aria_linear(float *y, const float *x, const float *W, const float *b,
                  int M, int K, int N) {
+#ifdef ARIA_BLAS
+    if (ARIA_BLAS_BIG(K, N)) {
+        /* y = x[M,K] @ W[N,K]^T  (W is PyTorch Linear weight [out,in]) */
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K,
+                    1.0f, x, K, W, K, 0.0f, y, N);
+        if (b) {
+            for (int m = 0; m < M; m++) {
+                float *yr = y + (size_t)m * N;
+                for (int n = 0; n < N; n++) yr[n] += b[n];
+            }
+        }
+        return;
+    }
+#endif
     const int NB = 32;                 /* NB*K*4 bytes ~ L2-resident weight panel */
     int n_tiles = (N + NB - 1) / NB;
     #ifdef _OPENMP
@@ -47,6 +71,13 @@ void aria_linear(float *y, const float *x, const float *W, const float *b,
 }
 
 void aria_matmul(float *C, const float *A, const float *B, int M, int K, int N) {
+#ifdef ARIA_BLAS
+    if (ARIA_BLAS_BIG(K, N)) {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, M, N, K,
+                    1.0f, A, K, B, N, 0.0f, C, N);
+        return;
+    }
+#endif
     #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
     #endif
