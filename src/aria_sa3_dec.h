@@ -33,6 +33,7 @@ typedef struct aria_sa3_dec_medium aria_sa3_dec_medium;
 aria_sa3_dec_medium *aria_sa3_dec_medium_load(safetensors_file_t *sf);
 void aria_sa3_dec_medium_free(aria_sa3_dec_medium *m);
 void aria_sa3_dec_medium_forward(const aria_sa3_dec_medium *m, float *audio, const float *latent, int T);
+/* (medium view + CUDA medium decoder declared after aria_taae_block_view, below) */
 
 /* full decode: latent[256,T] -> out_audio[2, T*4096] (caller allocates). */
 void aria_sa3_dec_forward(const aria_sa3_dec *m, float *out_audio, const float *latent, int T);
@@ -57,6 +58,20 @@ typedef struct {
     aria_taae_block_view blocks[6];
 } aria_sa3_dec_view;
 void aria_sa3_dec_get_view(const aria_sa3_dec *m, aria_sa3_dec_view *v);
+
+/* read-only view + CUDA device-resident medium decoder (GPU). Blocks where
+ * (12-i) < 8 use a sinusoidal FF (the runtime decides from the block index). */
+typedef struct {
+    float running_std;
+    const float *proj_w, *proj_b, *new_tokens, *mapping_w, *mapping_b;
+    aria_taae_block_view blocks[12];
+} aria_sa3_dec_medium_view;
+void aria_sa3_dec_medium_get_view(const aria_sa3_dec_medium *m, aria_sa3_dec_medium_view *v);
+
+typedef struct aria_cuda_dec_medium aria_cuda_dec_medium;
+aria_cuda_dec_medium *aria_cuda_dec_medium_create(const aria_sa3_dec_medium_view *v);   /* NULL if no device/fit */
+void aria_cuda_dec_medium_free(aria_cuda_dec_medium *h);
+void aria_cuda_dec_medium_forward(aria_cuda_dec_medium *h, float *audio, const float *latent, int T);
 
 /* ---- CUDA device-resident decoder (E8.5c; implemented in aria_cuda.cu) ----
  * Uploads weights (fp16 GEMMs, fp32 norms/conv) once; runs the whole latent->audio

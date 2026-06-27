@@ -47,6 +47,7 @@ typedef struct {
     /* persistent device DiT + decoder (weights uploaded once, reused across generations) */
     aria_cuda_dit *cdit;
     aria_cuda_dec *cdec;
+    aria_cuda_dec_medium *cdec_med;   /* medium GPU decoder (dim 1536, banded attention) */
 } sa3_state;
 
 /* Load the T5Gemma encoder + tokenizer on demand (text prompts only). */
@@ -121,6 +122,7 @@ static void sa3_unload(void *state) {
 #ifdef ARIA_CUDA
     if (st->cdit) aria_cuda_dit_free(st->cdit);
     if (st->cdec) aria_cuda_dec_free(st->cdec);
+    if (st->cdec_med) aria_cuda_dec_medium_free(st->cdec_med);
 #endif
     aria_sa3_dit_free(st->dit);
     aria_sa3_dec_free(st->dec);
@@ -333,7 +335,13 @@ static int sa3_generate(aria_ctx *ctx, void *state,
         dc.cdit = st->cdit;
         dc.global_seconds = rv.global_seconds;
         dc.gcond = malloc((size_t)6 * st->cfg.embed_dim * sizeof(float));
-        if (!st->cdec && !st->is_medium) {   /* GPU decoder is small-music only */
+        if (st->is_medium) {
+            if (!st->cdec_med) {
+                aria_sa3_dec_medium_view dv; aria_sa3_dec_medium_get_view(st->dec_med, &dv);
+                st->cdec_med = aria_cuda_dec_medium_create(&dv);
+                if (st->cdec_med) fprintf(stderr, "[aria] decoder: GPU device-resident (medium), fp16\n");
+            }
+        } else if (!st->cdec) {
             aria_sa3_dec_view dv; aria_sa3_dec_get_view(st->dec, &dv);
             st->cdec = aria_cuda_dec_create(&dv);
             if (st->cdec) fprintf(stderr, "[aria] decoder: GPU device-resident, fp16\n");
@@ -351,7 +359,8 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     /* decode -> interleaved stereo (GPU if the DiT ran there, else CPU) */
     float *audio = malloc((size_t)2 * T * 4096 * sizeof(float));
 #ifdef ARIA_CUDA
-    if (st->cdec) aria_cuda_dec_forward(st->cdec, audio, x, T);
+    if (st->cdec_med)  aria_cuda_dec_medium_forward(st->cdec_med, audio, x, T);
+    else if (st->cdec) aria_cuda_dec_forward(st->cdec, audio, x, T);
     else
 #endif
     if (st->is_medium) aria_sa3_dec_medium_forward(st->dec_med, audio, x, T);
@@ -362,7 +371,7 @@ static int sa3_generate(aria_ctx *ctx, void *state,
         fprintf(stderr, "[aria] profile: setup=%.2fs dit=%.2fs decode=%.2fs (T=%d steps=%d) | peak RSS %.0f MB",
                 t1 - t0, t2 - t1, t3 - t2, T, steps, ru.ru_maxrss / 1024.0);
 #ifdef ARIA_CUDA
-        if (st->cdit || st->cdec) {
+        if (st->cdit || st->cdec || st->cdec_med) {
             size_t used = 0, total = 0; aria_cuda_meminfo(&used, &total);
             fprintf(stderr, " | GPU %.0f/%.0f MB", used / 1048576.0, total / 1048576.0);
         }
