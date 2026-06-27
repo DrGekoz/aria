@@ -21,6 +21,7 @@ LIB_SRCS := \
   $(SRC)/aria_wav.c \
   $(SRC)/aria_json.c \
   $(SRC)/aria_cpu.c \
+  $(SRC)/aria_quant.c \
   $(SRC)/aria_arena.c \
   $(SRC)/aria_cond.c \
   $(SRC)/aria_parity.c \
@@ -111,7 +112,7 @@ aria: $(BUILD)/main.o $(LIB)
 	$(CC) $(CFLAGS) -I$(SRC) $< -L$(BUILD) -laria $(LDFLAGS) -o $@
 
 # ---- tests ----
-TESTS := test_ops test_wav test_config test_sampler test_arena
+TESTS := test_ops test_wav test_config test_sampler test_arena test_quant
 test: $(LIB)
 	@set -e; \
 	for t in $(TESTS); do \
