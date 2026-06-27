@@ -156,27 +156,35 @@ extern "C" void aria_cuda_matmul(float *C, const float *A, const float *B, int M
     cudaFree(dA); cudaFree(dB); d_out(C, dC, (size_t)M * N);
 }
 
-/* ---- rmsnorm / gemma_rmsnorm (one thread per row, fp64 accum) ---- */
+/* ---- rmsnorm / gemma_rmsnorm: one block per row, fp32 shared-mem reduction ----
+ * (the old thread-per-row + fp64 accum was 51% of GPU time; fp64 is 1/64 rate on
+ * Ampere and 1 thread/row starves the device. fp32 is within the fp16 tolerance.) */
+#define RED_TH 256
 __global__ void k_rmsnorm(float *y, const float *x, const float *w, int rows, int dim, float eps, int gemma) {
-    int r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= rows) return;
+    int r = blockIdx.x; if (r >= rows) return;
     const float *xr = x + (size_t)r * dim; float *yr = y + (size_t)r * dim;
-    double ss = 0.0;
-    for (int i = 0; i < dim; i++) ss += (double)xr[i] * xr[i];
-    float inv = (float)(1.0 / sqrt(ss / dim + eps));
-    for (int i = 0; i < dim; i++) {
+    __shared__ float red[RED_TH];
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) ss += xr[i] * xr[i];
+    red[threadIdx.x] = ss; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv = rsqrtf(red[0] / dim + eps);
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
         float g = w ? (gemma ? 1.0f + w[i] : w[i]) : 1.0f;
         yr[i] = xr[i] * inv * g;
     }
 }
 extern "C" void aria_cuda_rmsnorm(float *y, const float *x, const float *w, int rows, int dim, float eps) {
     float *dx = d_in(x, (size_t)rows * dim), *dw = w ? d_in(w, dim) : NULL, *dy = d_new((size_t)rows * dim);
-    k_rmsnorm<<<nblocks(rows), THREADS>>>(dy, dx, dw, rows, dim, eps, 0); CK(cudaGetLastError());
+    k_rmsnorm<<<rows, RED_TH>>>(dy, dx, dw, rows, dim, eps, 0); CK(cudaGetLastError());
     cudaFree(dx); if (dw) cudaFree(dw); d_out(y, dy, (size_t)rows * dim);
 }
 extern "C" void aria_cuda_gemma_rmsnorm(float *y, const float *x, const float *w, int rows, int dim, float eps) {
     float *dx = d_in(x, (size_t)rows * dim), *dw = d_in(w, dim), *dy = d_new((size_t)rows * dim);
-    k_rmsnorm<<<nblocks(rows), THREADS>>>(dy, dx, dw, rows, dim, eps, 1); CK(cudaGetLastError());
+    k_rmsnorm<<<rows, RED_TH>>>(dy, dx, dw, rows, dim, eps, 1); CK(cudaGetLastError());
     cudaFree(dx); cudaFree(dw); d_out(y, dy, (size_t)rows * dim);
 }
 
@@ -226,24 +234,29 @@ extern "C" void aria_cuda_silu_gate(float *out, const float *gate, const float *
     cudaFree(dg); cudaFree(du); d_out(out, don, n);
 }
 
-/* ---- row softmax (one thread per row), optional additive mask ---- */
+/* ---- row softmax: one block per row (shared-mem max + sum), optional mask ---- */
 __global__ void k_softmax(float *x, int rows, int cols, const float *mask) {
-    int r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= rows) return;
+    int r = blockIdx.x; if (r >= rows) return;
     float *xr = x + (size_t)r * cols; const float *mr = mask ? mask + (size_t)r * cols : NULL;
+    __shared__ float red[RED_TH];
     float mx = -INFINITY;
-    for (int i = 0; i < cols; i++) { float v = xr[i] + (mr ? mr[i] : 0.0f); xr[i] = v; if (v > mx) mx = v; }
-    float s = 0.0f;
-    for (int i = 0; i < cols; i++) { float e = expf(xr[i] - mx); xr[i] = e; s += e; }
-    float inv = s > 0.0f ? 1.0f / s : 0.0f;
-    for (int i = 0; i < cols; i++) xr[i] *= inv;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) { float v = xr[i] + (mr ? mr[i] : 0.0f); xr[i] = v; mx = fmaxf(mx, v); }
+    red[threadIdx.x] = mx; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]); __syncthreads(); }
+    mx = red[0]; __syncthreads();
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) { float e = expf(xr[i] - mx); xr[i] = e; sum += e; }
+    red[threadIdx.x] = sum; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s]; __syncthreads(); }
+    float inv = red[0] > 0.0f ? 1.0f / red[0] : 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) xr[i] *= inv;
 }
 __global__ void k_scale(float *y, const float *x, float a, int n) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < (size_t)n) y[i] = x[i] * a;
 }
 extern "C" void aria_cuda_softmax(float *x, int rows, int cols, const float *mask) {
     float *dx = d_in(x, (size_t)rows * cols), *dm = mask ? d_in(mask, (size_t)rows * cols) : NULL;
-    k_softmax<<<nblocks(rows), THREADS>>>(dx, rows, cols, dm); CK(cudaGetLastError());
+    k_softmax<<<rows, RED_TH>>>(dx, rows, cols, dm); CK(cudaGetLastError());
     if (dm) cudaFree(dm); d_out(x, dx, (size_t)rows * cols);
 }
 
@@ -284,7 +297,7 @@ extern "C" void aria_cuda_attention(float *out, const float *q, const float *k, 
         float *oh = dout + (size_t)h * Nq * D;
         aria_gemm_nt<<<sgrid, sblk>>>(dscores, qh, kh, NULL, Nq, D, Nk);   /* scores = qh @ kh^T */
         k_scale<<<nblocks((size_t)Nq * Nk), THREADS>>>(dscores, dscores, scale, Nq * Nk);
-        k_softmax<<<nblocks(Nq), THREADS>>>(dscores, Nq, Nk, dmask);
+        k_softmax<<<Nq, RED_TH>>>(dscores, Nq, Nk, dmask);
         k_matmul<<<ogrid, oblk>>>(oh, dscores, vh, Nq, Nk, D);             /* out = scores @ vh */
     }
     CK(cudaGetLastError());
@@ -414,7 +427,7 @@ static void attn_dev(cublasHandle_t cb, float *out, const float *q, const float 
         &one, k, D, (long long)Nk * D, q, D, (long long)Nq * D,
         &zero, scores, Nk, (long long)Nq * Nk, H);
     k_scale<<<nblocks((size_t)H * Nq * Nk), THREADS>>>(scores, scores, scale, H * Nq * Nk);
-    k_softmax<<<nblocks((size_t)H * Nq), THREADS>>>(scores, H * Nq, Nk, NULL);
+    k_softmax<<<H * Nq, RED_TH>>>(scores, H * Nq, Nk, NULL);
     /* out[h] = scores[h] @ v[h]  -> per head [Nq,D] */
     cublasSgemmStridedBatched(cb, CUBLAS_OP_N, CUBLAS_OP_N, D, Nq, Nk,
         &one, v, D, (long long)Nk * D, scores, Nk, (long long)Nq * Nk,
@@ -491,15 +504,15 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
 
     /* self-attention */
     cudaMemcpy(residual, seq, (size_t)S * dim * sizeof(float), cudaMemcpyDeviceToDevice);
-    k_rmsnorm<<<nblocks(S), THREADS>>>(hh, seq, w->pre_norm, S, dim, 1e-5f, 0);
+    k_rmsnorm<<<S, RED_TH>>>(hh, seq, w->pre_norm, S, dim, 1e-5f, 0);
     k_adaln<<<nSd, THREADS>>>(hh, scale_self, shift_self, S, dim);
     float *qkv = da_alloc(ar, (size_t)S * 3 * dim);
     gemm_f16w(h->cublas, &h->arena, qkv, hh, w->sa_to_qkv, NULL, S, dim, 3 * dim);
     k_extract_heads<<<nHShd, THREADS>>>(qh, qkv, S, H, hd, 3 * dim, 0);
     k_extract_heads<<<nHShd, THREADS>>>(kh, qkv, S, H, hd, 3 * dim, dim);
     k_extract_heads<<<nHShd, THREADS>>>(vh, qkv, S, H, hd, 3 * dim, 2 * dim);
-    k_rmsnorm<<<nblocks((size_t)H * S), THREADS>>>(qh, qh, w->sa_q_norm, H * S, hd, 1e-6f, 0);
-    k_rmsnorm<<<nblocks((size_t)H * S), THREADS>>>(kh, kh, w->sa_k_norm, H * S, hd, 1e-6f, 0);
+    k_rmsnorm<<<H * S, RED_TH>>>(qh, qh, w->sa_q_norm, H * S, hd, 1e-6f, 0);
+    k_rmsnorm<<<H * S, RED_TH>>>(kh, kh, w->sa_k_norm, H * S, hd, 1e-6f, 0);
     k_rope<<<nblocks((size_t)H * S), THREADS>>>(qh, h->rope_cos, h->rope_sin, H, S, hd, rot);
     k_rope<<<nblocks((size_t)H * S), THREADS>>>(kh, h->rope_cos, h->rope_sin, H, S, hd, rot);
     attn_dev(h->cublas, ao, qh, kh, vh, H, S, S, hd, scores);
@@ -510,11 +523,11 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
 
     /* cross-attention (cached K/V) */
     cudaMemcpy(residual, seq, (size_t)S * dim * sizeof(float), cudaMemcpyDeviceToDevice);
-    k_rmsnorm<<<nblocks(S), THREADS>>>(hh, seq, w->cross_norm, S, dim, 1e-5f, 0);
+    k_rmsnorm<<<S, RED_TH>>>(hh, seq, w->cross_norm, S, dim, 1e-5f, 0);
     float *q = da_alloc(ar, (size_t)S * dim);
     gemm_f16w(h->cublas, &h->arena, q, hh, w->ca_to_q, NULL, S, dim, dim);
     k_extract_heads<<<nHShd, THREADS>>>(qh, q, S, H, hd, dim, 0);
-    k_rmsnorm<<<nblocks((size_t)H * S), THREADS>>>(qh, qh, w->ca_q_norm, H * S, hd, 1e-6f, 0);
+    k_rmsnorm<<<H * S, RED_TH>>>(qh, qh, w->ca_q_norm, H * S, hd, 1e-6f, 0);
     attn_dev(h->cublas, ao, qh, h->cross_k[blk], h->cross_v[blk], H, S, Sc, hd, scores);
     k_merge_heads<<<nHShd, THREADS>>>(merged, ao, S, H, hd);
     gemm_f16w(h->cublas, &h->arena, o, merged, w->ca_to_out, NULL, S, dim, dim);
@@ -522,7 +535,7 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
 
     /* feed-forward (GLU) */
     cudaMemcpy(residual, seq, (size_t)S * dim * sizeof(float), cudaMemcpyDeviceToDevice);
-    k_rmsnorm<<<nblocks(S), THREADS>>>(hh, seq, w->ff_norm, S, dim, 1e-5f, 0);
+    k_rmsnorm<<<S, RED_TH>>>(hh, seq, w->ff_norm, S, dim, 1e-5f, 0);
     k_adaln<<<nSd, THREADS>>>(hh, scale_ff, shift_ff, S, dim);
     float *proj = da_alloc(ar, (size_t)S * 2 * inner), *gated = da_alloc(ar, (size_t)S * inner);
     gemm_f16w(h->cublas, &h->arena, proj, hh, w->ff_in_w, w->ff_in_b, S, dim, 2 * inner);
