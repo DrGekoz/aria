@@ -52,13 +52,21 @@ the parity tests against them. Override the interpreter or the model with:
 make parity ARIA_MODEL=/abs/path/to/model PYTHON=/path/to/venv/bin/python
 ```
 
-What the parity suite covers (growing as the runtime grows):
+What the parity suite (`PARITY_TESTS` in the Makefile) covers, all driven against
+the real `stable-audio-tools` reference:
 
-- `test_number_cond`: the `seconds_total` NumberConditioner (ExpoFourier +
-  Linear) against `NumberConditioner.forward`.
-- (planned) per-op parity for attention/RoPE/QK-RMSNorm/conv1d, the DiT block and
-  full DiT forward, the taae_v2 decoder, and the sampler loop — each landing with
-  its own parity test before it is trusted.
+- conditioning + schedule: `test_number_cond` (NumberConditioner), `test_schedule`
+  (LogSNR pingpong schedule).
+- attention + DiT: `test_attn`, `test_dit`, `test_dit_diff` (differential block),
+  `test_dit_full` (full DiT forward), `test_quant_dit` (Q8/Q4 velocity gates).
+- autoencoder: `test_dec` (small-music decoder), `test_taae_med` (medium block),
+  `test_enc` (encoder), `test_inpaint` / `test_inpaint_e2e` (continue/inpaint).
+- end-to-end + text: `test_e2e`, `test_t5enc`, `test_tokenizer`.
+
+CUDA op parity is a separate target, `make test_cuda` (CUDA-vs-CPU, skips cleanly
+with no device). The medium-model end-to-end tests (`test_dec_medium`,
+`test_e2e_medium`) need the medium weights and so run outside the default
+`PARITY_TESTS` set.
 
 ### How parity is judged
 

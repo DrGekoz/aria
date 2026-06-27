@@ -63,9 +63,10 @@ void aria_logsnr_schedule(float *out, int steps, float sigma_max,
 }
 
 /* ---- pingpong ---- */
-void aria_pingpong(float *x, int n, const float *sigmas, int steps,
-                   aria_denoiser_fn denoise, void *ctx,
-                   aria_rng *rng, const float *injected_noise) {
+void aria_pingpong_cb(float *x, int n, const float *sigmas, int steps,
+                      aria_denoiser_fn denoise, void *ctx,
+                      aria_rng *rng, const float *injected_noise,
+                      void (*progress)(int step, int total, void *user), void *user) {
     float *v = malloc((size_t)n * sizeof(float));
     float *denoised = malloc((size_t)n * sizeof(float));
     for (int i = 0; i < steps; i++) {
@@ -77,7 +78,14 @@ void aria_pingpong(float *x, int n, const float *sigmas, int steps,
             float z = noise ? noise[j] : aria_rng_gaussian(rng);
             x[j] = (1.0f - tn) * denoised[j] + tn * z;
         }
+        if (progress) progress(i + 1, steps, user);
     }
     free(v);
     free(denoised);
+}
+
+void aria_pingpong(float *x, int n, const float *sigmas, int steps,
+                   aria_denoiser_fn denoise, void *ctx,
+                   aria_rng *rng, const float *injected_noise) {
+    aria_pingpong_cb(x, n, sigmas, steps, denoise, ctx, rng, injected_noise, NULL, NULL);
 }

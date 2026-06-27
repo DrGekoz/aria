@@ -70,26 +70,36 @@ make clean
 src/
   aria.h / aria.c            public API + orchestrator (load, registry, generate)
   aria_model.h               internal model-module vtable + aria_ctx struct
-  aria_model_sa3.c           Stable Audio 3 module (detect/load/generate)
-  aria_dit_sa3.c             SA3 DiT forward                 [planned]
-  aria_taae.c                taae_v2 autoencoder enc/dec     [planned]
-  aria_t5gemma.c             T5Gemma text encoder            [planned]
-  aria_spm.c                 tokenizer                       [planned]
-  aria_cond.h / aria_cond.c  conditioners (number, timestep, assembly)
-  aria_sampler.c             pingpong + schedule + CFG       [planned]
+  aria_model_sa3.c           Stable Audio 3 module (detect/load/generate, device routing)
+  aria_sa3_config.c          model_config.json -> aria_sa3_config
+  aria_sa3_dit.{c,h}         SA3 DiT forward (standard + differential attention)
+  aria_taae.{c,h}            shared taae_v2 transformer block (small + medium kernels)
+  aria_sa3_dec.{c,h}         taae_v2 decoder (small-music) + medium decoder decls
+  aria_sa3_dec_medium.c      taae_v2 decoder (medium: sliding-window + sinusoidal FF)
+  aria_sa3_enc.c             taae_v2 encoder (audio->latent, for continue/inpaint)
+  aria_t5enc.c               T5Gemma text encoder
+  aria_tokenizer.c           tokenizer (exported binary loaded at runtime)
+  aria_cond.{c,h}            conditioners (number, timestep, assembly, inpaint local)
+  aria_sampler.{c,h}         RNG (xoshiro256**) + LogSNR schedule + pingpong
+  aria_arena.{c,h}           bump allocator (hot-path scratch reuse)
   aria_ops.h                 backend-agnostic op surface
   aria_cpu.c                 CPU kernels (AVX2/FMA + OpenMP)
-  aria_cuda.cu / aria_gpu.h  CUDA kernels                    [Phase 3]
-  aria_quant.*               int8/q4 pack + dequant-on-use   [Phase 4]
+  aria_cuda.cu               CUDA backend (device-resident DiT + decoders, cuBLAS)
+  aria_quant.{c,h}           Q8 / asymmetric-Q4 pack + dequant-on-use
   aria_safetensors.*         mmap weight loader
   aria_wav.*                 WAV I/O
   aria_json.*                tiny config reader
   aria_parity.*              .atns reader for parity tests
   main.c                     CLI
+examples/generate.c          minimal external program linking libaria.a
 tests/                       unit + parity tests
-scripts/                     parity_io.py, dump_phase1.py (PyTorch reference dumps)
-tools/                       aria-quantize (offline)         [Phase 4]
+scripts/                     export_tokenizer.py, dump_phase1.py (PyTorch reference dumps)
+tools/aria_quantize.c        offline DiT quantizer (model.safetensors -> .aria overlay)
 ```
+
+The CUDA backend (`aria_cuda.cu`), Q8/Q4 quantization, continue/inpaint, and the
+medium model are all implemented (see [STATUS.md](STATUS.md)); the pure-C `make`
+build stays the default and the always-green reference.
 
 ## Architecture (and how to add a model)
 

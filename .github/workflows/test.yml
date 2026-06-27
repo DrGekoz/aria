@@ -1,0 +1,28 @@
+name: test
+
+# CPU-only, hermetic: `make test` needs no model, no GPU, and no network.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compiler info
+        run: gcc --version && make --version | head -1
+
+      # ubuntu-latest ships gcc + libgomp (OpenMP); no extra deps needed.
+      # -march=native is safe here (x86-64 runners have AVX2/FMA); CI binaries
+      # are test-only — distribution builds should drop -march=native.
+      - name: Build (CPU)
+        run: make
+
+      - name: Hermetic unit tests
+        run: make test
+
+      - name: Public-API link check (libaria.a)
+        run: make example   # compiles examples/generate.c against build/libaria.a

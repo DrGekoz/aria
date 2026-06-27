@@ -17,9 +17,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>   /* isatty */
 #if defined(ARIA_BLAS) && defined(_OPENMP)
 #include <omp.h>
 #endif
+
+/* per-step progress, drawn on one line; only attached when stderr is a TTY */
+static void cli_progress(int step, int total, void *user) {
+    (void)user;
+    fprintf(stderr, "\r  denoising [%d/%d]%s", step, total, step == total ? "\n" : "");
+    fflush(stderr);
+}
 
 static void usage(const char *prog) {
     fprintf(stderr,
@@ -159,6 +167,7 @@ int main(int argc, char **argv) {
         p.inpaint_from_s = inpaint_from;
         p.inpaint_to_s = inpaint_to;
         p.inpaint_continue = inpaint_continue;
+        if (isatty(fileno(stderr))) p.progress = cli_progress;  /* live progress on a terminal */
         double best = 1e9;
         for (int b = 0; b < bench && rc == 0; b++) {
             aria_audio *audio = NULL;

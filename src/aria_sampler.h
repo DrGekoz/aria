@@ -36,4 +36,11 @@ void aria_pingpong(float *x, int n, const float *sigmas, int steps,
                    aria_denoiser_fn denoise, void *ctx,
                    aria_rng *rng, const float *injected_noise);
 
+/* Same, plus an optional progress callback invoked after each completed step
+ * (step+1, total=steps). progress may be NULL. */
+void aria_pingpong_cb(float *x, int n, const float *sigmas, int steps,
+                      aria_denoiser_fn denoise, void *ctx,
+                      aria_rng *rng, const float *injected_noise,
+                      void (*progress)(int step, int total, void *user), void *user);
+
 #endif /* ARIA_SAMPLER_H */

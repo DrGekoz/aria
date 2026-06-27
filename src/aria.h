@@ -44,9 +44,13 @@ typedef struct {
     float inpaint_from_s;           /* start of the regenerated region (seconds) */
     float inpaint_to_s;             /* end of the regenerated region; <= 0 = seconds_total */
     int   inpaint_continue;         /* 1 = continue mode (regenerate the tail) */
+    /* optional per-step progress callback, invoked after each denoise step with
+     * (step, total, progress_user). NULL = no callback. */
+    void (*progress)(int step, int total, void *user);
+    void *progress_user;
 } aria_gen_params;
 
-#define ARIA_GEN_PARAMS_DEFAULT { NULL, NULL, 15.0f, 8, 1.0f, 0, ARIA_DEVICE_AUTO, ARIA_F32, NULL, NULL, 0.0f, 0.0f, 0 }
+#define ARIA_GEN_PARAMS_DEFAULT { NULL, NULL, 15.0f, 8, 1.0f, 0, ARIA_DEVICE_AUTO, ARIA_F32, NULL, NULL, 0.0f, 0.0f, 0, NULL, NULL }
 
 /* Load a model from a directory containing model_config.json + model.safetensors.
  * Returns NULL on error (see aria_last_error()). */

@@ -349,7 +349,7 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     }
 #endif
     double t1 = sa3_now();
-    aria_pingpong(x, n, sched, steps, sa3_denoise, &dc, &rng, NULL);
+    aria_pingpong_cb(x, n, sched, steps, sa3_denoise, &dc, &rng, NULL, p->progress, p->progress_user);
     double t2 = sa3_now();
 #ifdef ARIA_CUDA
     free(dc.gcond);   /* the device handle persists on st; only gcond is per-call */

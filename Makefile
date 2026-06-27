@@ -41,9 +41,13 @@ EXTRA_LIB_OBJS ?=
 LIB_OBJS := $(patsubst $(SRC)/%.c,$(BUILD)/%.o,$(LIB_SRCS)) $(EXTRA_LIB_OBJS)
 LIB := $(BUILD)/libaria.a
 
-.PHONY: all cpu clean test cuda test_cuda blas bench bench-sweep profile help quantize install
+.PHONY: all cpu clean test cuda test_cuda blas bench bench-sweep profile help quantize install example
 all: cpu
 cpu: aria
+
+# example external program: links libaria.a using only the public headers (E11.1)
+example: $(LIB)
+	$(CC) $(CFLAGS) -I$(SRC) examples/generate.c -L$(BUILD) -laria $(LDFLAGS) -o example
 
 # install the CLI, static lib, and public headers under PREFIX (default /usr/local)
 PREFIX ?= /usr/local
@@ -69,6 +73,7 @@ help:
 	@echo "    make blas          CPU build routing GEMM to a BLAS (BLAS_LIB=-lopenblas)"
 	@echo "    make quantize      offline DiT quantizer -> ./aria-quantize (E9.2)"
 	@echo "    make install       install aria + libaria.a + headers (PREFIX=/usr/local)"
+	@echo "    make example       build examples/generate.c against libaria.a"
 	@echo "    make clean         remove build/ and ./aria"
 	@echo ""
 	@echo "  Test"
@@ -182,4 +187,4 @@ test_cuda:
 	$(BUILD)/test_cuda
 
 clean:
-	rm -rf $(BUILD) aria aria-quantize
+	rm -rf $(BUILD) aria aria-quantize example
