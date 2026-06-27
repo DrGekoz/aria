@@ -134,7 +134,7 @@ aria: $(BUILD)/main.o $(LIB)
 	$(CC) $(CFLAGS) -I$(SRC) $< -L$(BUILD) -laria $(LDFLAGS) -o $@
 
 # ---- tests ----
-TESTS := test_ops test_wav test_config test_sampler test_arena test_quant
+TESTS := test_ops test_wav test_config test_sampler test_arena test_quant test_rng
 test: $(LIB)
 	@set -e; \
 	for t in $(TESTS); do \

@@ -35,7 +35,8 @@ differential DiT + a sliding-window/sinusoidal taae decoder, both device-residen
     else CPU.
 - **CLI (`aria`):** `-m <model>` `-p "prompt"` | `--prompt-embed` | `--uncond`, `-d <seconds>`,
   `-s <steps>`, `--seed`, `--device auto|cpu|cuda`, `--precision fp32|q8|q4`,
-  `--bench N` (warm timing), `-o <out.wav>`;
+  `--rng xoshiro|torch` (torch = PyTorch-matched noise), `--bench N` (warm timing),
+  `-o <out.wav>`; per-step progress on a TTY;
   `--continue <wav>` / `--inpaint <wav> --from <s> --to <s>` (continue/inpaint);
   `ARIA_PROFILE=1` for per-stage timing; `--info`, `--list-tensors`.
 - **Tests:** per-op + per-component + end-to-end parity (`test_ops/arena/wav/config/sampler/

@@ -136,8 +136,9 @@ python scripts/export_tokenizer.py models/small-music
 ./aria -m models/small-music --uncond -d 10 -o out.wav
 ./aria -m models/small-music --prompt-embed prompt.atns -d 10 -o out.wav
 
-# pick the backend / precision
+# pick the backend / precision; --rng torch matches PyTorch's randn for reproduction
 ./aria -m models/small-music -p "..." --device cuda --precision q4 -o out.wav
+./aria -m models/small-music --uncond -d 5 --seed 0 --rng torch -o out.wav
 
 # continue (extend a clip) / inpaint (regenerate a region) — CPU, init WAV at 44.1 kHz
 ./aria -m models/small-music -p "..." -d 30 --continue in.wav -o out.wav

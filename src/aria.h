@@ -48,9 +48,11 @@ typedef struct {
      * (step, total, progress_user). NULL = no callback. */
     void (*progress)(int step, int total, void *user);
     void *progress_user;
+    int   rng_torch;                /* 1 = PyTorch-matched noise (MT19937) for exact
+                                     * torch.randn reproduction; 0 = xoshiro (default) */
 } aria_gen_params;
 
-#define ARIA_GEN_PARAMS_DEFAULT { NULL, NULL, 15.0f, 8, 1.0f, 0, ARIA_DEVICE_AUTO, ARIA_F32, NULL, NULL, 0.0f, 0.0f, 0, NULL, NULL }
+#define ARIA_GEN_PARAMS_DEFAULT { NULL, NULL, 15.0f, 8, 1.0f, 0, ARIA_DEVICE_AUTO, ARIA_F32, NULL, NULL, 0.0f, 0.0f, 0, NULL, NULL, 0 }
 
 /* Load a model from a directory containing model_config.json + model.safetensors.
  * Returns NULL on error (see aria_last_error()). */

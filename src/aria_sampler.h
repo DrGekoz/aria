@@ -12,12 +12,23 @@
 
 #include <stdint.h>
 
-/* xoshiro256** PRNG (seeded via SplitMix64), with N(0,1) via Box-Muller. */
-typedef struct { uint64_t s[4]; } aria_rng;
-void  aria_rng_seed(aria_rng *r, uint64_t seed);
-double aria_rng_next_double(aria_rng *r);   /* uniform [0,1) */
-float aria_rng_gaussian(aria_rng *r);       /* N(0,1) */
-void  aria_rng_randn(aria_rng *r, float *out, int n);
+/* PRNG with two engines selectable per instance:
+ *  - ARIA_RNG_XOSHIRO: xoshiro256** (seeded via SplitMix64), N(0,1) via Box-Muller.
+ *  - ARIA_RNG_TORCH:   PyTorch's at::mt19937 + the float `normal_fill` (block-of-16
+ *    Box-Muller), so aria_rng_randn bit-matches `torch.manual_seed(s); torch.randn(n)`
+ *    on CPU for n >= 16 (the only case generation hits; n = 256*T). */
+typedef enum { ARIA_RNG_XOSHIRO = 0, ARIA_RNG_TORCH = 1 } aria_rng_mode;
+typedef struct {
+    int mode;
+    uint64_t s[4];        /* xoshiro256** state */
+    uint32_t mt[624];     /* at::mt19937 state */
+    int mt_left, mt_next;
+} aria_rng;
+void  aria_rng_seed(aria_rng *r, uint64_t seed);                       /* xoshiro (back-compat) */
+void  aria_rng_init(aria_rng *r, uint64_t seed, aria_rng_mode mode);   /* select the engine */
+double aria_rng_next_double(aria_rng *r);   /* xoshiro uniform [0,1) */
+float aria_rng_gaussian(aria_rng *r);       /* xoshiro N(0,1) */
+void  aria_rng_randn(aria_rng *r, float *out, int n);  /* engine-aware N(0,1) fill */
 
 /* build_schedule + LogSNRShift. out holds steps+1 values, descending from
  * sigma_max to 0 (first pinned to sigma_max). logsnr_start = anchor_logsnr -

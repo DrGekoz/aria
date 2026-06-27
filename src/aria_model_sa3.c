@@ -251,7 +251,8 @@ static int sa3_generate(aria_ctx *ctx, void *state,
 
     /* init noise */
     aria_rng rng;
-    aria_rng_seed(&rng, p->seed >= 0 ? (uint64_t)p->seed : 0x9E3779B97F4A7C15ULL);
+    aria_rng_init(&rng, p->seed >= 0 ? (uint64_t)p->seed : 0x9E3779B97F4A7C15ULL,
+                  p->rng_torch ? ARIA_RNG_TORCH : ARIA_RNG_XOSHIRO);
     float *x = malloc((size_t)n * sizeof(float));
     aria_rng_randn(&rng, x, n);
 

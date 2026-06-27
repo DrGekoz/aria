@@ -44,7 +44,9 @@ static void usage(const char *prog) {
         "    --device auto (default) runs the DiT device-resident on the GPU when one fits, else CPU\n"
         "    --precision fp32|q8|q4 selects the CPU DiT weight precision (q8/q4 force the CPU path)\n"
         "    --load-quant <file.aria> loads a pre-quantized DiT from aria-quantize (CPU)\n"
-        "    --continue/--inpaint run on the CPU DiT; the init WAV must be at the model sample rate\n",
+        "    --rng xoshiro (default) | torch  (torch = PyTorch-matched noise for reproduction)\n"
+        "    --continue/--inpaint run on the CPU DiT; the init WAV must be at the model sample rate\n"
+        "  Progress is drawn per denoise step when stderr is a terminal.\n",
         prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
@@ -86,6 +88,7 @@ int main(int argc, char **argv) {
     int inpaint_continue = 0;
     aria_dtype precision = ARIA_F32;
     const char *load_quant = NULL;
+    int rng_torch = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--wav-roundtrip") == 0 && i + 2 < argc) {
@@ -133,6 +136,11 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(argv[i], "--load-quant") == 0 && i + 1 < argc) {
             load_quant = argv[++i];
+        } else if (strcmp(argv[i], "--rng") == 0 && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (strcmp(m, "torch") == 0) rng_torch = 1;
+            else if (strcmp(m, "xoshiro") == 0) rng_torch = 0;
+            else { fprintf(stderr, "unknown --rng %s (use xoshiro|torch)\n", m); return 1; }
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]); return 0;
         } else {
@@ -167,6 +175,7 @@ int main(int argc, char **argv) {
         p.inpaint_from_s = inpaint_from;
         p.inpaint_to_s = inpaint_to;
         p.inpaint_continue = inpaint_continue;
+        p.rng_torch = rng_torch;
         if (isatty(fileno(stderr))) p.progress = cli_progress;  /* live progress on a terminal */
         double best = 1e9;
         for (int b = 0; b < bench && rc == 0; b++) {
