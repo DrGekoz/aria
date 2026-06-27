@@ -115,8 +115,8 @@ quant), **E8.5c** (GPU decoder), **E10** (medium), **E12** (steering).
 ## E7 — continue / inpaint
 
 - ✅ **E7.1** **P1** taae_v2 encoder (audio→latent): patchify (256-sample) → SAME encoder (pad to mult 32, WNConv1d mapping 512→768 k1, group-16 + 1 learned new_token → 17, two chunked S=34 transformer halves [0-2 unshifted, 3-5 midpoint-shift], take last of each 17-group, Linear 768→256) → softnorm fwd (`(x·scaling_factor + bias)/running_std`). The differential-attention block + chunk pass are now shared with the decoder via `aria_taae.{c,h}` (extracted; `test_dec` unchanged at 1.4e-4). Verify: staged `test_enc` parity vs `pretransform.encode` — patchify/softnorm exact, SAME encoder 8.9e-5, full encode 9e-4, zero-pad path 1.8e-2 (0.1% rel, softnorm-amplified). deps: E5.3, E2.7.
-- ⬜ **E7.2** **P1** Inpaint mask build (audio mask → nearest-interp to latent → masked_input). deps: E7.1 · Verify: mask/masked_input parity.
-- ⬜ **E7.3** **P1** Local-additive cond live in DiT (E1.6 with real mask). deps: E1.6, E4.3, E7.2 · Verify: inpaint-cond block parity.
+- ✅ **E7.2** **P1** Inpaint mask build. `aria_inpaint_mask_latent` nearest-interps an audio-space mask (1=keep, 0=inpaint) to latent length (`mask_lat[t]=mask_audio[(t·audio_len)/T]`, matching torch `F.interpolate(mode='nearest')`); `aria_inpaint_local_cond` builds `local[T,257] = [mask | latent·mask]` (channel 0 = mask, 1..256 = masked_input), matching generation.py. deps: E7.1 · Verify: `test_inpaint` mask/local_cond parity — both **exact (0.0)**.
+- ✅ **E7.3** **P1** Local-additive cond live in DiT (E1.6 hook with a real mask). The DiT velocity with a live `local_add_cond` (built by E7.2) matches `dit._forward(..., local_add_cond=real)` at **2.8e-4** (max|ref| 63.7). deps: E1.6, E4.3, E7.2 · Verify: `test_inpaint` dit_velocity parity.
 - ⬜ **E7.4** **P1** `aria_continue` + `aria_inpaint` API + CLI (`--continue` / `--inpaint --from --to`) + init-noise blend. deps: E7.1–7.3, E6.4 · Verify: kept regions preserved, masked changes; parity vs `generate_diffusion_cond_inpaint`. **← M3**
 
 ## E8 — CUDA backend (parallelizable track)

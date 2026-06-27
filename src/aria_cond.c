@@ -8,6 +8,7 @@
 #include "aria_cond.h"
 #include "aria_ops.h"
 #include <math.h>
+#include <stddef.h>
 
 void aria_expo_fourier(float *out, float t, int dim, float min_freq, float max_freq) {
     /* Computed in double precision: arg = t*freq*2pi reaches ~6e4 at max
@@ -39,4 +40,20 @@ void aria_number_embed(float *out, float value, float min_val, float max_val,
     float fourier[256];
     aria_expo_fourier(fourier, t, 256, 0.5f, 10000.0f);
     aria_linear(out, fourier, W, b, 1, 256, features);
+}
+
+void aria_inpaint_mask_latent(float *mask_lat, const float *mask_audio, int audio_len, int T) {
+    for (int t = 0; t < T; t++)
+        mask_lat[t] = mask_audio[(size_t)t * audio_len / T];  /* torch nearest: floor(t*in/out) */
+}
+
+void aria_inpaint_local_cond(float *local_TC, const float *latent_CT, const float *mask_lat, int T) {
+    const int C = 256;
+    for (int t = 0; t < T; t++) {
+        float mt = mask_lat[t];
+        float *row = local_TC + (size_t)t * (C + 1);
+        row[0] = mt;                                       /* channel 0 = inpaint_mask */
+        for (int c = 0; c < C; c++)
+            row[1 + c] = latent_CT[(size_t)c * T + t] * mt; /* masked_input = latent*mask */
+    }
 }

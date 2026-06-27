@@ -172,6 +172,66 @@ def dump_dit_block(model_dir, out_dir):
     print(f"dumped DiT block-0 reference to {d} (S={S}, Sc={Sc})")
 
 
+def dump_inpaint(model_dir, out_dir):
+    """Inpaint conditioning + DiT velocity reference. Builds the local-additive
+    conditioning exactly as inference/generation.py does (audio-space mask ->
+    nearest-interp to latent -> masked_input = latent*mask -> concat
+    [inpaint_mask, inpaint_masked_input] = [257,T]) and runs the real DiT
+    _forward with it. C must reproduce the mask interp, the local cond, and the
+    velocity. Validates E7.2 (mask build) + E7.3 (live local_add_cond)."""
+    from stable_audio_tools.models.dit import DiffusionTransformer
+    from torch.nn.functional import interpolate
+
+    cfg = json.load(open(os.path.join(model_dir, "model_config.json")))
+    dcfg = cfg["model"]["diffusion"]["config"]
+    objective = cfg["model"]["diffusion"].get("diffusion_objective", "rf_denoiser")
+    dit = DiffusionTransformer(diffusion_objective=objective, **dcfg).eval()
+    prefix = "model.model."
+    sd = {}
+    with safe_open(os.path.join(model_dir, "model.safetensors"), framework="pt") as f:
+        for k in f.keys():
+            if k.startswith(prefix):
+                sd[k[len(prefix):]] = f.get_tensor(k)
+    missing, _ = dit.load_state_dict(sd, strict=False)
+    missing = [x for x in missing if "rope" not in x and "inv_freq" not in x]
+    if missing:
+        print(f"  WARNING inpaint dit missing keys: {missing[:8]}{'...' if len(missing) > 8 else ''}")
+
+    torch.manual_seed(9)
+    T, n_cond = 16, 257
+    audio_len = T * 4096
+    x = torch.randn(1, dcfg["io_channels"], T)
+    t = torch.tensor([0.3])
+    cross = torch.randn(1, n_cond, dcfg["cond_token_dim"])
+    glob = torch.randn(1, dcfg["global_cond_dim"])
+    init_latent = torch.randn(1, dcfg["io_channels"], T)  # stand-in for encode(init_audio)
+
+    # audio-space inpaint mask: keep everything except a [start,end) region (=0)
+    start_s, end_s = 1.2, 2.7
+    sr = cfg["sample_rate"]
+    mask_audio = torch.ones(1, audio_len)
+    mask_audio[:, int(start_s * sr):int(end_s * sr)] = 0.0
+    mask_lat = interpolate(mask_audio.unsqueeze(1), size=T, mode='nearest').squeeze(1)  # [1,T]
+    masked_input = init_latent * mask_lat.unsqueeze(1)                                  # [1,256,T]
+    local = torch.cat([mask_lat.unsqueeze(1), masked_input], dim=1)                     # [1,257,T]
+
+    with torch.no_grad():
+        out = dit._forward(x, t, cross_attn_cond=cross, global_embed=glob, local_add_cond=local)
+
+    d = os.path.join(out_dir, "inpaint")
+    os.makedirs(d, exist_ok=True)
+    save_atns(os.path.join(d, "x.atns"), x.squeeze(0).float().cpu().numpy())          # [256,T]
+    save_atns(os.path.join(d, "cross.atns"), cross.squeeze(0).float().cpu().numpy())  # [257,768]
+    save_atns(os.path.join(d, "global.atns"), glob.squeeze(0).float().cpu().numpy())  # [768]
+    save_atns(os.path.join(d, "t.atns"), np.array([0.3], dtype=np.float32))
+    save_atns(os.path.join(d, "init_latent.atns"), init_latent.squeeze(0).float().cpu().numpy())  # [256,T]
+    save_atns(os.path.join(d, "mask_audio.atns"), mask_audio.squeeze(0).float().cpu().numpy())     # [audio_len]
+    save_atns(os.path.join(d, "mask_lat.atns"), mask_lat.squeeze(0).float().cpu().numpy())          # [T]
+    save_atns(os.path.join(d, "local.atns"), local.squeeze(0).float().cpu().numpy())                # [257,T]
+    save_atns(os.path.join(d, "out.atns"), out.squeeze(0).float().cpu().numpy())                    # [256,T]
+    print(f"dumped inpaint cond + DiT velocity to {d} (T={T}, mask {start_s}-{end_s}s)")
+
+
 def dump_schedule(out_dir):
     """LogSNR schedule reference (build_schedule + LogSNRShift) for fixed params."""
     from stable_audio_tools.inference.sampling import build_schedule, LogSNRShift
@@ -437,5 +497,6 @@ if __name__ == "__main__":
     dump_taae_block(model_dir, out_dir)
     dump_decoder(model_dir, out_dir)
     dump_encoder(model_dir, out_dir)
+    dump_inpaint(model_dir, out_dir)
     dump_e2e(model_dir, out_dir)
     dump_t5enc(model_dir, out_dir)
