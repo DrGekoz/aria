@@ -41,7 +41,7 @@ EXTRA_LIB_OBJS ?=
 LIB_OBJS := $(patsubst $(SRC)/%.c,$(BUILD)/%.o,$(LIB_SRCS)) $(EXTRA_LIB_OBJS)
 LIB := $(BUILD)/libaria.a
 
-.PHONY: all cpu clean test cuda test_cuda blas bench
+.PHONY: all cpu clean test cuda test_cuda blas bench bench-sweep
 all: cpu
 cpu: aria
 
@@ -49,6 +49,18 @@ cpu: aria
 bench: $(LIB)
 	$(CC) $(CFLAGS) -I$(SRC) tests/bench_gemm.c -L$(BUILD) -laria $(LDFLAGS) -o $(BUILD)/bench_gemm
 	$(BUILD)/bench_gemm
+
+# sweep the AVX2 register-tile (MR x NR) to pick the best default, then restore it
+bench-sweep: $(LIB)
+	@for c in 3:3 4:3 4:2 5:2 6:2 2:4; do \
+	  mr=$${c%%:*}; nr=$${c##*:}; \
+	  $(CC) $(CFLAGS) -DARIA_MR=$$mr -DARIA_NR=$$nr -I$(SRC) -c $(SRC)/aria_cpu.c -o $(BUILD)/aria_cpu.o 2>/dev/null; \
+	  $(AR) rs $(BUILD)/libaria.a $(BUILD)/aria_cpu.o 2>/dev/null; \
+	  $(CC) $(CFLAGS) -I$(SRC) tests/bench_gemm.c -L$(BUILD) -laria $(LDFLAGS) -o $(BUILD)/bench_gemm 2>/dev/null; \
+	  printf "MR=%s NR=%s: " $$mr $$nr; \
+	  $(BUILD)/bench_gemm | awk '/GFLOP/{s+=$$(NF-1);n++} END{printf "%.0f GFLOP/s avg\n", s/n}'; \
+	done; \
+	$(CC) $(CFLAGS) -I$(SRC) -c $(SRC)/aria_cpu.c -o $(BUILD)/aria_cpu.o 2>/dev/null; $(AR) rs $(BUILD)/libaria.a $(BUILD)/aria_cpu.o 2>/dev/null
 
 # Optional CPU acceleration: route GEMM to a BLAS (OpenBLAS here; on macOS use
 # LDLIBS="-framework Accelerate"). Keeps the pure-C build as the default.

@@ -22,9 +22,11 @@
 #include <immintrin.h>
 #define ARIA_AVX2 1
 /* register-tile dimensions (output rows x cols held in ymm accumulators):
- * regs used = NR (weight vecs) + 1 (x vec) + MR*NR (accumulators) <= 16 */
+ * regs used = NR (weight vecs) + 1 (x vec) + MR*NR (accumulators) <= 16.
+ * 3x3 (3+1+9=13 ymm) tuned via `make bench-sweep`: it matches/beats 4x3 (which
+ * saturates all 16 ymm) on the SA3 shapes while leaving register headroom. */
 #ifndef ARIA_MR
-#define ARIA_MR 4
+#define ARIA_MR 3
 #endif
 #ifndef ARIA_NR
 #define ARIA_NR 3
