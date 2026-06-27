@@ -41,9 +41,18 @@ EXTRA_LIB_OBJS ?=
 LIB_OBJS := $(patsubst $(SRC)/%.c,$(BUILD)/%.o,$(LIB_SRCS)) $(EXTRA_LIB_OBJS)
 LIB := $(BUILD)/libaria.a
 
-.PHONY: all cpu clean test cuda test_cuda blas bench bench-sweep profile help quantize
+.PHONY: all cpu clean test cuda test_cuda blas bench bench-sweep profile help quantize install
 all: cpu
 cpu: aria
+
+# install the CLI, static lib, and public headers under PREFIX (default /usr/local)
+PREFIX ?= /usr/local
+install: aria $(LIB)
+	install -d $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/lib $(DESTDIR)$(PREFIX)/include/aria
+	install -m 755 aria $(DESTDIR)$(PREFIX)/bin/aria
+	install -m 644 $(LIB) $(DESTDIR)$(PREFIX)/lib/libaria.a
+	install -m 644 $(SRC)/aria.h $(SRC)/aria_wav.h $(SRC)/aria_quant.h $(DESTDIR)$(PREFIX)/include/aria/
+	@echo "installed aria + libaria.a + headers under $(DESTDIR)$(PREFIX)"
 
 # offline weight quantizer (E9.2): model.safetensors -> packed .aria DiT overlay
 quantize: aria-quantize
@@ -59,6 +68,7 @@ help:
 	@echo "                       also NVCC, CUDA_HOME, CUDA_CCBIN)"
 	@echo "    make blas          CPU build routing GEMM to a BLAS (BLAS_LIB=-lopenblas)"
 	@echo "    make quantize      offline DiT quantizer -> ./aria-quantize (E9.2)"
+	@echo "    make install       install aria + libaria.a + headers (PREFIX=/usr/local)"
 	@echo "    make clean         remove build/ and ./aria"
 	@echo ""
 	@echo "  Test"

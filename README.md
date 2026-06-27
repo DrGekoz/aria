@@ -47,23 +47,33 @@ We support (or are building toward) the following backends:
 
 ## Status
 
-**Working end-to-end (small-music, CPU).** `aria` loads Stable Audio 3 and
-generates audio from a text prompt, entirely in C — every stage parity-checked
-against the `stable-audio-tools` PyTorch reference:
+**Working end-to-end on CPU and CUDA, small-music *and* medium.** Every stage is
+parity-checked against the `stable-audio-tools` PyTorch reference. Milestones
+**M1–M6** reached:
 
-- **text → tokens** (GemmaTokenizer BPE, exact id parity) →
-- **T5Gemma encoder** (12-layer Gemma2 encoder, ~0.15% rel) →
-- **DiT denoiser** (20 blocks, ~1e-5) over the **pingpong sampler** (LogSNR
-  schedule, ~6e-8) → **taae_v2 decoder** (latent→audio, ~1e-4) → stereo WAV.
+- **text → audio** — GemmaTokenizer BPE (exact ids) → T5Gemma encoder (~0.15 % rel)
+  → DiT denoiser over the pingpong sampler (LogSNR) → taae_v2 decoder → stereo WAV.
+- **continue / inpaint** — taae_v2 encoder (audio→latent) + inpaint local-additive
+  conditioning; `--continue` / `--inpaint --from --to` (e2e parity, kept regions
+  preserved).
+- **CUDA** — device-resident DiT + decoder (cuBLAS tensor-core GEMMs). RTX 3070:
+  **0.29 s** warm for a 10 s/8-step small-music clip (on par with PyTorch).
+- **precision / quantization** — `--precision fp32|q8|q4`; on the GPU the weights
+  stay packed in VRAM (dequant-on-use). q4 = asymmetric int4 + Q8 attention
+  (~9 % DiT velocity error, near q8) — small-music DiT 1.6 GB → ~0.3 GB.
+- **medium model** — differential DiT attention + a sliding-window/sinusoidal
+  taae decoder; runs end-to-end (DiT on GPU, ~0.35 s; e2e audio parity 1.7e-2).
+- **offline quantizer** — `aria-quantize` packs a model to a `.aria` overlay that
+  `--load-quant` loads (bit-identical to on-the-fly).
 
-CPU-only, AVX2/FMA + OpenMP, zero-copy mmap weights. ~9 s for a 2 s/8-step clip.
+The CPU path (AVX2/FMA + OpenMP, zero-copy mmap weights) is always built and is the
+reference; CUDA is an optional accelerator. See [STATUS.md](STATUS.md) for the full
+snapshot and [ROADMAP.md](ROADMAP.md) for the task list. Remaining: a GPU medium
+decoder, fp16/bf16 CPU storage, steering (E12), release polish (E11).
 
-- **Not yet:** CUDA backend, int8/q4 quantization, continue/inpaint, the medium
-  model. See [ROADMAP.md](ROADMAP.md) for the atomic, individually-verifiable
-  task list with priorities and dependencies. This software
-is developed with **strong assistance from large language models**, with a human
-leading the ideas, testing, and debugging. We say so openly because it shaped how
-the project was built.
+This software is developed with **strong assistance from large language models**,
+with a human leading the ideas, testing, and debugging. We say so openly because it
+shaped how the project was built.
 
 ## Documentation
 
@@ -118,20 +128,36 @@ The CPU build must stay warning-clean under `-Wall -Wextra`.
 # one-time: export the tokenizer to a compact binary aria loads at runtime
 python scripts/export_tokenizer.py models/small-music
 
-# text -> audio
+# text -> audio  (--device auto picks the GPU when one fits, else CPU)
 ./aria -m models/small-music -p "warm romantic piano, slow, tender" -d 15 -s 8 --seed 0 -o out.wav
 
 # unconditional, or from a precomputed [256,768] prompt embedding
 ./aria -m models/small-music --uncond -d 10 -o out.wav
 ./aria -m models/small-music --prompt-embed prompt.atns -d 10 -o out.wav
 
-# inspect
+# pick the backend / precision
+./aria -m models/small-music -p "..." --device cuda --precision q4 -o out.wav
+
+# continue (extend a clip) / inpaint (regenerate a region) — CPU, init WAV at 44.1 kHz
+./aria -m models/small-music -p "..." -d 30 --continue in.wav -o out.wav
+./aria -m models/small-music -p "..." --inpaint in.wav --from 5 --to 10 -o out.wav
+
+# medium model (differential DiT; DiT on GPU, decoder on CPU)
+./aria -m models/medium -p "..." -d 10 -s 8 -o out.wav
+
+# offline-quantize the DiT to a packed .aria, then load it
+make quantize && ./aria-quantize models/small-music dit.q4.aria q4
+./aria -m models/small-music --uncond -d 10 --load-quant dit.q4.aria -o out.wav
+
+# inspect / all flags
 ./aria -m models/small-music --info
-./aria -m models/small-music --list-tensors pretransform.
+./aria -h          # full flag list;  make help  for build targets
 ```
 
 `-m <dir>` is any directory with `model_config.json` and `model.safetensors`
-(what `download_model.sh` produces, or a raw Hugging Face snapshot).
+(what `download_model.sh` produces, or a raw Hugging Face snapshot). Text prompts
+need the T5Gemma weights + the exported tokenizer; `--uncond` / `--prompt-embed`
+work without them.
 
 ## Architecture
 
