@@ -22,8 +22,9 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <sys/resource.h>
 
-/* optional per-stage timing (set ARIA_PROFILE=1) */
+/* optional per-stage timing + memory (set ARIA_PROFILE=1) */
 static double sa3_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 
 typedef struct {
@@ -238,9 +239,18 @@ static int sa3_generate(aria_ctx *ctx, void *state,
 #endif
     aria_sa3_dec_forward(st->dec, audio, x, T);
     double t3 = sa3_now();
-    if (profile)
-        fprintf(stderr, "[aria] profile: setup=%.2fs dit=%.2fs decode=%.2fs (T=%d steps=%d)\n",
-                t1 - t0, t2 - t1, t3 - t2, T, steps);
+    if (profile) {
+        struct rusage ru; getrusage(RUSAGE_SELF, &ru);
+        fprintf(stderr, "[aria] profile: setup=%.2fs dit=%.2fs decode=%.2fs (T=%d steps=%d) | peak RSS %.0f MB",
+                t1 - t0, t2 - t1, t3 - t2, T, steps, ru.ru_maxrss / 1024.0);
+#ifdef ARIA_CUDA
+        if (st->cdit || st->cdec) {
+            size_t used = 0, total = 0; aria_cuda_meminfo(&used, &total);
+            fprintf(stderr, " | GPU %.0f/%.0f MB", used / 1048576.0, total / 1048576.0);
+        }
+#endif
+        fprintf(stderr, "\n");
+    }
     aria_audio *a = aria_audio_alloc(st->sample_rate, 2, (int64_t)T * 4096);
     for (int64_t i = 0; i < (int64_t)T * 4096; i++) {
         a->data[i * 2 + 0] = audio[i];

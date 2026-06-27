@@ -41,7 +41,7 @@ EXTRA_LIB_OBJS ?=
 LIB_OBJS := $(patsubst $(SRC)/%.c,$(BUILD)/%.o,$(LIB_SRCS)) $(EXTRA_LIB_OBJS)
 LIB := $(BUILD)/libaria.a
 
-.PHONY: all cpu clean test cuda test_cuda blas bench bench-sweep
+.PHONY: all cpu clean test cuda test_cuda blas bench bench-sweep profile
 all: cpu
 cpu: aria
 
@@ -49,6 +49,13 @@ cpu: aria
 bench: $(LIB)
 	$(CC) $(CFLAGS) -I$(SRC) tests/bench_gemm.c -L$(BUILD) -laria $(LDFLAGS) -o $(BUILD)/bench_gemm
 	$(BUILD)/bench_gemm
+
+# end-to-end profile of a generation: built-in stage timing + peak RSS/VRAM, plus
+# per-kernel GPU time (nsys) on a CUDA build, or perf (CPU). Uses the built ./aria.
+#   make profile ARGS="-m <model> --uncond -d 10 -s 8 --device cuda"
+ARGS ?=
+profile:
+	@bash scripts/profile.sh ./aria $(ARGS)
 
 # sweep the AVX2 register-tile (MR x NR) to pick the best default, then restore it
 bench-sweep: $(LIB)

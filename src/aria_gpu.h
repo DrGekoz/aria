@@ -24,6 +24,8 @@ int aria_cuda_available(void);
 int aria_cuda_recommended(void);
 /* short device description into buf (name, compute capability, VRAM). */
 void aria_cuda_device_info(char *buf, size_t buflen);
+/* current device memory: *used and *total in bytes (used = total - free). */
+void aria_cuda_meminfo(size_t *used, size_t *total);
 
 /* raw device memory */
 void *aria_cuda_malloc(size_t bytes);
