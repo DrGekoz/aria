@@ -320,3 +320,22 @@ void aria_sa3_dec_free(aria_sa3_dec *m) {
     free(m->mapping_w);   /* the folded conv weight is the only owned buffer */
     free(m);
 }
+
+void aria_sa3_dec_get_view(const aria_sa3_dec *m, aria_sa3_dec_view *v) {
+    v->running_std = m->running_std;
+    v->proj_w = m->proj_w; v->proj_b = m->proj_b; v->new_tokens = m->new_tokens;
+    v->mapping_w = m->mapping_w; v->mapping_b = m->mapping_b;
+    for (int i = 0; i < 6; i++) {
+        const taae_block_w *s = &m->blocks[i];
+        aria_taae_block_view *d = &v->blocks[i];
+        d->pre_alpha = s->pre_alpha; d->qn_alpha = s->qn_alpha;
+        d->kn_alpha = s->kn_alpha;   d->ff_alpha = s->ff_alpha;
+        d->pre_gamma = s->pre_gamma; d->pre_beta = s->pre_beta;
+        d->qn_gamma = s->qn_gamma;   d->qn_beta = s->qn_beta;
+        d->kn_gamma = s->kn_gamma;   d->kn_beta = s->kn_beta;
+        d->ff_gamma = s->ff_gamma;   d->ff_beta = s->ff_beta;
+        d->to_qkv = s->to_qkv; d->to_out = s->to_out;
+        d->ff_in_w = s->ff_in_w; d->ff_in_b = s->ff_in_b;
+        d->ff_out_w = s->ff_out_w; d->ff_out_b = s->ff_out_b;
+    }
+}

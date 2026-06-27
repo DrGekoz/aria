@@ -9,6 +9,7 @@
 
 #include "aria_gpu.h"
 #include "aria_sa3_dit.h"
+#include "aria_sa3_dec.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
@@ -458,13 +459,13 @@ struct aria_cuda_dit {
  * tensor cores on sm_80+). x (fp32 activations) is converted to fp16 into transient
  * arena scratch; W is already fp16. Single default stream, so reusing the scratch
  * region after the (queued) GEMM is safe by stream ordering. */
-static void gemm_f16w(aria_cuda_dit *h, float *y, const float *x, const __half *W,
+static void gemm_f16w(cublasHandle_t cb, darena *ar, float *y, const float *x, const __half *W,
                       const float *b, int M, int K, int N) {
-    darena *ar = &h->arena; size_t mark = da_save(ar);
+    size_t mark = da_save(ar);
     __half *xh = da_alloc_half(ar, (size_t)M * K);
     k_f32_to_f16<<<nblocks((size_t)M * K), THREADS>>>(xh, x, (size_t)M * K);
     const float alpha = 1.0f, beta = 0.0f;
-    cublasGemmEx(h->cublas, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha,
+    cublasGemmEx(cb, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha,
                  W, CUDA_R_16F, K, xh, CUDA_R_16F, K, &beta,
                  y, CUDA_R_32F, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
     if (b) k_add_bias<<<nblocks((size_t)M * N), THREADS>>>(y, b, M, N);
@@ -493,7 +494,7 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     k_rmsnorm<<<nblocks(S), THREADS>>>(hh, seq, w->pre_norm, S, dim, 1e-5f, 0);
     k_adaln<<<nSd, THREADS>>>(hh, scale_self, shift_self, S, dim);
     float *qkv = da_alloc(ar, (size_t)S * 3 * dim);
-    gemm_f16w(h, qkv, hh, w->sa_to_qkv, NULL, S, dim, 3 * dim);
+    gemm_f16w(h->cublas, &h->arena, qkv, hh, w->sa_to_qkv, NULL, S, dim, 3 * dim);
     k_extract_heads<<<nHShd, THREADS>>>(qh, qkv, S, H, hd, 3 * dim, 0);
     k_extract_heads<<<nHShd, THREADS>>>(kh, qkv, S, H, hd, 3 * dim, dim);
     k_extract_heads<<<nHShd, THREADS>>>(vh, qkv, S, H, hd, 3 * dim, 2 * dim);
@@ -503,7 +504,7 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     k_rope<<<nblocks((size_t)H * S), THREADS>>>(kh, h->rope_cos, h->rope_sin, H, S, hd, rot);
     attn_dev(h->cublas, ao, qh, kh, vh, H, S, S, hd, scores);
     k_merge_heads<<<nHShd, THREADS>>>(merged, ao, S, H, hd);
-    gemm_f16w(h, o, merged, w->sa_to_out, NULL, S, dim, dim);
+    gemm_f16w(h->cublas, &h->arena, o, merged, w->sa_to_out, NULL, S, dim, dim);
     k_gate<<<nSd, THREADS>>>(o, gate_self, S, dim);
     k_add<<<nSd, THREADS>>>(seq, residual, o, (size_t)S * dim);
 
@@ -511,12 +512,12 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     cudaMemcpy(residual, seq, (size_t)S * dim * sizeof(float), cudaMemcpyDeviceToDevice);
     k_rmsnorm<<<nblocks(S), THREADS>>>(hh, seq, w->cross_norm, S, dim, 1e-5f, 0);
     float *q = da_alloc(ar, (size_t)S * dim);
-    gemm_f16w(h, q, hh, w->ca_to_q, NULL, S, dim, dim);
+    gemm_f16w(h->cublas, &h->arena, q, hh, w->ca_to_q, NULL, S, dim, dim);
     k_extract_heads<<<nHShd, THREADS>>>(qh, q, S, H, hd, dim, 0);
     k_rmsnorm<<<nblocks((size_t)H * S), THREADS>>>(qh, qh, w->ca_q_norm, H * S, hd, 1e-6f, 0);
     attn_dev(h->cublas, ao, qh, h->cross_k[blk], h->cross_v[blk], H, S, Sc, hd, scores);
     k_merge_heads<<<nHShd, THREADS>>>(merged, ao, S, H, hd);
-    gemm_f16w(h, o, merged, w->ca_to_out, NULL, S, dim, dim);
+    gemm_f16w(h->cublas, &h->arena, o, merged, w->ca_to_out, NULL, S, dim, dim);
     k_add<<<nSd, THREADS>>>(seq, residual, o, (size_t)S * dim);
 
     /* feed-forward (GLU) */
@@ -524,9 +525,9 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     k_rmsnorm<<<nblocks(S), THREADS>>>(hh, seq, w->ff_norm, S, dim, 1e-5f, 0);
     k_adaln<<<nSd, THREADS>>>(hh, scale_ff, shift_ff, S, dim);
     float *proj = da_alloc(ar, (size_t)S * 2 * inner), *gated = da_alloc(ar, (size_t)S * inner);
-    gemm_f16w(h, proj, hh, w->ff_in_w, w->ff_in_b, S, dim, 2 * inner);
+    gemm_f16w(h->cublas, &h->arena, proj, hh, w->ff_in_w, w->ff_in_b, S, dim, 2 * inner);
     k_ff_silugate<<<nblocks((size_t)S * inner), THREADS>>>(gated, proj, S, inner);
-    gemm_f16w(h, o, gated, w->ff_out_w, w->ff_out_b, S, inner, dim);
+    gemm_f16w(h->cublas, &h->arena, o, gated, w->ff_out_w, w->ff_out_b, S, inner, dim);
     k_gate<<<nSd, THREADS>>>(o, gate_ff, S, dim);
     k_add<<<nSd, THREADS>>>(seq, residual, o, (size_t)S * dim);
 
@@ -623,19 +624,19 @@ extern "C" void aria_cuda_dit_step(aria_cuda_dit *h, float *v_CT, const float *x
     float *xtc = da_alloc(ar, (size_t)T * C);
     k_transpose<<<nblocks((size_t)C * T), THREADS>>>(xtc, h->dx, C, T);   /* [C,T]->[T,C] */
     float *pre = da_alloc(ar, (size_t)T * C);
-    gemm_f16w(h, pre, xtc, h->preprocess, NULL, T, C, C);
+    gemm_f16w(h->cublas, &h->arena, pre, xtc, h->preprocess, NULL, T, C, C);
     k_add<<<nblocks((size_t)T * C), THREADS>>>(xtc, xtc, pre, (size_t)T * C);
 
     float *seq = da_alloc(ar, (size_t)S * ed);
     cudaMemcpy(seq, h->memory_tokens, (size_t)Mt * ed * sizeof(float), cudaMemcpyDeviceToDevice);
-    gemm_f16w(h, seq + (size_t)Mt * ed, xtc, h->project_in, NULL, T, C, ed);
+    gemm_f16w(h->cublas, &h->arena, seq + (size_t)Mt * ed, xtc, h->project_in, NULL, T, C, ed);
 
     for (int b = 0; b < h->depth; b++) dit_block_dev(h, seq, b);
 
     float *outtc = da_alloc(ar, (size_t)T * C);
-    gemm_f16w(h, outtc, seq + (size_t)Mt * ed, h->project_out, NULL, T, ed, C);
+    gemm_f16w(h->cublas, &h->arena, outtc, seq + (size_t)Mt * ed, h->project_out, NULL, T, ed, C);
     float *postc = da_alloc(ar, (size_t)T * C);
-    gemm_f16w(h, postc, outtc, h->postprocess, NULL, T, C, C);
+    gemm_f16w(h->cublas, &h->arena, postc, outtc, h->postprocess, NULL, T, C, C);
     k_add<<<nblocks((size_t)T * C), THREADS>>>(outtc, outtc, postc, (size_t)T * C);
     k_transpose<<<nblocks((size_t)T * C), THREADS>>>(h->dv, outtc, T, C);  /* [T,C]->[C,T] */
 
@@ -658,5 +659,247 @@ extern "C" void aria_cuda_dit_free(aria_cuda_dit *h) {
     }
     free(h->blocks);
     free_request(h);
+    free(h);
+}
+
+/* ===================== device-resident taae decoder (E8.5c) =====================
+ * Mirrors aria_sa3_dec.c, but batches all S=34 chunks of a pass into one workload:
+ * the per-token linears become [B*S, .] GEMMs, and the per-chunk differential
+ * attention runs B*H batched. Weights fp16 (GEMMs) / fp32 (norms, conv, tokens). */
+
+#define DC_D   768
+#define DC_H   12
+#define DC_HD  64
+#define DC_ROT 32
+#define DC_INNER 2304
+#define DC_QKV 3840   /* 5*768 */
+#define DC_S   34
+#define DC_OUT 512
+
+__global__ void k_subtract(float *a, const float *b, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) a[i] -= b[i];
+}
+/* (dynamic-tanh kernel k_dyt is defined above, shared with aria_cuda_dynamic_tanh) */
+/* [B*H,S,hd] from src[B*S, stride] at offset off (per chunk b, head h, pos s) */
+__global__ void k_extract_heads_b(float *dst, const float *src, int B, int S, int H, int hd, int stride, int off) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)B * H * S * hd) return;
+    int d = (int)(idx % hd), s = (int)((idx / hd) % S), h = (int)((idx / ((size_t)hd * S)) % H);
+    int b = (int)(idx / ((size_t)hd * S * H));
+    dst[idx] = src[(size_t)(b * S + s) * stride + off + (size_t)h * hd + d];
+}
+/* [B*S, H*hd] from src[B*H,S,hd] */
+__global__ void k_merge_heads_b(float *dst, const float *src, int B, int S, int H, int hd) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)B * H * S * hd) return;
+    int d = (int)(idx % hd), s = (int)((idx / hd) % S), h = (int)((idx / ((size_t)hd * S)) % H);
+    int b = (int)(idx / ((size_t)hd * S * H));
+    dst[(size_t)(b * S + s) * (H * hd) + (size_t)h * hd + d] = src[idx];
+}
+/* expand x[T,D] -> seq[Tp*17, D]: token t at row t*17 (zeros if padded), new_tokens at the next 16 */
+__global__ void k_expand_tokens(float *seq, const float *x, const float *new_tokens, int T, int Tp, int D) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)Tp * 17 * D) return;
+    int d = (int)(idx % D), p = (int)(idx / D), t = p / 17, pos = p % 17;
+    if (pos == 0) seq[idx] = (t < T) ? x[(size_t)t * D + d] : 0.0f;
+    else          seq[idx] = new_tokens[d];
+}
+/* feat[D, Lout] (channel-major) = last 16 of each 17-group: feat[d,t*16+j] = seq[(t*17+1+j)*D+d] */
+__global__ void k_extract_feat(float *feat, const float *seq, int D, int Lout) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)D * Lout) return;
+    int d = (int)(idx / Lout), col = (int)(idx % Lout), t = col / 16, j = col % 16;
+    feat[idx] = seq[(size_t)(t * 17 + 1 + j) * D + d];
+}
+/* unpatch: audio[2, L*256] from dec[512, L]: audio[c, l*256+hh] = dec[c*256+hh, l] */
+__global__ void k_unpatch(float *audio, const float *dec, int L) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)2 * L * 256) return;
+    int c = (int)(idx / ((size_t)L * 256));
+    size_t rem = idx % ((size_t)L * 256);
+    int l = (int)(rem / 256), hh = (int)(rem % 256);
+    audio[idx] = dec[(size_t)(c * 256 + hh) * L + l];
+}
+
+struct dec_blk_dev {
+    float pre_alpha, qn_alpha, kn_alpha, ff_alpha;
+    const float *pre_gamma, *pre_beta, *qn_gamma, *qn_beta, *kn_gamma, *kn_beta, *ff_gamma, *ff_beta;
+    const float *ff_in_b, *ff_out_b;
+    __half *to_qkv, *to_out, *ff_in_w, *ff_out_w;
+};
+struct aria_cuda_dec {
+    float running_std;
+    __half *proj_w; const float *proj_b, *new_tokens, *mapping_b;
+    float *mapping_w;       /* fp32 (k_conv1d) */
+    dec_blk_dev blocks[6];
+    float *rcos, *rsin;
+    cublasHandle_t cublas;
+};
+
+/* one taae block on seq[B*S, D] (B chunks of S=34), in place, scratch from `ar` */
+static void taae_block_dev(aria_cuda_dec *h, float *seq, int B, const dec_blk_dev *w, darena *ar) {
+    int S = DC_S, D = DC_D, H = DC_H, hd = DC_HD;
+    int N = B * S, NH = B * H * S * hd;
+    size_t mark = da_save(ar);
+    float *res = da_alloc(ar, (size_t)N * D), *hh = da_alloc(ar, (size_t)N * D);
+    float *q  = da_alloc(ar, (size_t)NH), *k  = da_alloc(ar, (size_t)NH), *v = da_alloc(ar, (size_t)NH);
+    float *qd = da_alloc(ar, (size_t)NH), *kd = da_alloc(ar, (size_t)NH);
+    float *ob = da_alloc(ar, (size_t)NH), *od = da_alloc(ar, (size_t)NH);
+    float *merged = da_alloc(ar, (size_t)N * D), *o = da_alloc(ar, (size_t)N * D);
+    float *scores = da_alloc(ar, (size_t)B * H * S * S);
+
+    /* differential self-attention */
+    cudaMemcpy(res, seq, (size_t)N * D * sizeof(float), cudaMemcpyDeviceToDevice);
+    k_dyt<<<nblocks((size_t)N * D), THREADS>>>(hh, seq, w->pre_alpha, w->pre_gamma, w->pre_beta, (size_t)N * D, D);
+    float *qkv = da_alloc(ar, (size_t)N * DC_QKV);
+    gemm_f16w(h->cublas, ar, qkv, hh, w->to_qkv, NULL, N, D, DC_QKV);
+    k_extract_heads_b<<<nblocks((size_t)NH), THREADS>>>(q,  qkv, B, S, H, hd, DC_QKV, 0);
+    k_extract_heads_b<<<nblocks((size_t)NH), THREADS>>>(k,  qkv, B, S, H, hd, DC_QKV, 768);
+    k_extract_heads_b<<<nblocks((size_t)NH), THREADS>>>(v,  qkv, B, S, H, hd, DC_QKV, 1536);
+    k_extract_heads_b<<<nblocks((size_t)NH), THREADS>>>(qd, qkv, B, S, H, hd, DC_QKV, 2304);
+    k_extract_heads_b<<<nblocks((size_t)NH), THREADS>>>(kd, qkv, B, S, H, hd, DC_QKV, 3072);
+    size_t bhs = (size_t)B * H * S;
+    k_dyt<<<nblocks((size_t)NH), THREADS>>>(q,  q,  w->qn_alpha, w->qn_gamma, w->qn_beta, (size_t)NH, hd);
+    k_dyt<<<nblocks((size_t)NH), THREADS>>>(qd, qd, w->qn_alpha, w->qn_gamma, w->qn_beta, (size_t)NH, hd);
+    k_dyt<<<nblocks((size_t)NH), THREADS>>>(k,  k,  w->kn_alpha, w->kn_gamma, w->kn_beta, (size_t)NH, hd);
+    k_dyt<<<nblocks((size_t)NH), THREADS>>>(kd, kd, w->kn_alpha, w->kn_gamma, w->kn_beta, (size_t)NH, hd);
+    k_rope<<<nblocks(bhs), THREADS>>>(q,  h->rcos, h->rsin, B * H, S, hd, DC_ROT);
+    k_rope<<<nblocks(bhs), THREADS>>>(qd, h->rcos, h->rsin, B * H, S, hd, DC_ROT);
+    k_rope<<<nblocks(bhs), THREADS>>>(k,  h->rcos, h->rsin, B * H, S, hd, DC_ROT);
+    k_rope<<<nblocks(bhs), THREADS>>>(kd, h->rcos, h->rsin, B * H, S, hd, DC_ROT);
+    attn_dev(h->cublas, ob, q,  k,  v, B * H, S, S, hd, scores);
+    attn_dev(h->cublas, od, qd, kd, v, B * H, S, S, hd, scores);
+    k_subtract<<<nblocks((size_t)NH), THREADS>>>(ob, od, (size_t)NH);
+    k_merge_heads_b<<<nblocks((size_t)NH), THREADS>>>(merged, ob, B, S, H, hd);
+    gemm_f16w(h->cublas, ar, o, merged, w->to_out, NULL, N, D, D);
+    k_add<<<nblocks((size_t)N * D), THREADS>>>(seq, res, o, (size_t)N * D);
+
+    /* SwiGLU feed-forward */
+    cudaMemcpy(res, seq, (size_t)N * D * sizeof(float), cudaMemcpyDeviceToDevice);
+    k_dyt<<<nblocks((size_t)N * D), THREADS>>>(hh, seq, w->ff_alpha, w->ff_gamma, w->ff_beta, (size_t)N * D, D);
+    float *proj = da_alloc(ar, (size_t)N * 2 * DC_INNER), *gated = da_alloc(ar, (size_t)N * DC_INNER);
+    gemm_f16w(h->cublas, ar, proj, hh, w->ff_in_w, w->ff_in_b, N, D, 2 * DC_INNER);
+    k_ff_silugate<<<nblocks((size_t)N * DC_INNER), THREADS>>>(gated, proj, N, DC_INNER);
+    gemm_f16w(h->cublas, ar, o, gated, w->ff_out_w, w->ff_out_b, N, DC_INNER, D);
+    k_add<<<nblocks((size_t)N * D), THREADS>>>(seq, res, o, (size_t)N * D);
+
+    da_restore(ar, mark);
+}
+
+/* run 3 blocks over seq[L,768] in S-chunks; shift=1 adds the midpoint halo */
+static void taae_pass_dev(aria_cuda_dec *h, float *seq, int L, const dec_blk_dev *blocks, int shift, darena *ar) {
+    int S = DC_S, D = DC_D, half = S / 2;
+    if (!shift) {
+        int B = L / S;
+        for (int b = 0; b < 3; b++) taae_block_dev(h, seq, B, &blocks[b], ar);
+    } else {
+        int Lp = L + S, B = Lp / S;
+        size_t mark = da_save(ar);
+        float *pad = da_alloc(ar, (size_t)Lp * D);
+        cudaMemcpy(pad, seq, (size_t)half * D * sizeof(float), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(pad + (size_t)half * D, seq, (size_t)L * D * sizeof(float), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(pad + (size_t)(half + L) * D, seq + (size_t)(L - half) * D, (size_t)half * D * sizeof(float), cudaMemcpyDeviceToDevice);
+        for (int b = 0; b < 3; b++) taae_block_dev(h, pad, B, &blocks[b], ar);
+        cudaMemcpy(seq, pad + (size_t)half * D, (size_t)L * D * sizeof(float), cudaMemcpyDeviceToDevice);
+        da_restore(ar, mark);
+    }
+}
+
+extern "C" aria_cuda_dec *aria_cuda_dec_create(const aria_sa3_dec_view *v) {
+    if (!aria_cuda_available()) return NULL;
+    aria_cuda_dec *h = (aria_cuda_dec *)calloc(1, sizeof(aria_cuda_dec));
+    if (cublasCreate(&h->cublas) != CUBLAS_STATUS_SUCCESS) { free(h); return NULL; }
+    h->running_std = v->running_std;
+    h->proj_w     = upload_f16(v->proj_w, (size_t)DC_D * 256);
+    h->proj_b     = upload_f32(v->proj_b, DC_D);
+    h->new_tokens = upload_f32(v->new_tokens, DC_D);
+    h->mapping_w  = upload_f32(v->mapping_w, (size_t)DC_OUT * DC_D * 3);
+    h->mapping_b  = upload_f32(v->mapping_b, DC_OUT);
+    int ok = h->proj_w && h->proj_b && h->new_tokens && h->mapping_w && h->mapping_b;
+    for (int i = 0; i < 6 && ok; i++) {
+        const aria_taae_block_view *s = &v->blocks[i]; dec_blk_dev *d = &h->blocks[i];
+        d->pre_alpha = s->pre_alpha; d->qn_alpha = s->qn_alpha; d->kn_alpha = s->kn_alpha; d->ff_alpha = s->ff_alpha;
+        d->pre_gamma = upload_f32(s->pre_gamma, DC_D); d->pre_beta = upload_f32(s->pre_beta, DC_D);
+        d->qn_gamma  = upload_f32(s->qn_gamma, DC_HD); d->qn_beta  = upload_f32(s->qn_beta, DC_HD);
+        d->kn_gamma  = upload_f32(s->kn_gamma, DC_HD); d->kn_beta  = upload_f32(s->kn_beta, DC_HD);
+        d->ff_gamma  = upload_f32(s->ff_gamma, DC_D);  d->ff_beta  = upload_f32(s->ff_beta, DC_D);
+        d->ff_in_b   = upload_f32(s->ff_in_b, 2 * DC_INNER); d->ff_out_b = upload_f32(s->ff_out_b, DC_D);
+        d->to_qkv    = upload_f16(s->to_qkv, (size_t)DC_QKV * DC_D);
+        d->to_out    = upload_f16(s->to_out, (size_t)DC_D * DC_D);
+        d->ff_in_w   = upload_f16(s->ff_in_w, (size_t)2 * DC_INNER * DC_D);
+        d->ff_out_w  = upload_f16(s->ff_out_w, (size_t)DC_D * DC_INNER);
+        ok = d->to_qkv && d->to_out && d->ff_in_w && d->ff_out_w && d->pre_gamma && d->ff_in_b;
+    }
+    /* rope tables for S=34 (computed on host, uploaded) */
+    int rh = DC_ROT / 2;
+    float *cs = (float *)malloc((size_t)DC_S * rh * sizeof(float)), *sn = (float *)malloc((size_t)DC_S * rh * sizeof(float));
+    for (int i = 0; i < rh; i++) {
+        double inv = 1.0 / pow(10000.0, (double)(2 * i) / (double)DC_ROT);
+        for (int p = 0; p < DC_S; p++) { cs[p * rh + i] = (float)cos((double)p * inv); sn[p * rh + i] = (float)sin((double)p * inv); }
+    }
+    h->rcos = upload_f32(cs, (size_t)DC_S * rh); h->rsin = upload_f32(sn, (size_t)DC_S * rh);
+    free(cs); free(sn);
+    if (!ok || !h->rcos) { aria_cuda_dec_free(h); return NULL; }
+    return h;
+}
+
+extern "C" void aria_cuda_dec_forward(aria_cuda_dec *h, float *audio, const float *latent, int T) {
+    int D = DC_D, Tp = (T % 2 == 0) ? T : T + 1, L = Tp * 17, Lout = Tp * 16, Lt = T * 16;
+    /* arena sized for the batched pass (shifted pass is the largest) */
+    int Bmax = (L + DC_S) / DC_S;
+    size_t bs = (size_t)Bmax * DC_S;
+    size_t cap = (bs * 19200 + (size_t)Bmax * DC_H * DC_S * DC_S        /* one block's peak */
+                  + (size_t)(L + DC_S) * D * 2                          /* seq + pad */
+                  + (size_t)D * Lout + (size_t)DC_OUT * Lout            /* feat + mapped */
+                  + (size_t)T * 256 + (size_t)T * D + (1u << 20)) * sizeof(float);
+    darena ar; cudaMalloc(&ar.base, cap); ar.cap = cap; ar.used = 0;
+
+    float *d_lat = upload_f32(latent, (size_t)256 * T);
+    size_t mark = da_save(&ar);
+    /* softnorm: z = latent * running_std ; transpose [256,T]->[T,256] ; proj ->[T,768] */
+    float *z = da_alloc(&ar, (size_t)256 * T);
+    k_scale<<<nblocks((size_t)256 * T), THREADS>>>(z, d_lat, h->running_std, 256 * T);
+    float *ztc = da_alloc(&ar, (size_t)T * 256);
+    k_transpose<<<nblocks((size_t)256 * T), THREADS>>>(ztc, z, 256, T);
+    float *x = da_alloc(&ar, (size_t)T * D);
+    gemm_f16w(h->cublas, &ar, x, ztc, h->proj_w, h->proj_b, T, 256, D);
+
+    /* expand to seq[L,768], two chunked passes (unshifted, then midpoint-shift) */
+    float *seq = da_alloc(&ar, (size_t)L * D);
+    k_expand_tokens<<<nblocks((size_t)L * D), THREADS>>>(seq, x, h->new_tokens, T, Tp, D);
+    taae_pass_dev(h, seq, L, &h->blocks[0], 0, &ar);
+    taae_pass_dev(h, seq, L, &h->blocks[3], 1, &ar);
+
+    /* extract feat[768,Lout], conv1d mapping 768->512, trim to T*16, unpatch -> audio */
+    float *feat = da_alloc(&ar, (size_t)D * Lout);
+    k_extract_feat<<<nblocks((size_t)D * Lout), THREADS>>>(feat, seq, D, Lout);
+    float *mapped = da_alloc(&ar, (size_t)DC_OUT * Lout);
+    k_conv1d<<<nblocks((size_t)DC_OUT * Lout), THREADS>>>(mapped, feat, h->mapping_w, h->mapping_b, D, DC_OUT, 3, 1, Lout);
+    float *dec = da_alloc(&ar, (size_t)DC_OUT * Lt);
+    CK(cudaMemcpy2D(dec, (size_t)Lt * sizeof(float), mapped, (size_t)Lout * sizeof(float),
+                    (size_t)Lt * sizeof(float), DC_OUT, cudaMemcpyDeviceToDevice));
+    float *d_audio = da_alloc(&ar, (size_t)2 * Lt * 256);
+    k_unpatch<<<nblocks((size_t)2 * Lt * 256), THREADS>>>(d_audio, dec, Lt);
+    CK(cudaGetLastError());
+    CK(cudaMemcpy(audio, d_audio, (size_t)2 * Lt * 256 * sizeof(float), cudaMemcpyDeviceToHost));
+
+    da_restore(&ar, mark);
+    cudaFree(d_lat); cudaFree(ar.base);
+}
+
+extern "C" void aria_cuda_dec_free(aria_cuda_dec *h) {
+    if (!h) return;
+    if (h->cublas) cublasDestroy(h->cublas);
+    cudaFree(h->proj_w); cudaFree((void *)h->proj_b); cudaFree((void *)h->new_tokens);
+    cudaFree(h->mapping_w); cudaFree((void *)h->mapping_b); cudaFree(h->rcos); cudaFree(h->rsin);
+    for (int i = 0; i < 6; i++) {
+        dec_blk_dev *d = &h->blocks[i];
+        cudaFree((void *)d->pre_gamma); cudaFree((void *)d->pre_beta);
+        cudaFree((void *)d->qn_gamma); cudaFree((void *)d->qn_beta);
+        cudaFree((void *)d->kn_gamma); cudaFree((void *)d->kn_beta);
+        cudaFree((void *)d->ff_gamma); cudaFree((void *)d->ff_beta);
+        cudaFree((void *)d->ff_in_b); cudaFree((void *)d->ff_out_b);
+        cudaFree(d->to_qkv); cudaFree(d->to_out); cudaFree(d->ff_in_w); cudaFree(d->ff_out_w);
+    }
     free(h);
 }

@@ -17,6 +17,10 @@
 
 #include "aria_safetensors.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct aria_sa3_dec aria_sa3_dec;
 
 aria_sa3_dec *aria_sa3_dec_load(safetensors_file_t *sf);
@@ -32,5 +36,30 @@ void aria_unpatch_stereo(float *audio, const float *dec, int L);                
 
 /* test hook: run transformers[idx] on xc[N,768] in place (rope recomputed for N). */
 void aria_sa3_dec_block_test(const aria_sa3_dec *m, int idx, float *xc, int N);
+
+/* ---- read-only weight view (so the CUDA backend can upload) ---- */
+typedef struct {
+    float pre_alpha, qn_alpha, kn_alpha, ff_alpha;
+    const float *pre_gamma, *pre_beta, *qn_gamma, *qn_beta, *kn_gamma, *kn_beta, *ff_gamma, *ff_beta;
+    const float *to_qkv, *to_out, *ff_in_w, *ff_in_b, *ff_out_w, *ff_out_b;
+} aria_taae_block_view;
+typedef struct {
+    float running_std;
+    const float *proj_w, *proj_b, *new_tokens, *mapping_w, *mapping_b;
+    aria_taae_block_view blocks[6];
+} aria_sa3_dec_view;
+void aria_sa3_dec_get_view(const aria_sa3_dec *m, aria_sa3_dec_view *v);
+
+/* ---- CUDA device-resident decoder (E8.5c; implemented in aria_cuda.cu) ----
+ * Uploads weights (fp16 GEMMs, fp32 norms/conv) once; runs the whole latent->audio
+ * decode on the device, batching all S=34 chunks of a pass. All host pointers. */
+typedef struct aria_cuda_dec aria_cuda_dec;
+aria_cuda_dec *aria_cuda_dec_create(const aria_sa3_dec_view *v);   /* NULL if no device / no fit */
+void aria_cuda_dec_free(aria_cuda_dec *h);
+void aria_cuda_dec_forward(aria_cuda_dec *h, float *audio, const float *latent, int T); /* audio[2,T*4096] */
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* ARIA_SA3_DEC_H */

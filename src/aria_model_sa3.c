@@ -38,8 +38,9 @@ typedef struct {
     /* text path (lazily loaded on first text prompt) */
     aria_t5enc *enc;
     aria_tokenizer *tok;
-    /* persistent device DiT (weights uploaded once, reused across generations) */
+    /* persistent device DiT + decoder (weights uploaded once, reused across generations) */
     aria_cuda_dit *cdit;
+    aria_cuda_dec *cdec;
 } sa3_state;
 
 /* Load the T5Gemma encoder + tokenizer on demand (text prompts only). */
@@ -107,6 +108,7 @@ static void sa3_unload(void *state) {
     if (!st) return;
 #ifdef ARIA_CUDA
     if (st->cdit) aria_cuda_dit_free(st->cdit);
+    if (st->cdec) aria_cuda_dec_free(st->cdec);
 #endif
     aria_sa3_dit_free(st->dit);
     aria_sa3_dec_free(st->dec);
@@ -212,6 +214,11 @@ static int sa3_generate(aria_ctx *ctx, void *state,
             dc.cdit = st->cdit;
             dc.global_seconds = rv.global_seconds;
             dc.gcond = malloc((size_t)6 * st->cfg.embed_dim * sizeof(float));
+            if (!st->cdec) {   /* decode on the GPU too (uploaded once, reused) */
+                aria_sa3_dec_view dv; aria_sa3_dec_get_view(st->dec, &dv);
+                st->cdec = aria_cuda_dec_create(&dv);
+                if (st->cdec) fprintf(stderr, "[aria] decoder: GPU device-resident, fp16\n");
+            }
         }
     }
 #endif
@@ -223,8 +230,12 @@ static int sa3_generate(aria_ctx *ctx, void *state,
 #endif
     aria_sa3_dit_req_end(req);
 
-    /* decode -> interleaved stereo */
+    /* decode -> interleaved stereo (GPU if the DiT ran there, else CPU) */
     float *audio = malloc((size_t)2 * T * 4096 * sizeof(float));
+#ifdef ARIA_CUDA
+    if (st->cdec) aria_cuda_dec_forward(st->cdec, audio, x, T);
+    else
+#endif
     aria_sa3_dec_forward(st->dec, audio, x, T);
     double t3 = sa3_now();
     if (profile)
