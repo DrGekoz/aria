@@ -40,6 +40,8 @@ typedef struct {
     const float *ca_to_q, *ca_to_kv, *ca_q_norm, *ca_k_norm, *ca_to_out;
     const float *ff_in_w, *ff_in_b, *ff_out_w, *ff_out_b;
     const float *to_scale_shift_gate;               /* [6*dim] */
+    /* local-additive (inpaint) cond MLP: Linear(257->dim) -> SiLU -> Linear(dim->dim) */
+    const float *to_local0_w, *to_local0_b, *to_local2_w, *to_local2_b;
 } aria_dit_block_w;
 
 /* In-place adaLN block forward on x[S, dim].
@@ -77,6 +79,12 @@ typedef struct aria_sa3_dit_req aria_sa3_dit_req;
 aria_sa3_dit_req *aria_sa3_dit_req_begin(const aria_sa3_dit *m, int T,
                                          const float *cross_768, int n_cond,
                                          const float *global_768);
+/* Optional local-additive (inpaint) conditioning: raw [n_local, local_dim]
+ * (=[T,257] of [inpaint_mask | inpaint_masked_input]); each block projects it via
+ * its to_local_embed MLP and adds it to the residual stream (left-padded past the
+ * memory tokens). Call after req_begin; omit for plain text->audio (no-op). */
+void aria_sa3_dit_req_set_local(aria_sa3_dit_req *req, const float *local_raw,
+                                int n_local, int local_dim);
 /* one denoising step: out_CT = velocity(x_CT, t), reusing the request's caches. */
 void aria_sa3_dit_step(const aria_sa3_dit *m, aria_sa3_dit_req *req,
                        float *out_CT, const float *x_CT, float t);

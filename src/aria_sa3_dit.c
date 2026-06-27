@@ -75,7 +75,7 @@ static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
                            const float *cross_k, const float *cross_v, int Sc,
                            const float *global_cond,
                            const float *rope_cos, const float *rope_sin, int rot_dim,
-                           const aria_dit_block_w *w, aria_arena *ar) {
+                           const float *local_emb, const aria_dit_block_w *w, aria_arena *ar) {
     const float eps_norm = 1e-5f, eps_qk = 1e-6f;
     size_t mark = aria_arena_save(ar);
 
@@ -130,6 +130,10 @@ static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
     aria_linear(o, merged, w->ca_to_out, NULL, S, dim, dim);
     for (size_t i = 0; i < (size_t)S * dim; i++) x[i] = residual[i] + o[i];
 
+    /* ---------- local-additive (inpaint) cond: x += left-padded local_emb ---------- */
+    if (local_emb)
+        for (size_t i = 0; i < (size_t)S * dim; i++) x[i] += local_emb[i];
+
     /* ---------- feed-forward (GLU) ---------- */
     memcpy(residual, x, (size_t)S * dim * sizeof(float));
     aria_rmsnorm(h, x, w->ff_norm, S, dim, eps_norm);
@@ -166,7 +170,7 @@ void aria_dit_block_forward(float *x, int S, int dim, int num_heads, int head_di
                   + (1u << 18)) * sizeof(float);
     aria_arena_init(&ar, cap);
     dit_block_core(x, S, dim, H, hd, inner, cross_k, cross_v, Sc, global_cond,
-                   rope_cos, rope_sin, rot_dim, w, &ar);
+                   rope_cos, rope_sin, rot_dim, NULL, w, &ar);
     aria_arena_free(&ar);
     free(cross_k); free(cross_v);
 }
@@ -248,6 +252,10 @@ aria_sa3_dit *aria_sa3_dit_load(safetensors_file_t *sf, const aria_sa3_config *c
         BW(ff_out_w, "ff.ff.2.weight");
         BW(ff_out_b, "ff.ff.2.bias");
         BW(to_scale_shift_gate, "to_scale_shift_gate");
+        BW(to_local0_w, "to_local_embed.0.weight");
+        BW(to_local0_b, "to_local_embed.0.bias");
+        BW(to_local2_w, "to_local_embed.2.weight");
+        BW(to_local2_b, "to_local_embed.2.bias");
         #undef BW
     }
 
@@ -286,6 +294,7 @@ struct aria_sa3_dit_req {
     float *global_seconds;  /* [ed]          to_global_embed(seconds) (timestep added per step) */
     float *rope_cos, *rope_sin;             /* [S, rot/2] */
     float **cross_k, **cross_v;             /* [depth] each [H, n_cond, hd]; cross_k post k_norm */
+    float **local_emb; int has_local;       /* [depth] each [S, ed] (left-padded) or NULL */
 };
 
 aria_sa3_dit_req *aria_sa3_dit_req_begin(const aria_sa3_dit *m, int T,
@@ -333,6 +342,27 @@ aria_sa3_dit_req *aria_sa3_dit_req_begin(const aria_sa3_dit *m, int T,
     return r;
 }
 
+void aria_sa3_dit_req_set_local(aria_sa3_dit_req *r, const float *local_raw,
+                                int n_local, int local_dim) {
+    const aria_sa3_dit *m = r->m;
+    int ed = m->ed, Mt = m->n_mem, S = r->S, depth = m->depth;
+    if (!local_raw || n_local <= 0) return;  /* no-op (text->audio) */
+    /* each block: emb = to_local_embed(local_raw) [n_local, ed]; left-pad past the
+     * Mt memory tokens into [S, ed] (the cond aligns to the audio-latent positions). */
+    r->local_emb = calloc((size_t)depth, sizeof(float *));
+    float *emb = malloc((size_t)n_local * ed * sizeof(float));
+    for (int b = 0; b < depth; b++) {
+        const aria_dit_block_w *w = &m->blocks[b];
+        aria_sa3_mlp2(emb, local_raw, n_local, local_dim, ed, ed,
+                      w->to_local0_w, w->to_local0_b, w->to_local2_w, w->to_local2_b);
+        r->local_emb[b] = calloc((size_t)S * ed, sizeof(float));  /* zeros for memory tokens */
+        int rows = n_local < (S - Mt) ? n_local : (S - Mt);
+        memcpy(r->local_emb[b] + (size_t)Mt * ed, emb, (size_t)rows * ed * sizeof(float));
+    }
+    free(emb);
+    r->has_local = 1;
+}
+
 void aria_sa3_dit_step(const aria_sa3_dit *m, aria_sa3_dit_req *r,
                        float *out_CT, const float *x_CT, float t) {
     int C = m->io_ch, ed = m->ed, Mt = m->n_mem, S = r->S, T = r->T, rot = m->rot_dim;
@@ -361,7 +391,8 @@ void aria_sa3_dit_step(const aria_sa3_dit *m, aria_sa3_dit_req *r,
     for (int b = 0; b < m->depth; b++)
         dit_block_core(seq, S, ed, m->num_heads, m->head_dim, m->inner,
                        r->cross_k[b], r->cross_v[b], r->n_cond, gcond,
-                       r->rope_cos, r->rope_sin, rot, &m->blocks[b], ar);
+                       r->rope_cos, r->rope_sin, rot,
+                       r->has_local ? r->local_emb[b] : NULL, &m->blocks[b], ar);
 
     /* strip memory tokens, project_out [T,ed] -> [T,C] */
     float *outtc = aria_arena_floats(ar, (size_t)T * C);
@@ -383,6 +414,8 @@ void aria_sa3_dit_req_end(aria_sa3_dit_req *r) {
     if (r->cross_k) for (int b = 0; b < r->m->depth; b++) free(r->cross_k[b]);
     if (r->cross_v) for (int b = 0; b < r->m->depth; b++) free(r->cross_v[b]);
     free(r->cross_k); free(r->cross_v);
+    if (r->local_emb) for (int b = 0; b < r->m->depth; b++) free(r->local_emb[b]);
+    free(r->local_emb);
     free(r);
 }
 
