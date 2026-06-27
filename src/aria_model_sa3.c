@@ -249,6 +249,22 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     aria_logsnr_schedule(sched, steps, 1.0f, -6.2f, 2000.0f, 1.0f, 2.0f, (float)T);
 
     int profile = getenv("ARIA_PROFILE") != NULL;
+
+    /* precision: q8/q4 quantize the DiT block GEMMs (CPU path); fp16/bf16 are not
+     * yet a distinct CPU storage format, so they fall back to fp32 here. Idempotent
+     * + must run before req_begin (the cross-K/V projection uses the overlay). */
+    aria_dtype cpu_prec = (p->precision == ARIA_Q8 || p->precision == ARIA_Q4) ? p->precision : ARIA_F32;
+    aria_sa3_dit_quantize(st->dit, cpu_prec);
+    int quant = (cpu_prec != ARIA_F32);
+    if (quant) {
+        static int announced = 0;
+        if (!announced) {
+            fprintf(stderr, "[aria] DiT: %s block weights = %.0f MB (CPU)\n",
+                    aria_dtype_name(cpu_prec), aria_sa3_dit_weight_bytes(st->dit) / 1048576.0);
+            announced = 1;
+        }
+    }
+
     double t0 = sa3_now();
     aria_sa3_dit_req *req = aria_sa3_dit_req_begin(st->dit, T, cross, n_cond, sec_emb);
     /* continue / inpaint: build + attach the local-additive conditioning (E7). */
@@ -263,7 +279,7 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     /* auto: use the GPU only if it's worth it (sm_70+) and fits (create returns NULL
      * on OOM -> CPU); cuda: force any device (still CPU-fallback on OOM); cpu: never.
      * Inpaint stays on the CPU DiT -- the device DiT has no local-cond path yet. */
-    int want_gpu = !p->init_audio &&
+    int want_gpu = !p->init_audio && !quant &&
                    ((p->device == ARIA_DEVICE_CUDA && aria_cuda_available()) ||
                     (p->device == ARIA_DEVICE_AUTO && aria_cuda_recommended()));
     if (want_gpu) {

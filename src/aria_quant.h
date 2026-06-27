@@ -51,4 +51,23 @@ static inline size_t aria_q8_nscale(int N, int K)   { (void)K; return (size_t)N;
 static inline size_t aria_q4_qbytes(int N, int K)   { return (size_t)N * aria_q4_rowbytes(K); }
 static inline size_t aria_q4_nscale(int N, int K)   { return (size_t)N * aria_q4_nblocks(K); }
 
+/* ---- a Linear weight that may be f32 (borrowed) or quantized (owned) ----
+ * Lets a model dispatch one GEMM call site across precisions with no other
+ * change. F32 keeps the zero-copy mmap pointer; Q8/Q4 own their packed data. */
+typedef struct {
+    aria_dtype dt;
+    int N, K;            /* [out,in] (PyTorch Linear layout) */
+    const float *f32;    /* dt==F32: borrowed */
+    void *q;             /* dt==Q8: int8_t* ; dt==Q4: uint8_t* (owned) */
+    float *scale;        /* dt==Q8/Q4: scales (owned) */
+} aria_qweight;
+
+/* pack W[N,K] into `w` per dt (F32 borrows W; Q8/Q4 allocate + quantize). */
+void aria_qweight_set(aria_qweight *w, const float *W, int N, int K, aria_dtype dt);
+void aria_qweight_free(aria_qweight *w);
+/* dispatch GEMM: y[M,N] = x[M,K] @ W^T + b (b may be NULL). */
+void aria_linear_qw(float *y, const float *x, const aria_qweight *w, const float *b, int M);
+/* packed size in bytes (q data + scales), for footprint reporting. */
+size_t aria_qweight_bytes(const aria_qweight *w);
+
 #endif /* ARIA_QUANT_H */

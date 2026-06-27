@@ -15,6 +15,7 @@
 
 #include <stdint.h>
 #include "aria_wav.h"
+#include "aria_quant.h"   /* aria_dtype (precision selection) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -32,6 +33,7 @@ typedef struct {
     float cfg_scale;                /* CFG scale (default 1.0 = off) */
     int64_t seed;                   /* RNG seed (-1 = random) */
     aria_device device;             /* DiT backend: auto (default) / cpu / cuda (E8.5) */
+    aria_dtype precision;           /* DiT weight precision: fp32 (default) / q8 / q4 (E9, CPU) */
     /* continue / inpaint (E7): regenerate part of an existing clip, keep the rest.
      * Set init_audio to a WAV path. inpaint_from_s..inpaint_to_s marks the region
      * to regenerate (seconds; to_s <= 0 means "to seconds_total"). inpaint_continue
@@ -43,7 +45,7 @@ typedef struct {
     int   inpaint_continue;         /* 1 = continue mode (regenerate the tail) */
 } aria_gen_params;
 
-#define ARIA_GEN_PARAMS_DEFAULT { NULL, NULL, 15.0f, 8, 1.0f, 0, ARIA_DEVICE_AUTO, NULL, 0.0f, 0.0f, 0 }
+#define ARIA_GEN_PARAMS_DEFAULT { NULL, NULL, 15.0f, 8, 1.0f, 0, ARIA_DEVICE_AUTO, ARIA_F32, NULL, 0.0f, 0.0f, 0 }
 
 /* Load a model from a directory containing model_config.json + model.safetensors.
  * Returns NULL on error (see aria_last_error()). */

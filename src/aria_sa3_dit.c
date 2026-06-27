@@ -4,6 +4,7 @@
 
 #include "aria_sa3_dit.h"
 #include "aria_ops.h"
+#include "aria_quant.h"
 #include "aria_cond.h"
 #include "aria_arena.h"
 #include <stdio.h>
@@ -68,14 +69,36 @@ static void gate_sigmoid(float *y, const float *gate, int S, int dim) {
     }
 }
 
+/* Quantized mirror of a block's big linears, built on load when precision != f32
+ * (additive overlay -- the f32 path and the CUDA view are untouched). */
+typedef struct {
+    aria_qweight sa_to_qkv, sa_to_out, ca_to_q, ca_to_kv, ca_to_out, ff_in_w, ff_out_w;
+} dit_block_q;
+
+/* quant-aware GLU feed-forward (mirrors aria_ff_glu, but the two GEMMs dispatch
+ * across precisions via aria_linear_qw). scratch: [N*3*inner] floats. */
+static void ff_glu_qw(float *out, const float *x, int N, int inner, int dim_out,
+                      const aria_qweight *Win, const float *bin,
+                      const aria_qweight *Wout, const float *bout, float *scratch) {
+    float *proj = scratch, *gated = scratch + (size_t)N * 2 * inner;
+    aria_linear_qw(proj, x, Win, bin, N);
+    for (int n = 0; n < N; n++)
+        aria_silu_gate(gated + (size_t)n * inner, proj + (size_t)n * 2 * inner + inner,
+                       proj + (size_t)n * 2 * inner, inner);
+    aria_linear_qw(out, gated, Wout, bout, N);
+    (void)dim_out;
+}
+
 /* Block forward with the cross-attention K/V already projected and head-split
  * (cross_k/cross_v are [H, Sc, hd]; cross_k is post-k_norm). All temporaries come
- * from `ar` (save/restore-scoped), so the hot loop never malloc/frees. */
+ * from `ar` (save/restore-scoped), so the hot loop never malloc/frees. `bq` is the
+ * quantized weight overlay (NULL = f32; that branch is bit-identical to before). */
 static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
                            const float *cross_k, const float *cross_v, int Sc,
                            const float *global_cond,
                            const float *rope_cos, const float *rope_sin, int rot_dim,
-                           const float *local_emb, const aria_dit_block_w *w, aria_arena *ar) {
+                           const float *local_emb, const aria_dit_block_w *w,
+                           const dit_block_q *bq, aria_arena *ar) {
     const float eps_norm = 1e-5f, eps_qk = 1e-6f;
     size_t mark = aria_arena_save(ar);
 
@@ -101,7 +124,8 @@ static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
     adaln_modulate(h, scale_self, shift_self, S, dim);
     {
         float *qkv = aria_arena_floats(ar, (size_t)S * 3 * dim);
-        aria_linear(qkv, h, w->sa_to_qkv, NULL, S, dim, 3 * dim);
+        if (bq) aria_linear_qw(qkv, h, &bq->sa_to_qkv, NULL, S);
+        else    aria_linear(qkv, h, w->sa_to_qkv, NULL, S, dim, 3 * dim);
         extract_heads(qh, qkv, S, H, hd, 3 * dim, 0);
         extract_heads(kh, qkv, S, H, hd, 3 * dim, dim);
         extract_heads(vh, qkv, S, H, hd, 3 * dim, 2 * dim);
@@ -112,7 +136,8 @@ static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
     aria_rope_apply(kh, rope_cos, rope_sin, H, S, hd, rot_dim);
     aria_attention(ao, qh, kh, vh, H, S, S, hd, NULL, scores);
     merge_heads(merged, ao, S, H, hd);
-    aria_linear(o, merged, w->sa_to_out, NULL, S, dim, dim);
+    if (bq) aria_linear_qw(o, merged, &bq->sa_to_out, NULL, S);
+    else    aria_linear(o, merged, w->sa_to_out, NULL, S, dim, dim);
     gate_sigmoid(o, gate_self, S, dim);
     for (size_t i = 0; i < (size_t)S * dim; i++) x[i] = residual[i] + o[i];
 
@@ -121,13 +146,15 @@ static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
     aria_rmsnorm(h, x, w->cross_norm, S, dim, eps_norm);
     {
         float *q = aria_arena_floats(ar, (size_t)S * dim);
-        aria_linear(q, h, w->ca_to_q, NULL, S, dim, dim);
+        if (bq) aria_linear_qw(q, h, &bq->ca_to_q, NULL, S);
+        else    aria_linear(q, h, w->ca_to_q, NULL, S, dim, dim);
         extract_heads(qh, q, S, H, hd, dim, 0);
         aria_rmsnorm(qh, qh, w->ca_q_norm, H * S, hd, eps_qk);
         aria_attention(ao, qh, cross_k, cross_v, H, S, Sc, hd, NULL, scores);
         merge_heads(merged, ao, S, H, hd);
     }
-    aria_linear(o, merged, w->ca_to_out, NULL, S, dim, dim);
+    if (bq) aria_linear_qw(o, merged, &bq->ca_to_out, NULL, S);
+    else    aria_linear(o, merged, w->ca_to_out, NULL, S, dim, dim);
     for (size_t i = 0; i < (size_t)S * dim; i++) x[i] = residual[i] + o[i];
 
     /* ---------- local-additive (inpaint) cond: x += left-padded local_emb ---------- */
@@ -140,7 +167,8 @@ static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
     adaln_modulate(h, scale_ff, shift_ff, S, dim);
     {
         float *ffs = aria_arena_floats(ar, (size_t)S * 3 * inner);
-        aria_ff_glu(o, h, S, dim, inner, dim, w->ff_in_w, w->ff_in_b, w->ff_out_w, w->ff_out_b, ffs);
+        if (bq) ff_glu_qw(o, h, S, inner, dim, &bq->ff_in_w, w->ff_in_b, &bq->ff_out_w, w->ff_out_b, ffs);
+        else    aria_ff_glu(o, h, S, dim, inner, dim, w->ff_in_w, w->ff_in_b, w->ff_out_w, w->ff_out_b, ffs);
     }
     gate_sigmoid(o, gate_ff, S, dim);
     for (size_t i = 0; i < (size_t)S * dim; i++) x[i] = residual[i] + o[i];
@@ -170,7 +198,7 @@ void aria_dit_block_forward(float *x, int S, int dim, int num_heads, int head_di
                   + (1u << 18)) * sizeof(float);
     aria_arena_init(&ar, cap);
     dit_block_core(x, S, dim, H, hd, inner, cross_k, cross_v, Sc, global_cond,
-                   rope_cos, rope_sin, rot_dim, NULL, w, &ar);
+                   rope_cos, rope_sin, rot_dim, NULL, w, NULL, &ar);
     aria_arena_free(&ar);
     free(cross_k); free(cross_v);
 }
@@ -184,6 +212,8 @@ struct aria_sa3_dit {
     const float *to_ts0_w, *to_ts0_b, *to_ts2_w, *to_ts2_b;
     const float *gce0_w, *gce0_b, *gce2_w, *gce2_b;
     aria_dit_block_w *blocks;
+    aria_dtype precision;   /* weight precision for the block GEMMs (default F32) */
+    dit_block_q *bq;        /* quantized overlay [depth], or NULL when precision==F32 */
     int failed;
 };
 
@@ -263,9 +293,65 @@ aria_sa3_dit *aria_sa3_dit_load(safetensors_file_t *sf, const aria_sa3_config *c
     return m;
 }
 
+/* free the quantized overlay (if any). */
+static void dit_free_bq(aria_sa3_dit *m) {
+    if (!m->bq) return;
+    for (int i = 0; i < m->depth; i++) {
+        dit_block_q *q = &m->bq[i];
+        aria_qweight_free(&q->sa_to_qkv); aria_qweight_free(&q->sa_to_out);
+        aria_qweight_free(&q->ca_to_q);   aria_qweight_free(&q->ca_to_kv);
+        aria_qweight_free(&q->ca_to_out); aria_qweight_free(&q->ff_in_w);
+        aria_qweight_free(&q->ff_out_w);
+    }
+    free(m->bq); m->bq = NULL;
+}
+
+/* (Re)build the quantized weight overlay for the block GEMMs. dt==F32 drops the
+ * overlay (back to the zero-copy mmap path). Idempotent: no-op if dt unchanged. */
+void aria_sa3_dit_quantize(aria_sa3_dit *m, aria_dtype dt) {
+    if (!m || dt == m->precision) return;
+    dit_free_bq(m);
+    m->precision = dt;
+    if (dt == ARIA_F32) return;
+    int ed = m->ed, inner = m->inner;
+    m->bq = calloc((size_t)m->depth, sizeof(dit_block_q));
+    for (int i = 0; i < m->depth; i++) {
+        const aria_dit_block_w *w = &m->blocks[i];
+        dit_block_q *q = &m->bq[i];
+        aria_qweight_set(&q->sa_to_qkv, w->sa_to_qkv, 3 * ed, ed, dt);
+        aria_qweight_set(&q->sa_to_out, w->sa_to_out, ed, ed, dt);
+        aria_qweight_set(&q->ca_to_q,   w->ca_to_q,   ed, ed, dt);
+        aria_qweight_set(&q->ca_to_kv,  w->ca_to_kv,  2 * ed, ed, dt);
+        aria_qweight_set(&q->ca_to_out, w->ca_to_out, ed, ed, dt);
+        aria_qweight_set(&q->ff_in_w,   w->ff_in_w,   2 * inner, ed, dt);
+        aria_qweight_set(&q->ff_out_w,  w->ff_out_w,  ed, inner, dt);
+    }
+}
+
+/* total bytes of the block GEMM weights at the current precision (for reporting). */
+size_t aria_sa3_dit_weight_bytes(const aria_sa3_dit *m) {
+    if (!m) return 0;
+    if (!m->bq) {
+        int ed = m->ed, inner = m->inner;
+        size_t per = ((size_t)3 * ed * ed + (size_t)ed * ed + (size_t)ed * ed + (size_t)2 * ed * ed
+                      + (size_t)ed * ed + (size_t)2 * inner * ed + (size_t)ed * inner) * sizeof(float);
+        return per * m->depth;
+    }
+    size_t tot = 0;
+    for (int i = 0; i < m->depth; i++) {
+        const dit_block_q *q = &m->bq[i];
+        tot += aria_qweight_bytes(&q->sa_to_qkv) + aria_qweight_bytes(&q->sa_to_out)
+             + aria_qweight_bytes(&q->ca_to_q)   + aria_qweight_bytes(&q->ca_to_kv)
+             + aria_qweight_bytes(&q->ca_to_out) + aria_qweight_bytes(&q->ff_in_w)
+             + aria_qweight_bytes(&q->ff_out_w);
+    }
+    return tot;
+}
+
 void aria_sa3_dit_free(aria_sa3_dit *m) {
     if (!m) return;
-    free(m->blocks);   /* weights are borrowed from the mmap; nothing else to free */
+    dit_free_bq(m);
+    free(m->blocks);   /* f32 weights are borrowed from the mmap; nothing else to free */
     free(m);
 }
 
@@ -323,7 +409,8 @@ aria_sa3_dit_req *aria_sa3_dit_req_begin(const aria_sa3_dit *m, int T,
     float *kv = malloc((size_t)n_cond * 2 * dim * sizeof(float));
     for (int b = 0; b < depth; b++) {
         const aria_dit_block_w *w = &m->blocks[b];
-        aria_linear(kv, r->cross_ed, w->ca_to_kv, NULL, n_cond, ed, 2 * dim);
+        if (m->bq) aria_linear_qw(kv, r->cross_ed, &m->bq[b].ca_to_kv, NULL, n_cond);
+        else       aria_linear(kv, r->cross_ed, w->ca_to_kv, NULL, n_cond, ed, 2 * dim);
         r->cross_k[b] = malloc((size_t)H * n_cond * hd * sizeof(float));
         r->cross_v[b] = malloc((size_t)H * n_cond * hd * sizeof(float));
         extract_heads(r->cross_k[b], kv, n_cond, H, hd, 2 * dim, 0);
@@ -392,7 +479,8 @@ void aria_sa3_dit_step(const aria_sa3_dit *m, aria_sa3_dit_req *r,
         dit_block_core(seq, S, ed, m->num_heads, m->head_dim, m->inner,
                        r->cross_k[b], r->cross_v[b], r->n_cond, gcond,
                        r->rope_cos, r->rope_sin, rot,
-                       r->has_local ? r->local_emb[b] : NULL, &m->blocks[b], ar);
+                       r->has_local ? r->local_emb[b] : NULL, &m->blocks[b],
+                       m->bq ? &m->bq[b] : NULL, ar);
 
     /* strip memory tokens, project_out [T,ed] -> [T,C] */
     float *outtc = aria_arena_floats(ar, (size_t)T * C);

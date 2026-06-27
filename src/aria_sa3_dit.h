@@ -19,6 +19,7 @@
 
 #include "aria_safetensors.h"
 #include "aria_sa3.h"
+#include "aria_quant.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -62,6 +63,14 @@ typedef struct aria_sa3_dit aria_sa3_dit;
  * missing tensor. Weights are copied to f32 buffers owned by the model. */
 aria_sa3_dit *aria_sa3_dit_load(safetensors_file_t *sf, const aria_sa3_config *cfg);
 void aria_sa3_dit_free(aria_sa3_dit *m);
+
+/* Quantize the block GEMM weights to `dt` (Q8/Q4) as an additive overlay; the
+ * denoise loop then dispatches those linears to dequant-on-use kernels. dt==F32
+ * drops the overlay (zero-copy mmap path, bit-identical to no quantization).
+ * Idempotent. The norms, biases, embedders, project_in/out stay f32. */
+void aria_sa3_dit_quantize(aria_sa3_dit *m, aria_dtype dt);
+/* total bytes of the block GEMM weights at the current precision (reporting). */
+size_t aria_sa3_dit_weight_bytes(const aria_sa3_dit *m);
 
 /* Per-request context: a reusable scratch arena plus the step-invariant state
  * cached once and reused across all denoising steps -- cross_ed (to_cond_embed),
