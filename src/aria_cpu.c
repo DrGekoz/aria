@@ -39,6 +39,28 @@ static inline float aria_hsum256(__m256 v) {
     lo = _mm_add_ss(lo, _mm_shuffle_ps(lo, lo, 0x1));
     return _mm_cvtss_f32(lo);
 }
+static inline double aria_hsum256d(__m256d v) {
+    __m128d lo = _mm256_castpd256_pd128(v);
+    __m128d hi = _mm256_extractf128_pd(v, 1);
+    lo = _mm_add_pd(lo, hi);
+    return _mm_cvtsd_f64(_mm_add_sd(lo, _mm_unpackhi_pd(lo, lo)));
+}
+/* sum of x[i]^2 over dim, accumulated in double (8-wide), to match the scalar
+ * double-precision reduction used for RMS norms within float tolerance. */
+static inline double aria_sumsq_f(const float *x, int dim) {
+    __m256d a0 = _mm256_setzero_pd(), a1 = _mm256_setzero_pd();
+    int i = 0;
+    for (; i + 8 <= dim; i += 8) {
+        __m256 xv = _mm256_loadu_ps(x + i);
+        __m256d xl = _mm256_cvtps_pd(_mm256_castps256_ps128(xv));
+        __m256d xh = _mm256_cvtps_pd(_mm256_extractf128_ps(xv, 1));
+        a0 = _mm256_fmadd_pd(xl, xl, a0);
+        a1 = _mm256_fmadd_pd(xh, xh, a1);
+    }
+    double ss = aria_hsum256d(a0) + aria_hsum256d(a1);
+    for (; i < dim; i++) ss += (double)x[i] * x[i];
+    return ss;
+}
 #endif
 
 /* y[M,N] = x[M,K] @ W^T + b, W=[N,K] (PyTorch Linear).
@@ -188,11 +210,19 @@ void aria_rmsnorm(float *y, const float *x, const float *weight,
     for (int r = 0; r < rows; r++) {
         const float *xr = x + (size_t)r * dim;
         float *yr = y + (size_t)r * dim;
-        double ss = 0.0;
-        for (int i = 0; i < dim; i++) ss += (double)xr[i] * xr[i];
-        float inv = (float)(1.0 / sqrt(ss / dim + eps));
-        if (weight) for (int i = 0; i < dim; i++) yr[i] = xr[i] * inv * weight[i];
-        else        for (int i = 0; i < dim; i++) yr[i] = xr[i] * inv;
+        float inv = (float)(1.0 / sqrt(aria_sumsq_f(xr, dim) / dim + eps));
+        __m256 vi = _mm256_set1_ps(inv);
+        int i = 0;
+        if (weight) {
+            for (; i + 8 <= dim; i += 8)
+                _mm256_storeu_ps(yr + i, _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(xr + i), vi),
+                                                       _mm256_loadu_ps(weight + i)));
+            for (; i < dim; i++) yr[i] = xr[i] * inv * weight[i];
+        } else {
+            for (; i + 8 <= dim; i += 8)
+                _mm256_storeu_ps(yr + i, _mm256_mul_ps(_mm256_loadu_ps(xr + i), vi));
+            for (; i < dim; i++) yr[i] = xr[i] * inv;
+        }
     }
 }
 
@@ -218,12 +248,16 @@ void aria_gemma_rmsnorm(float *y, const float *x, const float *weight,
     #pragma omp parallel for schedule(static)
     #endif
     for (int r = 0; r < rows; r++) {
+        const __m256 one = _mm256_set1_ps(1.0f);
         const float *xr = x + (size_t)r * dim;
         float *yr = y + (size_t)r * dim;
-        double ss = 0.0;
-        for (int i = 0; i < dim; i++) ss += (double)xr[i] * xr[i];
-        float inv = (float)(1.0 / sqrt(ss / dim + eps));
-        for (int i = 0; i < dim; i++) yr[i] = xr[i] * inv * (1.0f + weight[i]);
+        float inv = (float)(1.0 / sqrt(aria_sumsq_f(xr, dim) / dim + eps));
+        __m256 vi = _mm256_set1_ps(inv);
+        int i = 0;
+        for (; i + 8 <= dim; i += 8)
+            _mm256_storeu_ps(yr + i, _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(xr + i), vi),
+                                                   _mm256_add_ps(one, _mm256_loadu_ps(weight + i))));
+        for (; i < dim; i++) yr[i] = xr[i] * inv * (1.0f + weight[i]);
     }
 }
 
