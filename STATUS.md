@@ -62,14 +62,15 @@ excluded.
 
 **`--precision fp32|q8|q4`** selects the CPU DiT weight precision (E9.0/E9.1/E9.3). The block
 GEMMs dispatch through an `aria_qweight` overlay (`aria_quant.{c,h}`): fp32 keeps the zero-copy
-mmap path (bit-identical), **q8** quantizes to per-row int8 (4.0× smaller block weights:
-1.6 GB → 401 MB; **3.1 % velocity rel-RMS** — usable), **q4** to per-block int4 (6.4× smaller →
-250 MB; coarse at **36.8 %** — needs better quantization on the attention path). `test_quant`
-(hermetic) + `test_quant_dit` (model-level) gate it. **On the GPU (E9.4)** `--precision q8|q4`
-keeps the DiT block weights **packed in VRAM** and dequantizes on use into a reused fp16 scratch
-before the tensor-core GEMM, so resident VRAM shrinks (small-music: fp16 ~1.73 GB → q8 1.40 GB →
-q4 1.25 GB) — the path that lets medium fit. Verified on the GT 1030: output is finite and
-numerically identical to the CPU quant path. **Caveat:** CPU quant is a *footprint* win, not
+mmap path (bit-identical), **q8** = per-row int8 (4.0× smaller: 1.6 GB → 361 MB; **2.45 %
+velocity rel-RMS** — high fidelity), **q4** = a workflow-tuned mixed recipe: **asymmetric
+(zero-point) int4 on the FFN + Q8 on the attention projections** (which feed qk-rmsnorm + softmax,
+where error is amplified). That brings q4 from 29.8 % (uniform symmetric) to **9.3 %** velocity —
+near q8 — at 300 MB (4.8×, still smaller than q8). `test_quant`
+(hermetic) + `test_quant_dit` (model-level, 13 % gate) gate it. **On the GPU (E9.4)** `--precision
+q8|q4` keeps the DiT block weights **packed in VRAM** and dequantizes on use into a reused fp16
+scratch before the tensor-core GEMM, so resident VRAM shrinks — the path that lets medium fit.
+Verified: GPU q4 is finite and matches the CPU q4 path (1.06 % rel-RMS, fp16-dequant level). **Caveat:** CPU quant is a *footprint* win, not
 speed (scalar dequant GEMM ~6–8× slower than the AVX2 f32 kernel); the GPU speed win wants tensor
 cores (RTX 3070, sm_86 — bench there). fp16/bf16 fall back to fp32/fp16 for now.
 

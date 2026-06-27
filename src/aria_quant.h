@@ -3,12 +3,14 @@
  * dequant-on-use GEMM. The foundation of E9 (precision & quantization).
  *
  * Weights follow PyTorch's nn.Linear layout [N,K] = [out,in]; aria_linear and
- * its quantized variants all compute y[M,N] = x[M,K] @ W^T + b. Quantization is
- * symmetric (zero-point 0) and dequant happens inside the GEMM (ds4 style), so
- * the packed weights stay small in cache.
+ * its quantized variants all compute y[M,N] = x[M,K] @ W^T + b. Dequant happens
+ * inside the GEMM (ds4 style), so the packed weights stay small in cache.
  *
- *   Q8  per-row int8:  scale[n] = max|W[n,:]|/127;  W ~= q*scale[n]
- *   Q4  per-block int4: scale[n,blk] = max|blk|/7;  W ~= (nib-8)*scale  (block 32)
+ *   Q8  per-row symmetric int8:   scale[n] = max|W[n,:]|/127;  W ~= q*scale[n]
+ *   Q4  per-block ASYMMETRIC int4 (zero-point): per block [min, scale], scale =
+ *       (max-min)/15, nibble in [0,15];  W ~= min + nib*scale  (block 32). Affine
+ *       quant captures skewed weight blocks far better than symmetric int4 (~3x
+ *       lower DiT velocity error), for one extra scale float per block.
  */
 
 #ifndef ARIA_QUANT_H
@@ -26,7 +28,7 @@ typedef enum {
     ARIA_F16  = 1,   /* float16 storage, fp32 compute (E9.0 wiring) */
     ARIA_BF16 = 2,   /* bfloat16 storage, fp32 compute (E9.0 wiring) */
     ARIA_Q8   = 3,   /* int8, per-row symmetric */
-    ARIA_Q4   = 4,   /* int4, per-block symmetric */
+    ARIA_Q4   = 4,   /* int4, per-block asymmetric (zero-point) */
 } aria_dtype;
 
 const char *aria_dtype_name(aria_dtype dt);
@@ -40,11 +42,13 @@ void aria_q8_quant(int8_t *q, float *scale, const float *W, int N, int K);
 void aria_linear_q8(float *y, const float *x, const int8_t *q, const float *scale,
                     const float *b, int M, int K, int N);
 
-/* ---- Q4: per-block symmetric int4 (block = ARIA_Q4_BLOCK), 2 nibbles/byte ---- */
+/* ---- Q4: per-block asymmetric int4 (block = ARIA_Q4_BLOCK), 2 nibbles/byte,
+ *      2 floats per block [min, scale] ---- */
 #define ARIA_Q4_BLOCK 32
 static inline int    aria_q4_nblocks(int K) { return (K + ARIA_Q4_BLOCK - 1) / ARIA_Q4_BLOCK; }
 static inline size_t aria_q4_rowbytes(int K) { return (size_t)((K + 1) / 2); }
-/* quantize W[N,K] -> packed q[N*ceil(K/2)] + scale[N*nblocks] (caller-allocated). */
+/* quantize W[N,K] -> packed q[N*ceil(K/2)] + scale[N*2*nblocks] (caller-allocated;
+ * scale layout per row: [min0,scale0, min1,scale1, ...]). */
 void aria_q4_quant(uint8_t *q, float *scale, const float *W, int N, int K);
 void aria_linear_q4(float *y, const float *x, const uint8_t *q, const float *scale,
                     const float *b, int M, int K, int N);
@@ -53,7 +57,7 @@ void aria_linear_q4(float *y, const float *x, const uint8_t *q, const float *sca
 static inline size_t aria_q8_qbytes(int N, int K)   { return (size_t)N * K; }
 static inline size_t aria_q8_nscale(int N, int K)   { (void)K; return (size_t)N; }
 static inline size_t aria_q4_qbytes(int N, int K)   { return (size_t)N * aria_q4_rowbytes(K); }
-static inline size_t aria_q4_nscale(int N, int K)   { return (size_t)N * aria_q4_nblocks(K); }
+static inline size_t aria_q4_nscale(int N, int K)   { return (size_t)N * 2 * aria_q4_nblocks(K); }
 
 /* ---- a Linear weight that may be f32 (borrowed) or quantized (owned) ----
  * Lets a model dispatch one GEMM call site across precisions with no other

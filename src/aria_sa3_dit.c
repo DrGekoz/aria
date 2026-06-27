@@ -315,14 +315,20 @@ void aria_sa3_dit_quantize(aria_sa3_dit *m, aria_dtype dt) {
     m->precision = dt;
     if (dt == ARIA_F32) return;
     int ed = m->ed, inner = m->inner;
+    /* Mixed precision for Q4: the four attention projections feed qk-rmsnorm +
+     * softmax, where quantization error is amplified through the nonlinearity, so
+     * keep them Q8; only the FFN (the bulk of the params) goes Q4. This is what
+     * makes Q4 usable -- ~9% DiT velocity error vs ~23% for uniform asym-Q4. The
+     * Q8 path stays uniform Q8. (The GPU mirrors this in aria_cuda_dit_create.) */
+    aria_dtype adt = (dt == ARIA_Q4) ? ARIA_Q8 : dt;   /* attention precision */
     m->bq = calloc((size_t)m->depth, sizeof(dit_block_q));
     for (int i = 0; i < m->depth; i++) {
         const aria_dit_block_w *w = &m->blocks[i];
         dit_block_q *q = &m->bq[i];
-        aria_qweight_set(&q->sa_to_qkv, w->sa_to_qkv, 3 * ed, ed, dt);
-        aria_qweight_set(&q->sa_to_out, w->sa_to_out, ed, ed, dt);
-        aria_qweight_set(&q->ca_to_q,   w->ca_to_q,   ed, ed, dt);
-        aria_qweight_set(&q->ca_to_out, w->ca_to_out, ed, ed, dt);
+        aria_qweight_set(&q->sa_to_qkv, w->sa_to_qkv, 3 * ed, ed, adt);
+        aria_qweight_set(&q->sa_to_out, w->sa_to_out, ed, ed, adt);
+        aria_qweight_set(&q->ca_to_q,   w->ca_to_q,   ed, ed, adt);
+        aria_qweight_set(&q->ca_to_out, w->ca_to_out, ed, ed, adt);
         aria_qweight_set(&q->ff_in_w,   w->ff_in_w,   2 * inner, ed, dt);
         aria_qweight_set(&q->ff_out_w,  w->ff_out_w,  ed, inner, dt);
     }

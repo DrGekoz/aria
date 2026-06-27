@@ -471,6 +471,7 @@ __global__ void k_dequant_q8(__half *W, const int8_t *q, const float *scale, int
     if (idx >= (size_t)N * K) return;
     W[idx] = __float2half((float)q[idx] * scale[idx / K]);
 }
+/* asymmetric (zero-point) int4: per block [min, scale]; W = min + nib*scale. */
 __global__ void k_dequant_q4(__half *W, const uint8_t *q, const float *scale, int N, int K) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (size_t)N * K) return;
@@ -479,7 +480,8 @@ __global__ void k_dequant_q4(__half *W, const uint8_t *q, const float *scale, in
     size_t rb = (size_t)((K + 1) / 2);
     uint8_t byte = q[(size_t)n * rb + (k >> 1)];
     int nib = (k & 1) ? (byte >> 4) : (byte & 0x0F);
-    W[idx] = __float2half((float)(nib - 8) * scale[(size_t)n * nblk + (k / ARIA_Q4_BLOCK)]);
+    size_t si = ((size_t)n * nblk + (k / ARIA_Q4_BLOCK)) * 2;
+    W[idx] = __float2half(scale[si] + (float)nib * scale[si + 1]);
 }
 
 /* host-quantize a [N,K] f32 weight per dt and upload it (packed) to the device. */
@@ -619,10 +621,14 @@ extern "C" aria_cuda_dit *aria_cuda_dit_create(const aria_sa3_dit_view *v, aria_
     if (!aria_cuda_available()) return NULL;
     int ed = v->ed, inner = v->inner;
     if (precision != ARIA_Q8 && precision != ARIA_Q4) precision = ARIA_F32;  /* fp16/bf16 -> fp16 storage */
-    /* rough fit check: per-block block-GEMM elements = 6*ed^2 + 3*inner*ed; bytes
-     * per element = 2 (fp16) / 1 (q8) / ~0.5 (q4), plus the dequant scratch. */
-    size_t welem = (size_t)v->depth * (6 * (size_t)ed * ed + 3 * (size_t)inner * ed);
-    size_t wbytes = (precision == ARIA_Q4) ? welem / 2 : (precision == ARIA_Q8 ? welem : welem * 2);
+    /* Q4 is mixed precision (mirrors aria_sa3_dit_quantize): the 4 attention
+     * projections (6*ed^2/block) stay Q8 and only the FFN (3*inner*ed/block) goes
+     * asymmetric Q4 -- ~9% DiT velocity error vs ~23% for uniform Q4. Rough fit:
+     * attention ~1 B/elem (q8), FFN ~1 B/elem (q4: 0.5 nibble + scale, rounded up),
+     * fp16 = 2 B/elem, plus the dequant scratch. */
+    size_t attn_elem = (size_t)v->depth * 6 * (size_t)ed * ed;
+    size_t ffn_elem  = (size_t)v->depth * 3 * (size_t)inner * ed;
+    size_t wbytes = (precision == ARIA_F32) ? (attn_elem + ffn_elem) * 2 : (attn_elem + ffn_elem);
     size_t need = wbytes + (precision != ARIA_F32 ? (size_t)2 * inner * ed * sizeof(__half) : 0) + (64u << 20);
     size_t freeb = 0, totb = 0; cudaMemGetInfo(&freeb, &totb);
     if (freeb < need) { fprintf(stderr, "aria_cuda_dit: need ~%zu MiB, only %zu free\n", need >> 20, freeb >> 20); return NULL; }
@@ -652,11 +658,13 @@ extern "C" aria_cuda_dit *aria_cuda_dit_create(const aria_sa3_dit_view *v, aria_
         d->ssg        = upload_f32(s->to_scale_shift_gate, (size_t)6 * ed);
         d->ff_in_b    = upload_f32(s->ff_in_b, (size_t)2 * inner);
         d->ff_out_b   = upload_f32(s->ff_out_b, ed);
+        /* Q4 mixed precision: attention projections stay Q8 (error-sensitive). */
+        aria_dtype adt = (precision == ARIA_Q4) ? ARIA_Q8 : precision;
         int u = 1;
-        u &= upload_dqw(&d->sa_to_qkv, s->sa_to_qkv, 3 * ed, ed, precision);
-        u &= upload_dqw(&d->sa_to_out, s->sa_to_out, ed, ed, precision);
-        u &= upload_dqw(&d->ca_to_q,   s->ca_to_q,   ed, ed, precision);
-        u &= upload_dqw(&d->ca_to_out, s->ca_to_out, ed, ed, precision);
+        u &= upload_dqw(&d->sa_to_qkv, s->sa_to_qkv, 3 * ed, ed, adt);
+        u &= upload_dqw(&d->sa_to_out, s->sa_to_out, ed, ed, adt);
+        u &= upload_dqw(&d->ca_to_q,   s->ca_to_q,   ed, ed, adt);
+        u &= upload_dqw(&d->ca_to_out, s->ca_to_out, ed, ed, adt);
         u &= upload_dqw(&d->ff_in_w,   s->ff_in_w,   2 * inner, ed, precision);
         u &= upload_dqw(&d->ff_out_w,  s->ff_out_w,  ed, inner, precision);
         ok = u && d->ssg && d->pre_norm;

@@ -59,12 +59,12 @@ int main(void) {
     size_t f32_bytes = aria_sa3_dit_weight_bytes(m);
 
     int fails = 0;
-    /* q8 is the usable quantization (hard gate). q4 trades a lot of fidelity for
-     * ~6.4x footprint; without mixed-precision tuning its per-forward error is
-     * large but bounded/finite -- gate only that it runs and stays sane (real Q4
-     * fidelity is a follow-up: keep the FFN in q8, or smaller blocks). */
+    /* q8 (per-row int8): the high-fidelity option. q4 = asymmetric (zero-point)
+     * int4 on the FFN + Q8 on the attention projections (error-sensitive) -- this
+     * mixed/affine recipe brings q4 from ~30% (uniform symmetric) to ~9% velocity,
+     * near q8, at a smaller footprint than q8. Both are hard gates now. */
     struct { aria_dtype dt; const char *name; float thr; } cases[] = {
-        { ARIA_Q8, "q8", 0.05f }, { ARIA_Q4, "q4", 0.60f },
+        { ARIA_Q8, "q8", 0.05f }, { ARIA_Q4, "q4", 0.13f },
     };
     for (int c = 0; c < 2; c++) {
         aria_sa3_dit_quantize(m, cases[c].dt);
@@ -74,10 +74,9 @@ int main(void) {
         for (int i = 0; i < C * T; i++) if (!isfinite(vq[i])) { finite = 0; break; }
         size_t qb = aria_sa3_dit_weight_bytes(m);
         int ok = finite && e <= cases[c].thr;
-        printf("%s %s velocity rel-RMS=%.2f%% (bound %.0f%%)  weights %.0f MB (%.2fx vs fp32)%s\n",
+        printf("%s %s velocity rel-RMS=%.2f%% (bound %.0f%%)  weights %.0f MB (%.2fx vs fp32)\n",
                ok ? "ok  " : "FAIL", cases[c].name, e * 100, cases[c].thr * 100,
-               qb / 1048576.0, (double)f32_bytes / qb,
-               cases[c].dt == ARIA_Q4 ? "  [coarse; needs mixed-precision tuning]" : "");
+               qb / 1048576.0, (double)f32_bytes / qb);
         if (!ok) fails++;
     }
 
