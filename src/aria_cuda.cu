@@ -11,6 +11,7 @@
 #include "aria_sa3_dit.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cublas_v2.h>
 #include <cstdio>
 #include <cstdlib>
 
@@ -345,9 +346,10 @@ __global__ void k_gemm_f16w(float *y, const float *x, const __half *W, const flo
     }
     if (row < M && col < N) y[(size_t)row * N + col] = acc + (b ? b[col] : 0.0f);
 }
-static void gemm_f16w(float *y, const float *x, const __half *W, const float *b, int M, int K, int N) {
-    dim3 blk(TILE, TILE), grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
-    k_gemm_f16w<<<grid, blk>>>(y, x, W, b, M, K, N);
+/* y[m,n] += b[n]  (broadcast bias over rows; cuBLAS GEMM has no vector-bias epilogue) */
+__global__ void k_add_bias(float *y, const float *b, int M, int N) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < (size_t)M * N) y[i] += b[i % N];
 }
 
 /* ---- glue kernels (device pointers) ---- */
@@ -416,6 +418,11 @@ static float *da_alloc(darena *a, size_t nf) {
     a->used = off + nf * sizeof(float);
     return (float *)(a->base + off);
 }
+static __half *da_alloc_half(darena *a, size_t nh) {
+    size_t off = (a->used + 63) & ~((size_t)63);
+    a->used = off + nh * sizeof(__half);
+    return (__half *)(a->base + off);
+}
 static size_t da_save(darena *a) { return a->used; }
 static void da_restore(darena *a, size_t m) { a->used = m; }
 
@@ -430,12 +437,30 @@ struct aria_cuda_dit {
     __half *preprocess, *postprocess, *project_in, *project_out;
     float *memory_tokens;
     blk_dev *blocks;
+    cublasHandle_t cublas;
     /* per-request */
     int T, S, n_cond, have_req;
     float *dx, *dv, *dgcond, *rope_cos, *rope_sin;
     float **cross_k, **cross_v;
     darena arena;
 };
+
+/* y[M,N] = x[M,K] @ W[N,K]^T + b via cuBLAS GemmEx (fp16 in, fp32 accumulate ->
+ * tensor cores on sm_80+). x (fp32 activations) is converted to fp16 into transient
+ * arena scratch; W is already fp16. Single default stream, so reusing the scratch
+ * region after the (queued) GEMM is safe by stream ordering. */
+static void gemm_f16w(aria_cuda_dit *h, float *y, const float *x, const __half *W,
+                      const float *b, int M, int K, int N) {
+    darena *ar = &h->arena; size_t mark = da_save(ar);
+    __half *xh = da_alloc_half(ar, (size_t)M * K);
+    k_f32_to_f16<<<nblocks((size_t)M * K), THREADS>>>(xh, x, (size_t)M * K);
+    const float alpha = 1.0f, beta = 0.0f;
+    cublasGemmEx(h->cublas, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha,
+                 W, CUDA_R_16F, K, xh, CUDA_R_16F, K, &beta,
+                 y, CUDA_R_32F, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    if (b) k_add_bias<<<nblocks((size_t)M * N), THREADS>>>(y, b, M, N);
+    da_restore(ar, mark);
+}
 
 static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     int S = h->S, ed = h->ed, H = h->H, hd = h->hd, dim = ed, inner = h->inner, Sc = h->n_cond, rot = h->rot;
@@ -459,7 +484,7 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     k_rmsnorm<<<nblocks(S), THREADS>>>(hh, seq, w->pre_norm, S, dim, 1e-5f, 0);
     k_adaln<<<nSd, THREADS>>>(hh, scale_self, shift_self, S, dim);
     float *qkv = da_alloc(ar, (size_t)S * 3 * dim);
-    gemm_f16w(qkv, hh, w->sa_to_qkv, NULL, S, dim, 3 * dim);
+    gemm_f16w(h, qkv, hh, w->sa_to_qkv, NULL, S, dim, 3 * dim);
     k_extract_heads<<<nHShd, THREADS>>>(qh, qkv, S, H, hd, 3 * dim, 0);
     k_extract_heads<<<nHShd, THREADS>>>(kh, qkv, S, H, hd, 3 * dim, dim);
     k_extract_heads<<<nHShd, THREADS>>>(vh, qkv, S, H, hd, 3 * dim, 2 * dim);
@@ -469,7 +494,7 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     k_rope<<<nblocks((size_t)H * S), THREADS>>>(kh, h->rope_cos, h->rope_sin, H, S, hd, rot);
     attn_dev(ao, qh, kh, vh, H, S, S, hd, scores);
     k_merge_heads<<<nHShd, THREADS>>>(merged, ao, S, H, hd);
-    gemm_f16w(o, merged, w->sa_to_out, NULL, S, dim, dim);
+    gemm_f16w(h, o, merged, w->sa_to_out, NULL, S, dim, dim);
     k_gate<<<nSd, THREADS>>>(o, gate_self, S, dim);
     k_add<<<nSd, THREADS>>>(seq, residual, o, (size_t)S * dim);
 
@@ -477,12 +502,12 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     cudaMemcpy(residual, seq, (size_t)S * dim * sizeof(float), cudaMemcpyDeviceToDevice);
     k_rmsnorm<<<nblocks(S), THREADS>>>(hh, seq, w->cross_norm, S, dim, 1e-5f, 0);
     float *q = da_alloc(ar, (size_t)S * dim);
-    gemm_f16w(q, hh, w->ca_to_q, NULL, S, dim, dim);
+    gemm_f16w(h, q, hh, w->ca_to_q, NULL, S, dim, dim);
     k_extract_heads<<<nHShd, THREADS>>>(qh, q, S, H, hd, dim, 0);
     k_rmsnorm<<<nblocks((size_t)H * S), THREADS>>>(qh, qh, w->ca_q_norm, H * S, hd, 1e-6f, 0);
     attn_dev(ao, qh, h->cross_k[blk], h->cross_v[blk], H, S, Sc, hd, scores);
     k_merge_heads<<<nHShd, THREADS>>>(merged, ao, S, H, hd);
-    gemm_f16w(o, merged, w->ca_to_out, NULL, S, dim, dim);
+    gemm_f16w(h, o, merged, w->ca_to_out, NULL, S, dim, dim);
     k_add<<<nSd, THREADS>>>(seq, residual, o, (size_t)S * dim);
 
     /* feed-forward (GLU) */
@@ -490,9 +515,9 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     k_rmsnorm<<<nblocks(S), THREADS>>>(hh, seq, w->ff_norm, S, dim, 1e-5f, 0);
     k_adaln<<<nSd, THREADS>>>(hh, scale_ff, shift_ff, S, dim);
     float *proj = da_alloc(ar, (size_t)S * 2 * inner), *gated = da_alloc(ar, (size_t)S * inner);
-    gemm_f16w(proj, hh, w->ff_in_w, w->ff_in_b, S, dim, 2 * inner);
+    gemm_f16w(h, proj, hh, w->ff_in_w, w->ff_in_b, S, dim, 2 * inner);
     k_ff_silugate<<<nblocks((size_t)S * inner), THREADS>>>(gated, proj, S, inner);
-    gemm_f16w(o, gated, w->ff_out_w, w->ff_out_b, S, inner, dim);
+    gemm_f16w(h, o, gated, w->ff_out_w, w->ff_out_b, S, inner, dim);
     k_gate<<<nSd, THREADS>>>(o, gate_ff, S, dim);
     k_add<<<nSd, THREADS>>>(seq, residual, o, (size_t)S * dim);
 
@@ -511,6 +536,7 @@ extern "C" aria_cuda_dit *aria_cuda_dit_create(const aria_sa3_dit_view *v) {
     aria_cuda_dit *h = (aria_cuda_dit *)calloc(1, sizeof(aria_cuda_dit));
     h->depth = v->depth; h->ed = ed; h->H = v->num_heads; h->hd = v->head_dim;
     h->inner = inner; h->io_ch = v->io_ch; h->n_mem = v->n_mem; h->rot = v->rot_dim;
+    if (cublasCreate(&h->cublas) != CUBLAS_STATUS_SUCCESS) { free(h); return NULL; }
     int C = v->io_ch;
     h->preprocess  = upload_f16(v->preprocess,  (size_t)C * C);
     h->postprocess = upload_f16(v->postprocess, (size_t)C * C);
@@ -588,19 +614,19 @@ extern "C" void aria_cuda_dit_step(aria_cuda_dit *h, float *v_CT, const float *x
     float *xtc = da_alloc(ar, (size_t)T * C);
     k_transpose<<<nblocks((size_t)C * T), THREADS>>>(xtc, h->dx, C, T);   /* [C,T]->[T,C] */
     float *pre = da_alloc(ar, (size_t)T * C);
-    gemm_f16w(pre, xtc, h->preprocess, NULL, T, C, C);
+    gemm_f16w(h, pre, xtc, h->preprocess, NULL, T, C, C);
     k_add<<<nblocks((size_t)T * C), THREADS>>>(xtc, xtc, pre, (size_t)T * C);
 
     float *seq = da_alloc(ar, (size_t)S * ed);
     cudaMemcpy(seq, h->memory_tokens, (size_t)Mt * ed * sizeof(float), cudaMemcpyDeviceToDevice);
-    gemm_f16w(seq + (size_t)Mt * ed, xtc, h->project_in, NULL, T, C, ed);
+    gemm_f16w(h, seq + (size_t)Mt * ed, xtc, h->project_in, NULL, T, C, ed);
 
     for (int b = 0; b < h->depth; b++) dit_block_dev(h, seq, b);
 
     float *outtc = da_alloc(ar, (size_t)T * C);
-    gemm_f16w(outtc, seq + (size_t)Mt * ed, h->project_out, NULL, T, ed, C);
+    gemm_f16w(h, outtc, seq + (size_t)Mt * ed, h->project_out, NULL, T, ed, C);
     float *postc = da_alloc(ar, (size_t)T * C);
-    gemm_f16w(postc, outtc, h->postprocess, NULL, T, C, C);
+    gemm_f16w(h, postc, outtc, h->postprocess, NULL, T, C, C);
     k_add<<<nblocks((size_t)T * C), THREADS>>>(outtc, outtc, postc, (size_t)T * C);
     k_transpose<<<nblocks((size_t)T * C), THREADS>>>(h->dv, outtc, T, C);  /* [T,C]->[C,T] */
 
@@ -610,6 +636,7 @@ extern "C" void aria_cuda_dit_step(aria_cuda_dit *h, float *v_CT, const float *x
 
 extern "C" void aria_cuda_dit_free(aria_cuda_dit *h) {
     if (!h) return;
+    if (h->cublas) cublasDestroy(h->cublas);
     cudaFree(h->preprocess); cudaFree(h->postprocess); cudaFree(h->project_in); cudaFree(h->project_out);
     cudaFree(h->memory_tokens);
     if (h->blocks) for (int b = 0; b < h->depth; b++) {

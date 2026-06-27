@@ -107,7 +107,7 @@ CUDA_HOME  ?= /usr/lib/cuda
 CUDA_CCBIN ?= gcc-9
 CUDA_ARCH  ?= sm_61
 CUDA_CFLAGS  := $(CSTD) $(DEFS) $(WARN) -O3 -march=native -mavx2 -mfma -fopenmp -DARIA_CUDA
-CUDA_LDFLAGS := -fopenmp -lm -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
+CUDA_LDFLAGS := -fopenmp -lm -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lcublas -lstdc++
 
 # build the lib (+ aria_cuda.o) and CLI with the CUDA backend linked in
 cuda:
