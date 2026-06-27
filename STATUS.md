@@ -38,9 +38,9 @@ A from-scratch, dependency-free **C runtime for Stable Audio 3 (small-music)**: 
 |---|---|---|
 | CPU 8-core (dev box) | ~9 s | AVX2 microkernel + arena |
 | CPU 20-core (RTX box) | 9.4 s | |
-| **RTX 3070 warm** | **0.61 s** | dit 0.42 + decode 0.02 (GPU) + setup 0.16 — full pipeline device-resident |
+| **RTX 3070 warm** | **0.29 s** | dit 0.16 + decode 0.03 (GPU) + setup 0.10 — full pipeline device-resident |
 | GT 1030 (2 GB) | slower than CPU | correctness-only (fits via fp16; weak Pascal) |
-| _ref: stable-audio-tools (3070, warm)_ | _0.36 s_ | gap **~1.7×** (was 13× originally) |
+| _ref: stable-audio-tools (3070, warm)_ | _0.36 s_ | **aria is on par / ahead** (was 13× slower originally) |
 
 PyTorch CPU reference is ~5.6 s warm; aria CPU is competitive once one-time weight fault-in is
 excluded.
@@ -87,7 +87,7 @@ precision + Q8/Q4 are **E9** (E9.0 = the `--precision` interface for fp variants
 | **E5** taae_v2 decoder | ✅ | softnorm + chunked resampling + unpatch, full latent→audio parity |
 | **E6** Sampler + end-to-end | ✅ (E6.5 ⬜) | LogSNR + xoshiro + pingpong + e2e WAV; CFG/`--cfg` flag ⬜ (base-checkpoint only) |
 | **E7** continue / inpaint | ⬜ | taae **encoder**, inpaint mask, local-add cond, `--continue`/`--inpaint` |
-| **E8** CUDA backend | ✅ E8.1–E8.5c · ⬜ E8.5d/E8.6 | scaffold, all op kernels, device-resident **DiT + decoder**, perf pass (4.73→**0.61 s** warm, ~1.7× of PyTorch); further micro-opt (E8.5d) + SSD streaming ⬜ |
+| **E8** CUDA backend | ✅ E8.1–E8.5d · ⬜ E8.5e/E8.6 | scaffold, all op kernels, device-resident **DiT + decoder**, profile-guided kernels (4.73→**0.29 s** warm — **on par with / ahead of PyTorch**); last micro-opts (E8.5e) + SSD streaming ⬜ |
 | **E9** Precision & Quantization | ⬜ | E9.0 `--precision` (fp32/fp16/bf16), E9.1–E9.4 Q8/Q4 + `aria-quantize` |
 | **E10** medium model | ⬜ | embed 1536 / depth 24 / differential DiT attn |
 | **E11** Release polish (v1.0.0) | ⬜ | API/install finalize, CLI UX, Philox RNG, docs, CI |
