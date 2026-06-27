@@ -62,14 +62,15 @@ parity-checked against the `stable-audio-tools` PyTorch reference. Milestones
   stay packed in VRAM (dequant-on-use). q4 = asymmetric int4 + Q8 attention
   (~9 % DiT velocity error, near q8) — small-music DiT 1.6 GB → ~0.3 GB.
 - **medium model** — differential DiT attention + a sliding-window/sinusoidal
-  taae decoder; runs end-to-end (DiT on GPU, ~0.35 s; e2e audio parity 1.7e-2).
+  taae decoder, **both device-resident on CUDA**; RTX 3070 runs medium fully on the
+  GPU in **2.2 s** (CPU 11.4 s), e2e audio parity 1.7e-2.
 - **offline quantizer** — `aria-quantize` packs a model to a `.aria` overlay that
   `--load-quant` loads (bit-identical to on-the-fly).
 
 The CPU path (AVX2/FMA + OpenMP, zero-copy mmap weights) is always built and is the
 reference; CUDA is an optional accelerator. See [STATUS.md](STATUS.md) for the full
-snapshot and [ROADMAP.md](ROADMAP.md) for the task list. Remaining: a GPU medium
-decoder, fp16/bf16 CPU storage, steering (E12), release polish (E11).
+snapshot and [ROADMAP.md](ROADMAP.md) for the task list. Remaining: fp16/bf16 CPU
+storage, steering (E12), release polish (E11).
 
 This software is developed with **strong assistance from large language models**,
 with a human leading the ideas, testing, and debugging. We say so openly because it
@@ -142,7 +143,7 @@ python scripts/export_tokenizer.py models/small-music
 ./aria -m models/small-music -p "..." -d 30 --continue in.wav -o out.wav
 ./aria -m models/small-music -p "..." --inpaint in.wav --from 5 --to 10 -o out.wav
 
-# medium model (differential DiT; DiT on GPU, decoder on CPU)
+# medium model (differential DiT + sliding-window decoder; full GPU on CUDA)
 ./aria -m models/medium -p "..." -d 10 -s 8 -o out.wav
 
 # offline-quantize the DiT to a packed .aria, then load it

@@ -11,8 +11,9 @@ A from-scratch, dependency-free **C runtime for Stable Audio 3 (small-music)**: 
 on **CPU** (AVX2/FMA + OpenMP) and **CUDA** (device-resident DiT, cuBLAS tensor-core GEMMs).
 Milestones **M1 (end-to-end), M2 (self-contained text), M3 (continue/inpaint), M4 (CUDA
 generation), M5 (Q4 quantization — medium fits low VRAM), M6 (medium model end-to-end)** reached.
-Both **small-music and medium** generate end-to-end (medium on CPU: differential DiT + a
-sliding-window/sinusoidal taae decoder).
+Both **small-music and medium** generate end-to-end on **CPU and GPU** — medium adds a
+differential DiT + a sliding-window/sinusoidal taae decoder, both device-resident on CUDA
+(RTX 3070: 11.4 s → 2.2 s).
 
 ## What works (verified end-to-end)
 
@@ -51,7 +52,7 @@ sliding-window/sinusoidal taae decoder).
 | **RTX 3070 warm fp16** | **0.29 s** | dit 0.16 + decode 0.03 (GPU) + setup 0.10 — full pipeline device-resident · **1464 MB VRAM** |
 | RTX 3070 warm **q8** | 0.36 s | dit 0.27 · **1142 MB VRAM (−22 %)** · 2.45 % velocity — weights packed in VRAM, dequant-on-use |
 | RTX 3070 warm **q4** | 0.35 s | dit 0.22 · **1080 MB VRAM (−26 %)** · 9.3 % velocity (asym + Q8 attention) |
-| **medium** RTX 3070 (GPU DiT) | 3.8 s | differential DiT on GPU 0.35 s (CPU 9.1 s, 26×) + CPU decode 2.0 s; fp16 3.08 GB → q8 2.01 → **q4 1.96 GB** |
+| **medium** RTX 3070 (full GPU) | **2.2 s** | DiT 0.36 s (CPU 9.1 s, 26×) + **GPU decode 0.05 s** (CPU 2.0 s, 40×); CPU total 11.4 s → 2.2 s (5.2×); fp16 3.95 GB → **q4 2.84 GB**; GPU-vs-CPU audio 0.76 % |
 | GT 1030 (2 GB) | slower than CPU | correctness-only (fits via fp16; weak Pascal) |
 
 _GPU quant (q8/q4) costs ~20 % time for a 22–26 % VRAM cut — tensor cores keep the GEMM fast; the
