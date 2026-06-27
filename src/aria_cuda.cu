@@ -395,20 +395,21 @@ __global__ void k_ff_silugate(float *out, const float *proj, int S, int inner) {
     out[idx] = (g / (1.0f + expf(-g))) * pr[i];
 }
 
-/* multi-head SDPA on device-resident fp32 activations (scale 1/sqrt(D)). */
-static void attn_dev(float *out, const float *q, const float *k, const float *v,
+/* multi-head SDPA, all heads batched through cuBLAS (scale 1/sqrt(D)).
+ * scores must hold [H, Nq, Nk]. q/k/v/out/scores are fp32 (attention stays fp32). */
+static void attn_dev(cublasHandle_t cb, float *out, const float *q, const float *k, const float *v,
                      int H, int Nq, int Nk, int D, float *scores) {
-    float scale = 1.0f / sqrtf((float)D);
-    dim3 sblk(TILE, TILE), sgrid((Nk + TILE - 1) / TILE, (Nq + TILE - 1) / TILE);
-    dim3 oblk(TILE, TILE), ogrid((D + TILE - 1) / TILE, (Nq + TILE - 1) / TILE);
-    for (int h = 0; h < H; h++) {
-        const float *qh = q + (size_t)h * Nq * D, *kh = k + (size_t)h * Nk * D, *vh = v + (size_t)h * Nk * D;
-        float *oh = out + (size_t)h * Nq * D;
-        aria_gemm_nt<<<sgrid, sblk>>>(scores, qh, kh, NULL, Nq, D, Nk);
-        k_scale<<<nblocks((size_t)Nq * Nk), THREADS>>>(scores, scores, scale, Nq * Nk);
-        k_softmax<<<nblocks(Nq), THREADS>>>(scores, Nq, Nk, NULL);
-        k_matmul<<<ogrid, oblk>>>(oh, scores, vh, Nq, Nk, D);
-    }
+    const float scale = 1.0f / sqrtf((float)D), one = 1.0f, zero = 0.0f;
+    /* scores[h] = q[h] @ k[h]^T  -> per head [Nq,Nk] */
+    cublasSgemmStridedBatched(cb, CUBLAS_OP_T, CUBLAS_OP_N, Nk, Nq, D,
+        &one, k, D, (long long)Nk * D, q, D, (long long)Nq * D,
+        &zero, scores, Nk, (long long)Nq * Nk, H);
+    k_scale<<<nblocks((size_t)H * Nq * Nk), THREADS>>>(scores, scores, scale, H * Nq * Nk);
+    k_softmax<<<nblocks((size_t)H * Nq), THREADS>>>(scores, H * Nq, Nk, NULL);
+    /* out[h] = scores[h] @ v[h]  -> per head [Nq,D] */
+    cublasSgemmStridedBatched(cb, CUBLAS_OP_N, CUBLAS_OP_N, D, Nq, Nk,
+        &one, v, D, (long long)Nk * D, scores, Nk, (long long)Nq * Nk,
+        &zero, out, D, (long long)Nq * D, H);
 }
 
 /* ---- device bump arena (pointer arithmetic only) ---- */
@@ -476,7 +477,7 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     float *o = da_alloc(ar, (size_t)S * dim), *merged = da_alloc(ar, (size_t)S * dim);
     float *qh = da_alloc(ar, (size_t)H * S * hd), *kh = da_alloc(ar, (size_t)H * S * hd);
     float *vh = da_alloc(ar, (size_t)H * S * hd), *ao = da_alloc(ar, (size_t)H * S * hd);
-    float *scores = da_alloc(ar, (size_t)S * (S > Sc ? S : Sc));
+    float *scores = da_alloc(ar, (size_t)H * S * (S > Sc ? S : Sc));   /* all heads (batched attn) */
     int nHShd = (int)nblocks((size_t)H * S * hd);
 
     /* self-attention */
@@ -492,7 +493,7 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     k_rmsnorm<<<nblocks((size_t)H * S), THREADS>>>(kh, kh, w->sa_k_norm, H * S, hd, 1e-6f, 0);
     k_rope<<<nblocks((size_t)H * S), THREADS>>>(qh, h->rope_cos, h->rope_sin, H, S, hd, rot);
     k_rope<<<nblocks((size_t)H * S), THREADS>>>(kh, h->rope_cos, h->rope_sin, H, S, hd, rot);
-    attn_dev(ao, qh, kh, vh, H, S, S, hd, scores);
+    attn_dev(h->cublas, ao, qh, kh, vh, H, S, S, hd, scores);
     k_merge_heads<<<nHShd, THREADS>>>(merged, ao, S, H, hd);
     gemm_f16w(h, o, merged, w->sa_to_out, NULL, S, dim, dim);
     k_gate<<<nSd, THREADS>>>(o, gate_self, S, dim);
@@ -505,7 +506,7 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     gemm_f16w(h, q, hh, w->ca_to_q, NULL, S, dim, dim);
     k_extract_heads<<<nHShd, THREADS>>>(qh, q, S, H, hd, dim, 0);
     k_rmsnorm<<<nblocks((size_t)H * S), THREADS>>>(qh, qh, w->ca_q_norm, H * S, hd, 1e-6f, 0);
-    attn_dev(ao, qh, h->cross_k[blk], h->cross_v[blk], H, S, Sc, hd, scores);
+    attn_dev(h->cublas, ao, qh, h->cross_k[blk], h->cross_v[blk], H, S, Sc, hd, scores);
     k_merge_heads<<<nHShd, THREADS>>>(merged, ao, S, H, hd);
     gemm_f16w(h, o, merged, w->ca_to_out, NULL, S, dim, dim);
     k_add<<<nSd, THREADS>>>(seq, residual, o, (size_t)S * dim);
@@ -597,7 +598,7 @@ extern "C" void aria_cuda_dit_set_request(aria_cuda_dit *h, const aria_sa3_dit_r
         h->cross_v[b] = upload_f32(rv->cross_v[b], (size_t)H * n_cond * hd);
     }
     /* device arena: one block's peak + step buffers (mirrors the CPU sizing) */
-    size_t block_floats = (size_t)6 * ed + 24 * (size_t)S * ed + (size_t)S * (S > n_cond ? S : n_cond);
+    size_t block_floats = (size_t)6 * ed + 24 * (size_t)S * ed + (size_t)H * S * (S > n_cond ? S : n_cond);
     size_t step_floats = (size_t)S * ed + 8 * (size_t)T * C + 8 * (size_t)ed;
     h->arena.cap = (block_floats + step_floats + (1u << 20)) * sizeof(float);
     h->arena.used = 0;
