@@ -5,6 +5,7 @@
 #include "aria_sa3_dec.h"
 #include "aria_ops.h"
 #include "aria_arena.h"
+#include "aria_taae.h"
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -13,25 +14,10 @@
 #include <string.h>
 #include <math.h>
 
-#define DEC_D   768   /* model dim */
-#define DEC_H   12    /* heads */
-#define DEC_HD  64    /* head dim */
-#define DEC_ROT 32    /* rotated dims */
-#define DEC_INNER 2304
-#define DEC_QKV 3840  /* 5 * 768 */
-#define DEC_S   34    /* effective chunk = 2 * 17 */
-#define DEC_OUT 512   /* decoder out channels */
-
-typedef struct {
-    float pre_alpha;  const float *pre_gamma, *pre_beta;
-    const float *to_qkv;                 /* [3840,768] */
-    float qn_alpha;   const float *qn_gamma, *qn_beta;
-    float kn_alpha;   const float *kn_gamma, *kn_beta;
-    const float *to_out;                 /* [768,768] */
-    float ff_alpha;   const float *ff_gamma, *ff_beta;
-    const float *ff_in_w, *ff_in_b;      /* [4608,768],[4608] */
-    const float *ff_out_w, *ff_out_b;    /* [768,2304],[768] */
-} taae_block_w;
+#define DEC_D   TAAE_D    /* transformer model dim (768) */
+#define DEC_ROT TAAE_ROT  /* rotated dims (32) */
+#define DEC_S   TAAE_S    /* effective chunk = 2 * 17 (34) */
+#define DEC_OUT 512        /* decoder out channels */
 
 struct aria_sa3_dec {
     float running_std;
@@ -43,120 +29,9 @@ struct aria_sa3_dec {
     int failed;
 };
 
-/* ---- head transpose helpers (chunk-local) ---- */
-static void extract_heads(float *dst, const float *src, int N, int H, int hd, int stride, int off) {
-    for (int h = 0; h < H; h++)
-        for (int s = 0; s < N; s++)
-            memcpy(dst + ((size_t)h * N + s) * hd, src + (size_t)s * stride + off + (size_t)h * hd,
-                   (size_t)hd * sizeof(float));
-}
-static void merge_heads(float *dst, const float *src, int N, int H, int hd) {
-    for (int h = 0; h < H; h++)
-        for (int s = 0; s < N; s++)
-            memcpy(dst + (size_t)s * (H * hd) + (size_t)h * hd, src + ((size_t)h * N + s) * hd,
-                   (size_t)hd * sizeof(float));
-}
+/* ---- channel<->token transpose (decoder-local) ---- */
 static void transpose_ct_tc(float *dst, const float *src, int C, int T) {
     for (int c = 0; c < C; c++) for (int t = 0; t < T; t++) dst[(size_t)t * C + c] = src[(size_t)c * T + t];
-}
-
-/* one taae transformer block in place on xc[N,768], rope tables rcos/rsin[N,16].
- * All temporaries are drawn from `ar` (save/restore-scoped): this block is the
- * decoder hot path (~650 calls/generation), so it never malloc/frees. */
-static void taae_block_forward(float *xc, int N, const taae_block_w *w,
-                               const float *rcos, const float *rsin, aria_arena *ar) {
-    const int D = DEC_D, H = DEC_H, hd = DEC_HD;
-    size_t mark = aria_arena_save(ar);
-    float *h = aria_arena_floats(ar, (size_t)N * D);
-    float *res = aria_arena_floats(ar, (size_t)N * D);
-    float *qkv = aria_arena_floats(ar, (size_t)N * DEC_QKV);
-    float *q = aria_arena_floats(ar, (size_t)H * N * hd);
-    float *k = aria_arena_floats(ar, (size_t)H * N * hd);
-    float *v = aria_arena_floats(ar, (size_t)H * N * hd);
-    float *qd = aria_arena_floats(ar, (size_t)H * N * hd);
-    float *kd = aria_arena_floats(ar, (size_t)H * N * hd);
-    float *ob = aria_arena_floats(ar, (size_t)H * N * hd);
-    float *od = aria_arena_floats(ar, (size_t)H * N * hd);
-    float *merged = aria_arena_floats(ar, (size_t)N * D);
-    float *o = aria_arena_floats(ar, (size_t)N * D);
-    float *scores = aria_arena_floats(ar, (size_t)N * N);
-    float *ffs = aria_arena_floats(ar, (size_t)N * 3 * DEC_INNER);
-
-    /* self-attention (differential) */
-    memcpy(res, xc, (size_t)N * D * sizeof(float));
-    aria_dynamic_tanh(h, xc, w->pre_alpha, w->pre_gamma, w->pre_beta, N, D);
-    aria_linear(qkv, h, w->to_qkv, NULL, N, D, DEC_QKV);
-    extract_heads(q,  qkv, N, H, hd, DEC_QKV, 0);
-    extract_heads(k,  qkv, N, H, hd, DEC_QKV, 768);
-    extract_heads(v,  qkv, N, H, hd, DEC_QKV, 1536);
-    extract_heads(qd, qkv, N, H, hd, DEC_QKV, 2304);
-    extract_heads(kd, qkv, N, H, hd, DEC_QKV, 3072);
-    aria_dynamic_tanh(q,  q,  w->qn_alpha, w->qn_gamma, w->qn_beta, H * N, hd);
-    aria_dynamic_tanh(qd, qd, w->qn_alpha, w->qn_gamma, w->qn_beta, H * N, hd);
-    aria_dynamic_tanh(k,  k,  w->kn_alpha, w->kn_gamma, w->kn_beta, H * N, hd);
-    aria_dynamic_tanh(kd, kd, w->kn_alpha, w->kn_gamma, w->kn_beta, H * N, hd);
-    aria_rope_apply(q,  rcos, rsin, H, N, hd, DEC_ROT);
-    aria_rope_apply(qd, rcos, rsin, H, N, hd, DEC_ROT);
-    aria_rope_apply(k,  rcos, rsin, H, N, hd, DEC_ROT);
-    aria_rope_apply(kd, rcos, rsin, H, N, hd, DEC_ROT);
-    aria_attention(ob, q,  k,  v, H, N, N, hd, NULL, scores);
-    aria_attention(od, qd, kd, v, H, N, N, hd, NULL, scores);
-    for (size_t i = 0; i < (size_t)H * N * hd; i++) ob[i] -= od[i];
-    merge_heads(merged, ob, N, H, hd);
-    aria_linear(o, merged, w->to_out, NULL, N, D, D);
-    for (size_t i = 0; i < (size_t)N * D; i++) xc[i] = res[i] + o[i];
-
-    /* feed-forward (SwiGLU) */
-    memcpy(res, xc, (size_t)N * D * sizeof(float));
-    aria_dynamic_tanh(h, xc, w->ff_alpha, w->ff_gamma, w->ff_beta, N, D);
-    aria_ff_glu(o, h, N, D, DEC_INNER, D, w->ff_in_w, w->ff_in_b, w->ff_out_w, w->ff_out_b, ffs);
-    for (size_t i = 0; i < (size_t)N * D; i++) xc[i] = res[i] + o[i];
-
-    aria_arena_restore(ar, mark);
-}
-
-/* run 3 blocks over the sequence in S-chunks; shift=1 adds a midpoint-shift halo.
- * Chunks are independent, so they run in parallel -- one arena per worker thread
- * (the inner ops' OpenMP regions nest serially, so there is no oversubscription). */
-static void chunk_pass(float *x, int L, const taae_block_w *blocks,
-                       const float *rcos, const float *rsin, int shift, aria_arena *arenas) {
-    const int S = DEC_S, half = S / 2;  /* 17 */
-    float *base = x, *pad = NULL;
-    int n;
-    if (!shift) {
-        n = L / S;
-    } else {
-        int Lp = L + S;  /* [x[:17], x, x[-17:]] */
-        pad = malloc((size_t)Lp * DEC_D * sizeof(float));
-        memcpy(pad, x, (size_t)half * DEC_D * sizeof(float));
-        memcpy(pad + (size_t)half * DEC_D, x, (size_t)L * DEC_D * sizeof(float));
-        memcpy(pad + (size_t)(half + L) * DEC_D, x + (size_t)(L - half) * DEC_D,
-               (size_t)half * DEC_D * sizeof(float));
-        base = pad; n = Lp / S;
-    }
-    #ifdef _OPENMP
-    #pragma omp parallel for schedule(dynamic)
-    #endif
-    for (int c = 0; c < n; c++) {
-        #ifdef _OPENMP
-        aria_arena *ar = &arenas[omp_get_thread_num()];
-        #else
-        aria_arena *ar = &arenas[0];
-        #endif
-        float *chunk = base + (size_t)c * S * DEC_D;
-        for (int b = 0; b < 3; b++) taae_block_forward(chunk, S, &blocks[b], rcos, rsin, ar);
-    }
-    if (shift) {
-        memcpy(x, pad + (size_t)half * DEC_D, (size_t)L * DEC_D * sizeof(float));
-        free(pad);
-    }
-}
-
-/* scratch arena big enough for one taae block at chunk size DEC_S */
-static size_t taae_block_arena_bytes(void) {
-    size_t N = DEC_S;
-    size_t fl = 12 * N * DEC_D + N * DEC_QKV + N * N + 3 * N * DEC_INNER + 4096;
-    return fl * sizeof(float);
 }
 
 void aria_sa3_softnorm_decode(const aria_sa3_dec *m, float *z, const float *latent, int T) {
@@ -202,8 +77,8 @@ void aria_sa3_same_decode(const aria_sa3_dec *m, float *dec, const float *z, int
     #endif
     aria_arena *arenas = malloc((size_t)nth * sizeof(aria_arena));
     for (int i = 0; i < nth; i++) aria_arena_init(&arenas[i], taae_block_arena_bytes());
-    chunk_pass(seq, L, &m->blocks[0], rcos, rsin, 0, arenas);  /* blocks 0,1,2 */
-    chunk_pass(seq, L, &m->blocks[3], rcos, rsin, 1, arenas);  /* blocks 3,4,5 midpoint-shift */
+    taae_chunk_pass(seq, L, &m->blocks[0], rcos, rsin, 0, arenas);  /* blocks 0,1,2 */
+    taae_chunk_pass(seq, L, &m->blocks[3], rcos, rsin, 1, arenas);  /* blocks 3,4,5 midpoint-shift */
     for (int i = 0; i < nth; i++) aria_arena_free(&arenas[i]);
     free(arenas);
 
@@ -244,7 +119,7 @@ void aria_sa3_dec_block_test(const aria_sa3_dec *m, int idx, float *xc, int N) {
     float *rsin = malloc((size_t)N * (DEC_ROT / 2) * sizeof(float));
     aria_rope_freqs(rcos, rsin, N, DEC_ROT, 10000.0f);
     aria_arena ar;
-    size_t fl = 12 * (size_t)N * DEC_D + (size_t)N * DEC_QKV + (size_t)N * N + 3 * (size_t)N * DEC_INNER + 4096;
+    size_t fl = 12 * (size_t)N * DEC_D + (size_t)N * TAAE_QKV + (size_t)N * N + 3 * (size_t)N * TAAE_INNER + 4096;
     aria_arena_init(&ar, fl * sizeof(float));
     taae_block_forward(xc, N, &m->blocks[idx], rcos, rsin, &ar);
     aria_arena_free(&ar);
