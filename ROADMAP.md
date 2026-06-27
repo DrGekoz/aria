@@ -133,9 +133,10 @@ M2.
 - ⬜ **E8.5c** **P2** Close the rest: device-resident GPU decoder (the 0.76 s CPU taae decode is now the top cost; batch the S=34 chunks), DiT glue-kernel fusion + fewer fp16 conversions. deps: E8.5b · Verify: warm generation approaches PyTorch; parity unchanged.
 - ⬜ **E8.6** **P2** SSD weight streaming for VRAM-exceeding components (GT 1030). deps: E8.5 · Verify: medium runs on 2 GB.
 
-## E9 — Quantization
+## E9 — Precision & Quantization
 
-- ⬜ **E9.1** `∥` **P1** Q8 (int8 per-row) pack/unpack + CPU dequant-on-use gemm. deps: E2.9 · Verify: quantized linear parity (looser tol); size halved.
+- ⬜ **E9.0** **P1** Unified precision/dtype selection. An `aria_dtype {fp32, fp16, bf16, q8, q4}` threaded through weight-load + GEMM dispatch on **both** backends, surfaced as `--precision` (CLI) / a gen-param, so any (precision × device) is one flag — making speed/quality comparisons trivial (pairs with `--bench`/`ARIA_PROFILE`). **This task lands the fp variants** (CPU: convert-on-load + F16C/bf16 GEMM; GPU: `cublasSgemm` fp32 / GemmEx fp16+bf16) and defines the dispatch seam that E9.1–E9.4 extend with q8/q4. Per-card support matrix with graceful fallback (e.g. fp32 weights don't fit the GT 1030's 2 GB; auto-pick or clear error). deps: E2.9, E8.5 · Verify: every supported (precision×device) generates; audio diff vs fp32 within the dtype's expected tolerance; `--bench` reports each variant's speed. **Currently hardcoded: CPU=fp32, CUDA=fp16.**
+- ⬜ **E9.1** `∥` **P1** Q8 (int8 per-row) pack/unpack + CPU dequant-on-use gemm. deps: E9.0 · Verify: quantized linear parity (looser tol); size halved.
 - ⬜ **E9.2** **P1** `aria-quantize` offline tool (safetensors → packed `.aria`: fp16/Q8/Q4). deps: E9.1 · Verify: round-trip; aria loads packed model + generates.
 - ⬜ **E9.3** **P1** Q4 (block) pack + dequant-on-use. deps: E9.1 · Verify: parity (tol); medium fits low VRAM.
 - ⬜ **E9.4** **P1** CUDA dequant-on-use kernels (Q8/Q4). deps: E8.2, E9.3 · Verify: cuda quant parity. **← M5**
