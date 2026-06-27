@@ -23,13 +23,14 @@ int8/q4 quantization, as a library + CLI — all parity-gated.
 | **M3** ✅ | continue / inpaint working | E7.4 |
 | **M4** ✅ | CUDA end-to-end generation | E8.5 |
 | **M5** ✅ | Quantized (Q4) — medium fits low VRAM | E9.4 |  ← Q4 mechanism (CPU+GPU), fidelity-tuned (9.3%), offline `aria-quantize`; medium loads/runs/**fits** on the 3070 at q4 (1.91 GB). A *correct* medium run needs differential DiT attn (E4.5 → M6). |
-| **M6** | medium model end-to-end | E10.2 |
+| **M6** ✅ | medium model end-to-end | E10.2 |  ← differential DiT + medium decoder (sliding-window/sinusoidal); e2e parity latent 7.3e-3 / audio 1.7e-2 (CPU) |
 | **M7** | Steering (TasteSteer): latent + DiT-residual + cond-space injection, training-free | E12.7 |
 | **v1.0.0** | Release checklist green | E11.7 |
 
 ## Status snapshot
 
-Milestones **M1, M2, M3, M4, M5** reached. Done: **E0–E7** (full `text→audio` **+
+Milestones **M1–M6** reached (**M6: medium model end-to-end** — differential DiT +
+medium decoder, CPU, e2e parity audio 1.7e-2). Done: **E0–E7** (full `text→audio` **+
 continue/inpaint** pipeline — all parity-verified), **E2.9/E2.9b** (CPU AVX2 GEMM +
 arena/KV-cache), **E8.1–E8.5d** (CUDA backend + device-resident DiT/decoder +
 profile-guided kernels: 3070 warm 0.29 s), **E9.0–E9.4** (precision/quant: `--precision`
@@ -144,8 +145,8 @@ quant), **E8.5c** (GPU decoder), **E10** (medium), **E12** (steering).
 
 ## E10 — medium model
 
-- 🟡 **E10.1** **P1** Load medium config/weights (embed 1536, depth 24, heads 24) + SAME-L decoder. deps: E4.4, E5.4 · Verify: tensors/shapes. **Partial:** aria already parses the medium config and loads/runs it end-to-end on the GPU (the loader is dim-driven; q8/q4 quantize + upload + decode all handle medium's scale — verified on the RTX 3070: fp16 2.84 GB → **q4 1.91 GB**, fits comfortably). The **medium DiT is now correct** (E4.5 differential attention + the `differential` bool-parse fix): full 24-block medium denoiser parity vs PyTorch **0.108** (threshold 0.23) — medium produces correct **latents**. **Remaining for medium audio:** the medium **decoder** differs substantially from small-music's — taae_v2 with transformer_dim **1536** (vs 768), depth **12** (vs 6), inner 4608, **`sinusoidal_blocks: 8`** (sinusoidal FF in the later blocks), and **`sliding_window: [1,1]`** with `chunk_size None` (a different chunk/attention path vs small-music's `chunk_size 32` midpoint-shift). Norm is still DyT (alpha/gamma/beta). `aria_taae`/`aria_sa3_dec` are hardcoded to the small-music decoder, so medium latent→audio (E10.2) is a **major rework** (≈ the original taae effort + sliding-window + sinusoidal FF).
-- ⬜ **E10.2** **P1** Medium end-to-end (differential DiT attn + larger decoder, quantized). deps: E10.1, E4.5, E9.3 · Verify: medium WAV parity. **← M6**
+- 🟡 **E10.1** **P1** Load medium config/weights (embed 1536, depth 24, heads 24) + SAME-L decoder. deps: E4.4, E5.4 · Verify: tensors/shapes. **Partial:** aria already parses the medium config and loads/runs it end-to-end on the GPU (the loader is dim-driven; q8/q4 quantize + upload + decode all handle medium's scale — verified on the RTX 3070: fp16 2.84 GB → **q4 1.91 GB**, fits comfortably). The **medium DiT is now correct** (E4.5 differential attention + the `differential` bool-parse fix): full 24-block medium denoiser parity vs PyTorch **0.108** (threshold 0.23) — medium produces correct **latents**. **Remaining for medium audio:** the medium **decoder** differs substantially from small-music's — taae_v2 with transformer_dim **1536** (vs 768), depth **12** (vs 6), inner 4608, **`sinusoidal_blocks: 8`** (sinusoidal FF in the later blocks), and **`sliding_window: [1,1]`** with `chunk_size None` (a different chunk/attention path vs small-music's `chunk_size 32` midpoint-shift). Norm is still DyT (alpha/gamma/beta). **Done** (E10.2): new `aria_sa3_dec_medium` + `taae_med_block_forward` (runtime dim, sliding-window band mask, SiLU/Sin GLU FF). Block parity 2.4e-7/5.4e-7, full decode 3.4e-6, e2e (DiT+sampler+decode) latent 7.3e-3 / audio 1.7e-2. The orchestrator detects medium (decoder.layers.1.weight `[1536,256]`) and runs it on the CPU.
+- ✅ **E10.2** **P1** Medium end-to-end (differential DiT attn + medium decoder). `aria -m <medium>` runs the full pipeline on the CPU: medium differential DiT → 8-step pingpong → medium taae_v2 decoder (sliding-window banded attention + sinusoidal FF) → stereo. Verify: `test_e2e_medium` (injected-noise, vs PyTorch) latent **7.3e-3** / audio **1.7e-2**; CLI uncond produces finite, in-range audio (CPU ~11.5 s / 3 s clip: DiT 9.1 s + decode 2.0 s). deps: E10.1, E4.5 · **← M6**. Remaining (perf, not correctness): GPU differential DiT + GPU medium decoder + medium-q4 (the CUDA paths are small-music-only).
 
 ## E11 — Release polish (v1.0.0)
 

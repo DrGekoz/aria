@@ -10,7 +10,9 @@ A from-scratch, dependency-free **C runtime for Stable Audio 3 (small-music)**: 
 **text → audio** inference **+ continue/inpaint**, parity-verified against PyTorch/`stable-audio-tools`,
 on **CPU** (AVX2/FMA + OpenMP) and **CUDA** (device-resident DiT, cuBLAS tensor-core GEMMs).
 Milestones **M1 (end-to-end), M2 (self-contained text), M3 (continue/inpaint), M4 (CUDA
-generation), M5 (Q4 quantization — medium fits low VRAM)** reached.
+generation), M5 (Q4 quantization — medium fits low VRAM), M6 (medium model end-to-end)** reached.
+Both **small-music and medium** generate end-to-end (medium on CPU: differential DiT + a
+sliding-window/sinusoidal taae decoder).
 
 ## What works (verified end-to-end)
 
@@ -102,7 +104,7 @@ cores (RTX 3070, sm_86 — bench there). fp16/bf16 fall back to fp32/fp16 for no
 | **M3** continue / inpaint | ✅ |
 | **M4** CUDA end-to-end generation | ✅ |
 | **M5** quantized (Q4) — medium fits low VRAM | ✅ |
-| M6 medium model | ⬜ |
+| **M6** medium model end-to-end | ✅ |
 | M7 steering (TasteSteer) | ⬜ |
 
 ## Epics — status
@@ -113,13 +115,13 @@ cores (RTX 3070, sm_86 — bench there). fp16/bf16 fall back to fp32/fp16 for no
 | **E1** Conditioning | ✅ | number/timestep/global-adaLN/cross-attn + **E1.6** local-add inpaint cond hook (now exercised with a real mask via **E7.3**) |
 | **E2** Core ops | ✅ + perf | rope/attn/qk-norm/cross/softcap/differential/conv1d/GLU; **E2.9/9b/9c ✅** (AVX2 GEMM tuned 3×3, arena/KV-cache), **E2.10 ✅** (`--device auto`); E2.9c-pack/E2.10-mps deferred |
 | **E3** T5Gemma encoder + tokenizer | ✅ | BPE tokenizer + 12-layer Gemma2 encoder + conditioner; `--prompt-embed` |
-| **E4** SA3 DiT forward | ✅ (E4.5 ⬜) | block-0 + full 20-block parity; differential-attn path for medium ⬜ |
+| **E4** SA3 DiT forward | ✅ | block-0 + full parity; **E4.5 ✅** differential attention (medium), synthetic 7.7e-7 |
 | **E5** taae_v2 decoder | ✅ | softnorm + chunked resampling + unpatch, full latent→audio parity |
 | **E6** Sampler + end-to-end | ✅ (E6.5 ⬜) | LogSNR + xoshiro + pingpong + e2e WAV; CFG/`--cfg` flag ⬜ (base-checkpoint only) |
 | **E7** continue / inpaint | ✅ | taae **encoder** (parity 9e-4), inpaint mask + local-add cond (exact), `--continue`/`--inpaint`, e2e parity (audio 2.4e-4); CPU DiT (GPU local-cond ⬜) |
 | **E8** CUDA backend | ✅ E8.1–E8.5d · ⬜ E8.5e/E8.6 | scaffold, all op kernels, device-resident **DiT + decoder**, profile-guided kernels (4.73→**0.29 s** warm — **on par with / ahead of PyTorch**); last micro-opts (E8.5e) + SSD streaming ⬜ |
 | **E9** Precision & Quantization | ✅ E9.1–E9.4 · 🟡 E9.0 | `aria_quant` (Q8/Q4 pack + dequant GEMM) + `--precision` seam on **CPU and GPU**; q8 2.45 %, **q4 fidelity-tuned to 9.3 %** (asym int4 + Q8 attention); GPU packs weights in VRAM (dequant-on-use); offline **`aria-quantize`** + `--load-quant`. **M5 reached** (medium fits the 3070 at q4). 🟡 E9.0 fp16/bf16 CPU storage still falls back to fp32 |
-| **E10** medium model | 🟡 E10.1 | medium loads/runs/**fits** on the 3070 at q4 (1.91 GB); correct run needs differential DiT attn (E4.5 → M6) |
+| **E10** medium model | ✅ E10.1/E10.2 (CPU) | **medium end-to-end on CPU** — differential DiT (E4.5) + medium decoder (`aria_sa3_dec_medium`: sliding-window + sinusoidal FF); e2e parity audio 1.7e-2. GPU/quant for medium = perf follow-up |
 | **E11** Release polish (v1.0.0) | ⬜ | API/install finalize, CLI UX, Philox RNG, docs, CI |
 | **E12** Steering (TasteSteer) | ⬜ | latent / DiT-residual / cond-space hooks + `--steer` |
 | **E13** Batch / server | ✅ E13.3 · ⬜ E13.1/2 | enc/dec arena done (concurrency-clean); request-parallel + batched-forward APIs ⬜ |
