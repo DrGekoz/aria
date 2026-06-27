@@ -194,12 +194,17 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     aria_sa3_dit_req *req = aria_sa3_dit_req_begin(st->dit, T, cross, n_cond, sec_emb);
     sa3_dctx dc = { st->dit, req, NULL, NULL, NULL };
 #ifdef ARIA_CUDA
-    if (p->device == ARIA_DEVICE_CUDA && aria_cuda_available()) {
+    /* auto: use the GPU only if it's worth it (sm_70+) and fits (create returns NULL
+     * on OOM -> CPU); cuda: force any device (still CPU-fallback on OOM); cpu: never. */
+    int want_gpu = (p->device == ARIA_DEVICE_CUDA && aria_cuda_available()) ||
+                   (p->device == ARIA_DEVICE_AUTO && aria_cuda_recommended());
+    if (want_gpu) {
         if (!st->cdit) {   /* upload weights once; reused across generations */
             aria_sa3_dit_view view; aria_sa3_dit_get_view(st->dit, &view);
             st->cdit = aria_cuda_dit_create(&view);
-            if (st->cdit) fprintf(stderr, "[aria] DiT: GPU device-resident (fp16 weights)\n");
-            else fprintf(stderr, "[aria] DiT: GPU unavailable/insufficient VRAM, using CPU\n");
+            const char *how = p->device == ARIA_DEVICE_AUTO ? "auto" : "forced";
+            if (st->cdit) fprintf(stderr, "[aria] DiT: GPU device-resident, fp16 (%s)\n", how);
+            else fprintf(stderr, "[aria] DiT: GPU insufficient VRAM, using CPU (%s)\n", how);
         }
         if (st->cdit) {
             aria_sa3_dit_req_view rv; aria_sa3_dit_req_get_view(req, &rv);

@@ -18,6 +18,10 @@ extern "C" {
 
 /* 1 if a usable CUDA device is present (0 in a CPU-only build). */
 int aria_cuda_available(void);
+/* 1 if the device is worth auto-selecting over the CPU (sm_70+ / tensor cores).
+ * Weaker cards (e.g. GT 1030, sm_61) are slower than the AVX2 CPU, so `--device
+ * auto` skips them; `--device cuda` still forces any available device. */
+int aria_cuda_recommended(void);
 /* short device description into buf (name, compute capability, VRAM). */
 void aria_cuda_device_info(char *buf, size_t buflen);
 

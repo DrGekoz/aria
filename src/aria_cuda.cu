@@ -27,6 +27,14 @@ extern "C" int aria_cuda_available(void) {
     return (e == cudaSuccess && n > 0) ? 1 : 0;
 }
 
+extern "C" int aria_cuda_recommended(void) {
+    int n = 0;
+    if (cudaGetDeviceCount(&n) != cudaSuccess || n < 1) return 0;
+    cudaDeviceProp p;
+    if (cudaGetDeviceProperties(&p, 0) != cudaSuccess) return 0;
+    return p.major >= 7 ? 1 : 0;   /* Volta+ (tensor cores) — faster than the AVX2 CPU */
+}
+
 extern "C" void aria_cuda_device_info(char *buf, size_t buflen) {
     cudaDeviceProp p;
     if (cudaGetDeviceProperties(&p, 0) != cudaSuccess) {

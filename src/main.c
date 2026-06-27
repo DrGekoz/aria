@@ -28,10 +28,10 @@ static void usage(const char *prog) {
         "  %s -m <model_dir> --info\n"
         "  %s -m <model_dir> --list-tensors [prefix]\n"
         "  %s --wav-roundtrip <in.wav> <out.wav>\n"
-        "  %s -m <dir> -p \"prompt\" -d <seconds> -s <steps> --seed <n> [--device cpu|cuda] -o out.wav\n"
+        "  %s -m <dir> -p \"prompt\" -d <seconds> -s <steps> --seed <n> [--device auto|cpu|cuda] -o out.wav\n"
         "  %s -m <dir> --uncond -d <seconds> -o out.wav\n"
         "  %s -m <dir> --prompt-embed <prompt.atns> -d <seconds> -o out.wav\n"
-        "    --device cuda runs the DiT device-resident on the GPU (fp16 weights; E8.5)\n",
+        "    --device auto (default) runs the DiT device-resident on the GPU when one fits, else CPU\n",
         prog, prog, prog, prog, prog, prog);
 }
 
@@ -66,7 +66,7 @@ int main(int argc, char **argv) {
     float seconds = 15.0f;
     int steps = 8;
     long long seed = -1;
-    aria_device device = ARIA_DEVICE_CPU;
+    aria_device device = ARIA_DEVICE_AUTO;
     int bench = 1;   /* --bench N: generate N times (model resident) for warm timing */
 
     for (int i = 1; i < argc; i++) {
@@ -95,7 +95,9 @@ int main(int argc, char **argv) {
             out_path = argv[++i];
         } else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
             const char *d = argv[++i];
-            device = (strcmp(d, "cuda") == 0 || strcmp(d, "gpu") == 0) ? ARIA_DEVICE_CUDA : ARIA_DEVICE_CPU;
+            if (strcmp(d, "cpu") == 0) device = ARIA_DEVICE_CPU;
+            else if (strcmp(d, "cuda") == 0 || strcmp(d, "gpu") == 0) device = ARIA_DEVICE_CUDA;
+            else device = ARIA_DEVICE_AUTO;
         } else if (strcmp(argv[i], "--bench") == 0 && i + 1 < argc) {
             bench = atoi(argv[++i]); if (bench < 1) bench = 1;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
