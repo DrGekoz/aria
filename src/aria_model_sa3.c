@@ -286,9 +286,9 @@ static int sa3_generate(aria_ctx *ctx, void *state,
 #ifdef ARIA_CUDA
     /* auto: GPU when it's worth it (sm_70+) and fits; cuda: force any device
      * (CPU-fallback on OOM); cpu: never. Inpaint + packed-quant stay on the CPU DiT. */
-    /* medium stays on the CPU DiT+decoder: the device DiT has no differential path
-     * and the device decoder is the small-music one. */
-    int want_gpu = !p->init_audio && !loaded_quant && !st->is_medium &&
+    /* medium runs its DiT on the GPU (the device DiT now has a differential path)
+     * but keeps the medium decoder on the CPU (the device decoder is small-music). */
+    int want_gpu = !p->init_audio && !loaded_quant &&
                    ((p->device == ARIA_DEVICE_CUDA && aria_cuda_available()) ||
                     (p->device == ARIA_DEVICE_AUTO && aria_cuda_recommended()));
     if (want_gpu && !st->cdit) {   /* upload + quantize weights once; reused across gens */
@@ -333,7 +333,7 @@ static int sa3_generate(aria_ctx *ctx, void *state,
         dc.cdit = st->cdit;
         dc.global_seconds = rv.global_seconds;
         dc.gcond = malloc((size_t)6 * st->cfg.embed_dim * sizeof(float));
-        if (!st->cdec) {   /* decode on the GPU too (uploaded once, reused) */
+        if (!st->cdec && !st->is_medium) {   /* GPU decoder is small-music only */
             aria_sa3_dec_view dv; aria_sa3_dec_get_view(st->dec, &dv);
             st->cdec = aria_cuda_dec_create(&dv);
             if (st->cdec) fprintf(stderr, "[aria] decoder: GPU device-resident, fp16\n");

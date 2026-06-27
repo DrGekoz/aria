@@ -623,6 +623,7 @@ void aria_sa3_dit_forward(const aria_sa3_dit *m, float *out_CT, const float *x_C
 void aria_sa3_dit_get_view(const aria_sa3_dit *m, aria_sa3_dit_view *v) {
     v->depth = m->depth; v->ed = m->ed; v->num_heads = m->num_heads; v->head_dim = m->head_dim;
     v->inner = m->inner; v->io_ch = m->io_ch; v->n_mem = m->n_mem; v->rot_dim = m->rot_dim;
+    v->differential = m->differential;
     v->preprocess = m->preprocess; v->postprocess = m->postprocess;
     v->project_in = m->project_in; v->project_out = m->project_out; v->memory_tokens = m->memory_tokens;
     v->blocks = m->blocks;
@@ -631,7 +632,7 @@ void aria_sa3_dit_get_view(const aria_sa3_dit *m, aria_sa3_dit_view *v) {
 void aria_sa3_dit_req_get_view(const aria_sa3_dit_req *r, aria_sa3_dit_req_view *v) {
     v->T = r->T; v->S = r->S; v->n_cond = r->n_cond; v->depth = r->m->depth;
     v->global_seconds = r->global_seconds; v->rope_cos = r->rope_cos; v->rope_sin = r->rope_sin;
-    v->cross_k = r->cross_k; v->cross_v = r->cross_v;
+    v->cross_k = r->cross_k; v->cross_v = r->cross_v; v->cross_kd = r->cross_kd;
 }
 
 void aria_sa3_dit_global_cond(const aria_sa3_dit *m, const float *global_seconds, float t, float *gcond) {

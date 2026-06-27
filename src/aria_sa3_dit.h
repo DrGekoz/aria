@@ -113,6 +113,7 @@ void aria_sa3_dit_forward(const aria_sa3_dit *m, float *out_CT, const float *x_C
 /* ---- read-only views (so the CUDA backend can upload weights/caches) ---- */
 typedef struct {
     int depth, ed, num_heads, head_dim, inner, io_ch, n_mem, rot_dim;
+    int differential;                 /* medium: differential self+cross attention */
     const float *preprocess, *postprocess, *project_in, *project_out, *memory_tokens;
     const aria_dit_block_w *blocks;   /* [depth] */
 } aria_sa3_dit_view;
@@ -122,6 +123,7 @@ typedef struct {
     int T, S, n_cond, depth;
     const float *global_seconds, *rope_cos, *rope_sin;
     float *const *cross_k, *const *cross_v;   /* [depth] each [H, n_cond, head_dim] */
+    float *const *cross_kd;                   /* [depth] differential k_diff (post k_norm), or NULL */
 } aria_sa3_dit_req_view;
 void aria_sa3_dit_req_get_view(const aria_sa3_dit_req *r, aria_sa3_dit_req_view *v);
 

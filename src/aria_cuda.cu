@@ -512,6 +512,7 @@ struct blk_dev {
 
 struct aria_cuda_dit {
     int depth, ed, H, hd, inner, io_ch, n_mem, rot;
+    int differential;         /* medium: differential self+cross attention */
     aria_dtype precision;     /* block GEMM weight precision (fp32->fp16 / q8 / q4) */
     __half *dqbuf;            /* dequant scratch: largest weight, reused per GEMM */
     __half *preprocess, *postprocess, *project_in, *project_out;
@@ -521,9 +522,15 @@ struct aria_cuda_dit {
     /* per-request */
     int T, S, n_cond, have_req;
     float *dx, *dv, *dgcond, *rope_cos, *rope_sin;
-    float **cross_k, **cross_v;
+    float **cross_k, **cross_v, **cross_kd;
     darena arena;
 };
+
+/* a[i] -= b[i] (differential attention combine on the device) */
+__global__ void k_sub(float *a, const float *b, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) a[i] -= b[i];
+}
 
 /* y[M,N] = x[M,K] @ W[N,K]^T + b via cuBLAS GemmEx (fp16 in, fp32 accumulate ->
  * tensor cores on sm_80+). x (fp32 activations) is converted to fp16 into transient
@@ -570,35 +577,56 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     float *qh = da_alloc(ar, (size_t)H * S * hd), *kh = da_alloc(ar, (size_t)H * S * hd);
     float *vh = da_alloc(ar, (size_t)H * S * hd), *ao = da_alloc(ar, (size_t)H * S * hd);
     float *scores = da_alloc(ar, (size_t)H * S * (S > Sc ? S : Sc));   /* all heads (batched attn) */
-    int nHShd = (int)nblocks((size_t)H * S * hd);
+    int diff = h->differential, nHShd = (int)nblocks((size_t)H * S * hd);
+    size_t nHSd = (size_t)H * S * hd;
+    float *qdh = NULL, *kdh = NULL, *aod = NULL;   /* differential: q/k_diff + 2nd attn out */
+    if (diff) { qdh = da_alloc(ar, nHSd); kdh = da_alloc(ar, nHSd); aod = da_alloc(ar, nHSd); }
 
-    /* self-attention */
+    /* self-attention (differential medium: out = attn(q,k,v) - attn(qd,kd,v)) */
     cudaMemcpy(residual, seq, (size_t)S * dim * sizeof(float), cudaMemcpyDeviceToDevice);
     k_rmsnorm<<<S, RED_TH>>>(hh, seq, w->pre_norm, S, dim, 1e-5f, 0);
     k_adaln<<<nSd, THREADS>>>(hh, scale_self, shift_self, S, dim);
-    float *qkv = da_alloc(ar, (size_t)S * 3 * dim);
+    int nq = diff ? 5 : 3;
+    float *qkv = da_alloc(ar, (size_t)S * nq * dim);
     gemm_dqw(h, qkv, hh, &w->sa_to_qkv, NULL, S);
-    k_extract_heads<<<nHShd, THREADS>>>(qh, qkv, S, H, hd, 3 * dim, 0);
-    k_extract_heads<<<nHShd, THREADS>>>(kh, qkv, S, H, hd, 3 * dim, dim);
-    k_extract_heads<<<nHShd, THREADS>>>(vh, qkv, S, H, hd, 3 * dim, 2 * dim);
+    k_extract_heads<<<nHShd, THREADS>>>(qh, qkv, S, H, hd, nq * dim, 0);
+    k_extract_heads<<<nHShd, THREADS>>>(kh, qkv, S, H, hd, nq * dim, dim);
+    k_extract_heads<<<nHShd, THREADS>>>(vh, qkv, S, H, hd, nq * dim, 2 * dim);
     k_rmsnorm<<<H * S, RED_TH>>>(qh, qh, w->sa_q_norm, H * S, hd, 1e-6f, 0);
     k_rmsnorm<<<H * S, RED_TH>>>(kh, kh, w->sa_k_norm, H * S, hd, 1e-6f, 0);
     k_rope<<<nblocks((size_t)H * S), THREADS>>>(qh, h->rope_cos, h->rope_sin, H, S, hd, rot);
     k_rope<<<nblocks((size_t)H * S), THREADS>>>(kh, h->rope_cos, h->rope_sin, H, S, hd, rot);
     attn_dev(h->cublas, ao, qh, kh, vh, H, S, S, hd, scores);
+    if (diff) {
+        k_extract_heads<<<nHShd, THREADS>>>(qdh, qkv, S, H, hd, nq * dim, 3 * dim);
+        k_extract_heads<<<nHShd, THREADS>>>(kdh, qkv, S, H, hd, nq * dim, 4 * dim);
+        k_rmsnorm<<<H * S, RED_TH>>>(qdh, qdh, w->sa_q_norm, H * S, hd, 1e-6f, 0);
+        k_rmsnorm<<<H * S, RED_TH>>>(kdh, kdh, w->sa_k_norm, H * S, hd, 1e-6f, 0);
+        k_rope<<<nblocks((size_t)H * S), THREADS>>>(qdh, h->rope_cos, h->rope_sin, H, S, hd, rot);
+        k_rope<<<nblocks((size_t)H * S), THREADS>>>(kdh, h->rope_cos, h->rope_sin, H, S, hd, rot);
+        attn_dev(h->cublas, aod, qdh, kdh, vh, H, S, S, hd, scores);
+        k_sub<<<nblocks(nHSd), THREADS>>>(ao, aod, nHSd);
+    }
     k_merge_heads<<<nHShd, THREADS>>>(merged, ao, S, H, hd);
     gemm_dqw(h, o, merged, &w->sa_to_out, NULL, S);
     k_gate<<<nSd, THREADS>>>(o, gate_self, S, dim);
     k_add<<<nSd, THREADS>>>(seq, residual, o, (size_t)S * dim);
 
-    /* cross-attention (cached K/V) */
+    /* cross-attention (cached K/V; differential: q_diff + cross_kd) */
     cudaMemcpy(residual, seq, (size_t)S * dim * sizeof(float), cudaMemcpyDeviceToDevice);
     k_rmsnorm<<<S, RED_TH>>>(hh, seq, w->cross_norm, S, dim, 1e-5f, 0);
-    float *q = da_alloc(ar, (size_t)S * dim);
+    int ncq = diff ? 2 : 1;
+    float *q = da_alloc(ar, (size_t)S * ncq * dim);
     gemm_dqw(h, q, hh, &w->ca_to_q, NULL, S);
-    k_extract_heads<<<nHShd, THREADS>>>(qh, q, S, H, hd, dim, 0);
+    k_extract_heads<<<nHShd, THREADS>>>(qh, q, S, H, hd, ncq * dim, 0);
     k_rmsnorm<<<H * S, RED_TH>>>(qh, qh, w->ca_q_norm, H * S, hd, 1e-6f, 0);
     attn_dev(h->cublas, ao, qh, h->cross_k[blk], h->cross_v[blk], H, S, Sc, hd, scores);
+    if (diff) {
+        k_extract_heads<<<nHShd, THREADS>>>(qdh, q, S, H, hd, ncq * dim, dim);
+        k_rmsnorm<<<H * S, RED_TH>>>(qdh, qdh, w->ca_q_norm, H * S, hd, 1e-6f, 0);
+        attn_dev(h->cublas, aod, qdh, h->cross_kd[blk], h->cross_v[blk], H, S, Sc, hd, scores);
+        k_sub<<<nblocks(nHSd), THREADS>>>(ao, aod, nHSd);
+    }
     k_merge_heads<<<nHShd, THREADS>>>(merged, ao, S, H, hd);
     gemm_dqw(h, o, merged, &w->ca_to_out, NULL, S);
     k_add<<<nSd, THREADS>>>(seq, residual, o, (size_t)S * dim);
@@ -626,7 +654,9 @@ extern "C" aria_cuda_dit *aria_cuda_dit_create(const aria_sa3_dit_view *v, aria_
      * asymmetric Q4 -- ~9% DiT velocity error vs ~23% for uniform Q4. Rough fit:
      * attention ~1 B/elem (q8), FFN ~1 B/elem (q4: 0.5 nibble + scale, rounded up),
      * fp16 = 2 B/elem, plus the dequant scratch. */
-    size_t attn_elem = (size_t)v->depth * 6 * (size_t)ed * ed;
+    /* differential (medium): sa_to_qkv 5*ed^2, ca_to_q 2*ed^2 (vs 3/1) -> 9*ed^2 attn */
+    size_t attn_per = v->differential ? 9 : 6;
+    size_t attn_elem = (size_t)v->depth * attn_per * (size_t)ed * ed;
     size_t ffn_elem  = (size_t)v->depth * 3 * (size_t)inner * ed;
     size_t wbytes = (precision == ARIA_F32) ? (attn_elem + ffn_elem) * 2 : (attn_elem + ffn_elem);
     size_t need = wbytes + (precision != ARIA_F32 ? (size_t)2 * inner * ed * sizeof(__half) : 0) + (64u << 20);
@@ -636,7 +666,7 @@ extern "C" aria_cuda_dit *aria_cuda_dit_create(const aria_sa3_dit_view *v, aria_
     aria_cuda_dit *h = (aria_cuda_dit *)calloc(1, sizeof(aria_cuda_dit));
     h->depth = v->depth; h->ed = ed; h->H = v->num_heads; h->hd = v->head_dim;
     h->inner = inner; h->io_ch = v->io_ch; h->n_mem = v->n_mem; h->rot = v->rot_dim;
-    h->precision = precision;
+    h->precision = precision; h->differential = v->differential;
     if (cublasCreate(&h->cublas) != CUBLAS_STATUS_SUCCESS) { free(h); return NULL; }
     if (precision != ARIA_F32) { CK(cudaMalloc(&h->dqbuf, (size_t)2 * inner * ed * sizeof(__half))); }
     int C = v->io_ch;
@@ -658,12 +688,14 @@ extern "C" aria_cuda_dit *aria_cuda_dit_create(const aria_sa3_dit_view *v, aria_
         d->ssg        = upload_f32(s->to_scale_shift_gate, (size_t)6 * ed);
         d->ff_in_b    = upload_f32(s->ff_in_b, (size_t)2 * inner);
         d->ff_out_b   = upload_f32(s->ff_out_b, ed);
-        /* Q4 mixed precision: attention projections stay Q8 (error-sensitive). */
+        /* Q4 mixed precision: attention projections stay Q8 (error-sensitive).
+         * differential (medium): sa_to_qkv is [5*ed,ed], ca_to_q [2*ed,ed]. */
         aria_dtype adt = (precision == ARIA_Q4) ? ARIA_Q8 : precision;
+        int nq = v->differential ? 5 : 3, ncq = v->differential ? 2 : 1;
         int u = 1;
-        u &= upload_dqw(&d->sa_to_qkv, s->sa_to_qkv, 3 * ed, ed, adt);
+        u &= upload_dqw(&d->sa_to_qkv, s->sa_to_qkv, nq * ed, ed, adt);
         u &= upload_dqw(&d->sa_to_out, s->sa_to_out, ed, ed, adt);
-        u &= upload_dqw(&d->ca_to_q,   s->ca_to_q,   ed, ed, adt);
+        u &= upload_dqw(&d->ca_to_q,   s->ca_to_q,   ncq * ed, ed, adt);
         u &= upload_dqw(&d->ca_to_out, s->ca_to_out, ed, ed, adt);
         u &= upload_dqw(&d->ff_in_w,   s->ff_in_w,   2 * inner, ed, precision);
         u &= upload_dqw(&d->ff_out_w,  s->ff_out_w,  ed, inner, precision);
@@ -681,8 +713,9 @@ static void free_request(aria_cuda_dit *h) {
     cudaFree(h->rope_cos); cudaFree(h->rope_sin); cudaFree(h->arena.base);
     if (h->cross_k) for (int b = 0; b < h->depth; b++) cudaFree(h->cross_k[b]);
     if (h->cross_v) for (int b = 0; b < h->depth; b++) cudaFree(h->cross_v[b]);
-    free(h->cross_k); free(h->cross_v);
-    h->cross_k = h->cross_v = NULL; h->dx = h->dv = h->dgcond = NULL;
+    if (h->cross_kd) for (int b = 0; b < h->depth; b++) cudaFree(h->cross_kd[b]);
+    free(h->cross_k); free(h->cross_v); free(h->cross_kd);
+    h->cross_k = h->cross_v = h->cross_kd = NULL; h->dx = h->dv = h->dgcond = NULL;
     h->rope_cos = h->rope_sin = NULL; h->arena.base = NULL; h->have_req = 0;
 }
 
@@ -697,12 +730,16 @@ extern "C" void aria_cuda_dit_set_request(aria_cuda_dit *h, const aria_sa3_dit_r
     h->rope_sin = upload_f32(rv->rope_sin, (size_t)S * rh);
     h->cross_k = (float **)calloc(h->depth, sizeof(float *));
     h->cross_v = (float **)calloc(h->depth, sizeof(float *));
+    h->cross_kd = (h->differential && rv->cross_kd) ? (float **)calloc(h->depth, sizeof(float *)) : NULL;
     for (int b = 0; b < h->depth; b++) {
         h->cross_k[b] = upload_f32(rv->cross_k[b], (size_t)H * n_cond * hd);
         h->cross_v[b] = upload_f32(rv->cross_v[b], (size_t)H * n_cond * hd);
+        if (h->cross_kd) h->cross_kd[b] = upload_f32(rv->cross_kd[b], (size_t)H * n_cond * hd);
     }
-    /* device arena: one block's peak + step buffers (mirrors the CPU sizing) */
-    size_t block_floats = (size_t)6 * ed + 24 * (size_t)S * ed + (size_t)H * S * (S > n_cond ? S : n_cond);
+    /* device arena: one block's peak + step buffers (mirrors the CPU sizing;
+     * differential needs ~32*S*ed for the extra 5-way qkv + q/k_diff + 2nd attn). */
+    size_t block_floats = (size_t)6 * ed + (h->differential ? 32 : 24) * (size_t)S * ed
+                          + (size_t)H * S * (S > n_cond ? S : n_cond);
     size_t step_floats = (size_t)S * ed + 8 * (size_t)T * C + 8 * (size_t)ed;
     h->arena.cap = (block_floats + step_floats + (1u << 20)) * sizeof(float);
     h->arena.used = 0;
