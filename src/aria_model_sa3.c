@@ -32,6 +32,8 @@ typedef struct {
     aria_sa3_config cfg;
     aria_sa3_dit *dit;
     aria_sa3_dec *dec;
+    aria_sa3_dec_medium *dec_med;  /* medium decoder (dim 1536); dec is NULL when medium */
+    int is_medium;                 /* medium model: differential DiT + medium decoder (CPU) */
     aria_sa3_enc *enc_taae;   /* taae encoder, lazily loaded for continue/inpaint */
     int quant_loaded;         /* a packed .aria DiT overlay has been loaded (E9.2) */
     /* seconds_total NumberConditioner (borrowed from the mmap) */
@@ -79,12 +81,18 @@ static void *sa3_load(aria_ctx *ctx, safetensors_file_t *sf, const char *config_
     }
     st->sample_rate = ctx->sample_rate;
 
+    /* medium model: decoder.layers.1.weight is [1536,256] (vs [768,256] small-music) */
+    const safetensor_t *projw = safetensors_find(sf, "pretransform.model.decoder.layers.1.weight");
+    st->is_medium = projw && projw->ndim >= 1 && projw->shape[0] == 1536;
+
     st->dit = aria_sa3_dit_load(sf, &st->cfg);
-    st->dec = aria_sa3_dec_load(sf);
-    if (!st->dit || !st->dec) {
+    if (st->is_medium) st->dec_med = aria_sa3_dec_medium_load(sf);
+    else               st->dec = aria_sa3_dec_load(sf);
+    if (!st->dit || (st->is_medium ? !st->dec_med : !st->dec)) {
         aria_set_error("sa3_load: %s", aria_last_error()[0] ? aria_last_error() : "weight load failed");
         if (st->dit) aria_sa3_dit_free(st->dit);
         if (st->dec) aria_sa3_dec_free(st->dec);
+        if (st->dec_med) aria_sa3_dec_medium_free(st->dec_med);
         free(st);
         return NULL;
     }
@@ -102,7 +110,7 @@ static void *sa3_load(aria_ctx *ctx, safetensors_file_t *sf, const char *config_
     return st;
 
 fail:
-    aria_sa3_dit_free(st->dit); aria_sa3_dec_free(st->dec);
+    aria_sa3_dit_free(st->dit); aria_sa3_dec_free(st->dec); aria_sa3_dec_medium_free(st->dec_med);
     free(st);
     return NULL;
 }
@@ -116,6 +124,7 @@ static void sa3_unload(void *state) {
 #endif
     aria_sa3_dit_free(st->dit);
     aria_sa3_dec_free(st->dec);
+    if (st->dec_med) aria_sa3_dec_medium_free(st->dec_med);
     if (st->enc_taae) aria_sa3_enc_free(st->enc_taae);
     if (st->enc) aria_t5enc_free(st->enc);
     if (st->tok) aria_tokenizer_free(st->tok);
@@ -277,7 +286,9 @@ static int sa3_generate(aria_ctx *ctx, void *state,
 #ifdef ARIA_CUDA
     /* auto: GPU when it's worth it (sm_70+) and fits; cuda: force any device
      * (CPU-fallback on OOM); cpu: never. Inpaint + packed-quant stay on the CPU DiT. */
-    int want_gpu = !p->init_audio && !loaded_quant &&
+    /* medium stays on the CPU DiT+decoder: the device DiT has no differential path
+     * and the device decoder is the small-music one. */
+    int want_gpu = !p->init_audio && !loaded_quant && !st->is_medium &&
                    ((p->device == ARIA_DEVICE_CUDA && aria_cuda_available()) ||
                     (p->device == ARIA_DEVICE_AUTO && aria_cuda_recommended()));
     if (want_gpu && !st->cdit) {   /* upload + quantize weights once; reused across gens */
@@ -343,7 +354,8 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     if (st->cdec) aria_cuda_dec_forward(st->cdec, audio, x, T);
     else
 #endif
-    aria_sa3_dec_forward(st->dec, audio, x, T);
+    if (st->is_medium) aria_sa3_dec_medium_forward(st->dec_med, audio, x, T);
+    else               aria_sa3_dec_forward(st->dec, audio, x, T);
     double t3 = sa3_now();
     if (profile) {
         struct rusage ru; getrusage(RUSAGE_SELF, &ru);
