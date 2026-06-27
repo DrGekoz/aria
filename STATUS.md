@@ -7,14 +7,19 @@ work landed before the checkbox habit. This file is the source of truth for "wha
 ## TL;DR
 
 A from-scratch, dependency-free **C runtime for Stable Audio 3 (small-music)**: full
-**text → audio** inference, parity-verified against PyTorch/`stable-audio-tools`, on **CPU**
-(AVX2/FMA + OpenMP) and **CUDA** (device-resident DiT, cuBLAS tensor-core GEMMs). Milestones
-**M1 (end-to-end), M2 (self-contained text), M4 (CUDA generation)** reached.
+**text → audio** inference **+ continue/inpaint**, parity-verified against PyTorch/`stable-audio-tools`,
+on **CPU** (AVX2/FMA + OpenMP) and **CUDA** (device-resident DiT, cuBLAS tensor-core GEMMs).
+Milestones **M1 (end-to-end), M2 (self-contained text), M3 (continue/inpaint), M4 (CUDA
+generation)** reached.
 
 ## What works (verified end-to-end)
 
 - **Pipeline:** T5Gemma encoder → conditioning (cross-attn + global adaLN + seconds) → DiT
   denoise (8-step pingpong) → taae_v2 decode → stereo 44.1 kHz WAV.
+- **Continue / inpaint:** taae_v2 **encoder** (audio→latent) + inpaint mask (audio→latent
+  nearest-interp) + local-additive cond (`[mask | latent·mask]`) → `--continue <wav>` (extend a
+  clip) / `--inpaint <wav> --from <s> --to <s>` (regenerate a region). End-to-end parity vs
+  `generate_diffusion_cond_inpaint` (latent 6.6e-4, audio 2.4e-4); kept regions preserved. CPU DiT.
 - **Conditioning inputs:** text prompt (BPE tokenizer + T5Gemma encoder, all in C) · precomputed
   `[256,768]` embedding (`--prompt-embed`) · unconditional (`--uncond`); `seconds_total`
   duration conditioner.
@@ -27,10 +32,12 @@ A from-scratch, dependency-free **C runtime for Stable Audio 3 (small-music)**: 
     else CPU.
 - **CLI (`aria`):** `-m <model>` `-p "prompt"` | `--prompt-embed` | `--uncond`, `-d <seconds>`,
   `-s <steps>`, `--seed`, `--device auto|cpu|cuda`, `--bench N` (warm timing), `-o <out.wav>`;
+  `--continue <wav>` / `--inpaint <wav> --from <s> --to <s>` (continue/inpaint);
   `ARIA_PROFILE=1` for per-stage timing; `--info`, `--list-tensors`.
 - **Tests:** per-op + per-component + end-to-end parity (`test_ops/arena/wav/config/sampler/
-  schedule/number_cond/attn/dit/dit_full/dec/t5enc/tokenizer/e2e`) + `test_cuda` (CUDA-vs-CPU op
-  parity) + `make bench`. CPU↔GPU audio agree to ~0.6 % rel-RMS (fp16-weight level).
+  schedule/number_cond/attn/dit/dit_full/dec/enc/inpaint/inpaint_e2e/t5enc/tokenizer/e2e`) +
+  `test_cuda` (CUDA-vs-CPU op parity) + `make bench`. CPU↔GPU audio agree to ~0.6 % rel-RMS
+  (fp16-weight level).
 
 ## Performance (10 s clip, 8 steps)
 
@@ -58,8 +65,9 @@ precision + Q8/Q4 are **E9** (E9.0 = the `--precision` interface for fp variants
 - **Ops/backends:** `aria_ops.h` (op surface), `aria_cpu.c` (CPU kernels + AVX2 GEMM),
   `aria_cuda.cu` (CUDA backend + device-resident DiT), `aria_gpu.h`, `aria_arena.{c,h}` (scratch arena).
 - **Model components:** `aria_sa3_dit.{c,h}` (DiT + request context), `aria_sa3_dec.{c,h}`
-  (taae decoder), `aria_t5enc.{c,h}` (T5Gemma encoder), `aria_tokenizer.{c,h}` (BPE),
-  `aria_cond.c` (number/timestep), `aria_sampler.{c,h}` (RNG + LogSNR + pingpong).
+  (taae decoder), `aria_sa3_enc.{c,h}` (taae encoder), `aria_taae.{c,h}` (shared resampling
+  block + chunk pass), `aria_t5enc.{c,h}` (T5Gemma encoder), `aria_tokenizer.{c,h}` (BPE),
+  `aria_cond.{c,h}` (number/timestep + inpaint mask/local-cond), `aria_sampler.{c,h}` (RNG + LogSNR + pingpong).
 - **Infra:** `aria_safetensors.{c,h}` (mmap loader), `aria_wav.{c,h}`, `aria_json.{c,h}`,
   `aria_sa3_config.c`, `aria_parity.{c,h}`.
 
@@ -69,8 +77,8 @@ precision + Q8/Q4 are **E9** (E9.0 = the `--precision` interface for fp variants
 |---|---|
 | **M1** end-to-end text→audio (precomputed emb + injected noise) == Python | ✅ |
 | **M2** self-contained text (T5Gemma encoder in C) | ✅ |
+| **M3** continue / inpaint | ✅ |
 | **M4** CUDA end-to-end generation | ✅ |
-| M3 continue / inpaint | ⬜ |
 | M5 quantized (Q4) | ⬜ |
 | M6 medium model | ⬜ |
 | M7 steering (TasteSteer) | ⬜ |
@@ -80,13 +88,13 @@ precision + Q8/Q4 are **E9** (E9.0 = the `--precision` interface for fp variants
 | epic | status | notes |
 |---|---|---|
 | **E0** Scaffolding & infra | ✅ | repo, mmap loader, WAV, op surface, parity harness |
-| **E1** Conditioning | ✅ | number/timestep/global-adaLN/cross-attn + **E1.6** local-add inpaint cond hook (NULL-safe; full parity rides on E7) |
+| **E1** Conditioning | ✅ | number/timestep/global-adaLN/cross-attn + **E1.6** local-add inpaint cond hook (now exercised with a real mask via **E7.3**) |
 | **E2** Core ops | ✅ + perf | rope/attn/qk-norm/cross/softcap/differential/conv1d/GLU; **E2.9/9b/9c ✅** (AVX2 GEMM tuned 3×3, arena/KV-cache), **E2.10 ✅** (`--device auto`); E2.9c-pack/E2.10-mps deferred |
 | **E3** T5Gemma encoder + tokenizer | ✅ | BPE tokenizer + 12-layer Gemma2 encoder + conditioner; `--prompt-embed` |
 | **E4** SA3 DiT forward | ✅ (E4.5 ⬜) | block-0 + full 20-block parity; differential-attn path for medium ⬜ |
 | **E5** taae_v2 decoder | ✅ | softnorm + chunked resampling + unpatch, full latent→audio parity |
 | **E6** Sampler + end-to-end | ✅ (E6.5 ⬜) | LogSNR + xoshiro + pingpong + e2e WAV; CFG/`--cfg` flag ⬜ (base-checkpoint only) |
-| **E7** continue / inpaint | ⬜ | taae **encoder**, inpaint mask, local-add cond, `--continue`/`--inpaint` |
+| **E7** continue / inpaint | ✅ | taae **encoder** (parity 9e-4), inpaint mask + local-add cond (exact), `--continue`/`--inpaint`, e2e parity (audio 2.4e-4); CPU DiT (GPU local-cond ⬜) |
 | **E8** CUDA backend | ✅ E8.1–E8.5d · ⬜ E8.5e/E8.6 | scaffold, all op kernels, device-resident **DiT + decoder**, profile-guided kernels (4.73→**0.29 s** warm — **on par with / ahead of PyTorch**); last micro-opts (E8.5e) + SSD streaming ⬜ |
 | **E9** Precision & Quantization | ⬜ | E9.0 `--precision` (fp32/fp16/bf16), E9.1–E9.4 Q8/Q4 + `aria-quantize` |
 | **E10** medium model | ⬜ | embed 1536 / depth 24 / differential DiT attn |
@@ -100,5 +108,7 @@ precision + Q8/Q4 are **E9** (E9.0 = the `--precision` interface for fp variants
   exported tokenizer (`scripts/export_tokenizer.py`). `--uncond` / `--prompt-embed` work without it.
 - **GT 1030 (2 GB)** is correctness-validation only (fits via fp16; slower than the CPU). Real GPU
   speed is the **RTX 3070** (sm_86).
-- Not implemented: continue/inpaint (E7), quantization (E9), medium (E10), steering (E12),
-  batch/server APIs (E13.1/2), SSD streaming (E8.6).
+- **Continue/inpaint runs on the CPU DiT** — the device DiT has no local-cond path yet (follow-up).
+  Init WAV must already be at the model sample rate (44.1 kHz); no resampler yet.
+- Not implemented: quantization (E9), medium (E10), steering (E12), batch/server APIs (E13.1/2),
+  SSD streaming (E8.6), GPU inpaint.
