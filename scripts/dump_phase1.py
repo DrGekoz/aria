@@ -367,6 +367,55 @@ def _load_decoder_ae(model_dir):
     return ae
 
 
+def dump_taae_medium_block(out_dir):
+    """Synthetic medium-decoder resampling block (random weights): differential
+    self-attention + DyT norms + SLIDING-WINDOW (banded) attention + a SiLU and a
+    Sin (sinusoidal FF) variant. Validates the C medium decoder block kernel on the
+    dev box (no medium model needed). Window [17,17]."""
+    from stable_audio_tools.models.transformer import TransformerBlock
+
+    dim, head_dim = 512, 64          # 8 heads
+    W = [17, 17]                     # sliding window (medium: stride16 -> [17,17])
+    d = os.path.join(out_dir, "taae_med")
+    os.makedirs(d, exist_ok=True)
+    for tag, sinus in [("silu", False), ("sin", True)]:
+        blk = TransformerBlock(dim, dim_heads=head_dim, cross_attend=False, norm_type="dyt",
+                               attn_kwargs={"qk_norm": "dyt", "qk_norm_eps": 1e-3, "differential": True},
+                               ff_kwargs={"mult": 3, "no_bias": False, "sinusoidal": sinus},
+                               norm_kwargs={"eps": 1e-3}, add_rope=True).eval()
+        torch.manual_seed(41)
+        with torch.no_grad():
+            for name, p in blk.named_parameters():
+                if name.endswith("alpha"):   p.copy_(0.5 + 0.1 * torch.randn_like(p))
+                elif name.endswith("gamma"): p.copy_(1.0 + 0.05 * torch.randn_like(p))
+                elif name.endswith("beta"):  p.copy_(0.02 * torch.randn_like(p))
+                elif name.endswith("bias"):  p.copy_(0.01 * torch.randn_like(p))
+                else:                         p.copy_(0.04 * torch.randn_like(p))
+        torch.manual_seed(42)
+        N = 51                       # 3 * 17
+        x = torch.randn(1, N, dim) * 0.5
+        with torch.no_grad():
+            out = blk(x, self_attention_flash_sliding_window=W)
+        save_atns(os.path.join(d, f"{tag}_x.atns"), x.squeeze(0).float().cpu().numpy())
+        save_atns(os.path.join(d, f"{tag}_out.atns"), out.squeeze(0).float().cpu().numpy())
+        sd = blk.state_dict()
+        wmap = {
+            "pre_alpha": "pre_norm.alpha", "pre_gamma": "pre_norm.gamma", "pre_beta": "pre_norm.beta",
+            "to_qkv": "self_attn.to_qkv.weight",
+            "qn_alpha": "self_attn.q_norm.alpha", "qn_gamma": "self_attn.q_norm.gamma", "qn_beta": "self_attn.q_norm.beta",
+            "kn_alpha": "self_attn.k_norm.alpha", "kn_gamma": "self_attn.k_norm.gamma", "kn_beta": "self_attn.k_norm.beta",
+            "to_out": "self_attn.to_out.weight",
+            "ff_alpha": "ff_norm.alpha", "ff_gamma": "ff_norm.gamma", "ff_beta": "ff_norm.beta",
+            "ff_in_w": "ff.ff.0.proj.weight", "ff_in_b": "ff.ff.0.proj.bias",
+            "ff_out_w": "ff.ff.2.weight", "ff_out_b": "ff.ff.2.bias",
+        }
+        for fn, key in wmap.items():
+            v = sd[key]
+            save_atns(os.path.join(d, f"{tag}_{fn}.atns"),
+                      (v.reshape(()) if v.numel() == 1 else v).float().cpu().numpy())
+    print(f"dumped synthetic medium taae blocks (silu+sin, differential, sliding-window {W}) to {d}")
+
+
 def dump_decoder(model_dir, out_dir):
     """Staged taae_v2 decode reference (softnorm -> SAMEDecoder -> unpatch)."""
     ae = _load_decoder_ae(model_dir)
@@ -624,6 +673,7 @@ if __name__ == "__main__":
     dump_dit_full(model_dir, out_dir)
     dump_schedule(out_dir)
     dump_taae_block(model_dir, out_dir)
+    dump_taae_medium_block(out_dir)
     dump_decoder(model_dir, out_dir)
     dump_encoder(model_dir, out_dir)
     dump_inpaint(model_dir, out_dir)

@@ -48,4 +48,15 @@ void taae_chunk_pass(float *x, int L, const taae_block_w *blocks,
 /* scratch arena bytes sufficient for one block at chunk size TAAE_S. */
 size_t taae_block_arena_bytes(void);
 
+/* ---- medium decoder block (runtime dim; sliding-window + sinusoidal FF) ----
+ * Same DyT + differential-attention TransformerBlock as the small-music decoder,
+ * but generalized: arbitrary `dim`/`inner`, an optional additive attention `mask`
+ * [N,N] (the sliding-window band; NULL = full attention), and a sinusoidal FF gate
+ * sin(pi*x) instead of SiLU. xc[N,dim] in place; rope tables rcos/rsin[N,16]. */
+void taae_med_block_forward(float *xc, int N, int dim, int H, int hd, int inner,
+                            const taae_block_w *w, const float *rcos, const float *rsin,
+                            const float *mask, int sinusoidal, aria_arena *ar);
+/* scratch floats for one medium block at sequence length N (dim/inner runtime). */
+size_t taae_med_block_floats(int N, int dim, int inner);
+
 #endif /* ARIA_TAAE_H */

@@ -117,3 +117,74 @@ size_t taae_block_arena_bytes(void) {
     size_t fl = 12 * N * TAAE_D + N * TAAE_QKV + N * N + 3 * N * TAAE_INNER + 4096;
     return fl * sizeof(float);
 }
+
+/* ---- medium decoder block: runtime dim, sliding-window band mask, sin/SiLU FF ---- */
+#include <math.h>
+
+size_t taae_med_block_floats(int N, int dim, int inner) {
+    /* h+res(2) + qkv(5) + q,k,v,qd,kd,ob,od(7) + merged,o(2) = 16*N*dim, + N*N + 3*N*inner */
+    return (size_t)16 * N * dim + (size_t)N * N + (size_t)3 * N * inner + 4096;
+}
+
+void taae_med_block_forward(float *xc, int N, int dim, int H, int hd, int inner,
+                            const taae_block_w *w, const float *rcos, const float *rsin,
+                            const float *mask, int sinusoidal, aria_arena *ar) {
+    size_t mark = aria_arena_save(ar);
+    float *h   = aria_arena_floats(ar, (size_t)N * dim);
+    float *res = aria_arena_floats(ar, (size_t)N * dim);
+    float *qkv = aria_arena_floats(ar, (size_t)N * 5 * dim);
+    float *q  = aria_arena_floats(ar, (size_t)H * N * hd);
+    float *k  = aria_arena_floats(ar, (size_t)H * N * hd);
+    float *v  = aria_arena_floats(ar, (size_t)H * N * hd);
+    float *qd = aria_arena_floats(ar, (size_t)H * N * hd);
+    float *kd = aria_arena_floats(ar, (size_t)H * N * hd);
+    float *ob = aria_arena_floats(ar, (size_t)H * N * hd);
+    float *od = aria_arena_floats(ar, (size_t)H * N * hd);
+    float *merged = aria_arena_floats(ar, (size_t)N * dim);
+    float *o = aria_arena_floats(ar, (size_t)N * dim);
+    float *scores = aria_arena_floats(ar, (size_t)N * N);
+    float *ffs = aria_arena_floats(ar, (size_t)N * 3 * inner);
+
+    /* self-attention (differential): out = attn(q,k,v) - attn(qd,kd,v), banded mask */
+    memcpy(res, xc, (size_t)N * dim * sizeof(float));
+    aria_dynamic_tanh(h, xc, w->pre_alpha, w->pre_gamma, w->pre_beta, N, dim);
+    aria_linear(qkv, h, w->to_qkv, NULL, N, dim, 5 * dim);
+    extract_heads(q,  qkv, N, H, hd, 5 * dim, 0);
+    extract_heads(k,  qkv, N, H, hd, 5 * dim, dim);
+    extract_heads(v,  qkv, N, H, hd, 5 * dim, 2 * dim);
+    extract_heads(qd, qkv, N, H, hd, 5 * dim, 3 * dim);
+    extract_heads(kd, qkv, N, H, hd, 5 * dim, 4 * dim);
+    aria_dynamic_tanh(q,  q,  w->qn_alpha, w->qn_gamma, w->qn_beta, H * N, hd);
+    aria_dynamic_tanh(qd, qd, w->qn_alpha, w->qn_gamma, w->qn_beta, H * N, hd);
+    aria_dynamic_tanh(k,  k,  w->kn_alpha, w->kn_gamma, w->kn_beta, H * N, hd);
+    aria_dynamic_tanh(kd, kd, w->kn_alpha, w->kn_gamma, w->kn_beta, H * N, hd);
+    aria_rope_apply(q,  rcos, rsin, H, N, hd, TAAE_ROT);
+    aria_rope_apply(qd, rcos, rsin, H, N, hd, TAAE_ROT);
+    aria_rope_apply(k,  rcos, rsin, H, N, hd, TAAE_ROT);
+    aria_rope_apply(kd, rcos, rsin, H, N, hd, TAAE_ROT);
+    aria_attention(ob, q,  k,  v, H, N, N, hd, mask, scores);
+    aria_attention(od, qd, kd, v, H, N, N, hd, mask, scores);
+    for (size_t i = 0; i < (size_t)H * N * hd; i++) ob[i] -= od[i];
+    merge_heads(merged, ob, N, H, hd);
+    aria_linear(o, merged, w->to_out, NULL, N, dim, dim);
+    for (size_t i = 0; i < (size_t)N * dim; i++) xc[i] = res[i] + o[i];
+
+    /* feed-forward (GLU): out = value * act(gate), act = SiLU or sin(pi*x) */
+    memcpy(res, xc, (size_t)N * dim * sizeof(float));
+    aria_dynamic_tanh(h, xc, w->ff_alpha, w->ff_gamma, w->ff_beta, N, dim);
+    aria_linear(ffs, h, w->ff_in_w, w->ff_in_b, N, dim, 2 * inner);  /* [N, 2*inner] */
+    float *gated = ffs + (size_t)N * 2 * inner;
+    for (int n = 0; n < N; n++) {
+        const float *pr = ffs + (size_t)n * 2 * inner;
+        float *g = gated + (size_t)n * inner;
+        for (int i = 0; i < inner; i++) {
+            float val = pr[i], gate = pr[inner + i];
+            float a = sinusoidal ? sinf(3.14159265359f * gate) : gate / (1.0f + expf(-gate));
+            g[i] = val * a;
+        }
+    }
+    aria_linear(o, gated, w->ff_out_w, w->ff_out_b, N, inner, dim);
+    for (size_t i = 0; i < (size_t)N * dim; i++) xc[i] = res[i] + o[i];
+
+    aria_arena_restore(ar, mark);
+}
