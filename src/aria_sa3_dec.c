@@ -5,6 +5,9 @@
 #include "aria_sa3_dec.h"
 #include "aria_ops.h"
 #include "aria_arena.h"
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -112,28 +115,38 @@ static void taae_block_forward(float *xc, int N, const taae_block_w *w,
     aria_arena_restore(ar, mark);
 }
 
-/* run 3 blocks over the sequence in S-chunks; shift=1 adds a midpoint-shift halo */
+/* run 3 blocks over the sequence in S-chunks; shift=1 adds a midpoint-shift halo.
+ * Chunks are independent, so they run in parallel -- one arena per worker thread
+ * (the inner ops' OpenMP regions nest serially, so there is no oversubscription). */
 static void chunk_pass(float *x, int L, const taae_block_w *blocks,
-                       const float *rcos, const float *rsin, int shift, aria_arena *ar) {
+                       const float *rcos, const float *rsin, int shift, aria_arena *arenas) {
     const int S = DEC_S, half = S / 2;  /* 17 */
+    float *base = x, *pad = NULL;
+    int n;
     if (!shift) {
-        int n = L / S;
-        for (int c = 0; c < n; c++) {
-            float *chunk = x + (size_t)c * S * DEC_D;
-            for (int b = 0; b < 3; b++) taae_block_forward(chunk, S, &blocks[b], rcos, rsin, ar);
-        }
+        n = L / S;
     } else {
         int Lp = L + S;  /* [x[:17], x, x[-17:]] */
-        float *pad = malloc((size_t)Lp * DEC_D * sizeof(float));
+        pad = malloc((size_t)Lp * DEC_D * sizeof(float));
         memcpy(pad, x, (size_t)half * DEC_D * sizeof(float));
         memcpy(pad + (size_t)half * DEC_D, x, (size_t)L * DEC_D * sizeof(float));
         memcpy(pad + (size_t)(half + L) * DEC_D, x + (size_t)(L - half) * DEC_D,
                (size_t)half * DEC_D * sizeof(float));
-        int n = Lp / S;
-        for (int c = 0; c < n; c++) {
-            float *chunk = pad + (size_t)c * S * DEC_D;
-            for (int b = 0; b < 3; b++) taae_block_forward(chunk, S, &blocks[b], rcos, rsin, ar);
-        }
+        base = pad; n = Lp / S;
+    }
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic)
+    #endif
+    for (int c = 0; c < n; c++) {
+        #ifdef _OPENMP
+        aria_arena *ar = &arenas[omp_get_thread_num()];
+        #else
+        aria_arena *ar = &arenas[0];
+        #endif
+        float *chunk = base + (size_t)c * S * DEC_D;
+        for (int b = 0; b < 3; b++) taae_block_forward(chunk, S, &blocks[b], rcos, rsin, ar);
+    }
+    if (shift) {
         memcpy(x, pad + (size_t)half * DEC_D, (size_t)L * DEC_D * sizeof(float));
         free(pad);
     }
@@ -183,11 +196,16 @@ void aria_sa3_same_decode(const aria_sa3_dec *m, float *dec, const float *z, int
     float rcos[DEC_S * (DEC_ROT / 2)], rsin[DEC_S * (DEC_ROT / 2)];
     aria_rope_freqs(rcos, rsin, DEC_S, DEC_ROT, 10000.0f);
 
-    aria_arena ar;
-    aria_arena_init(&ar, taae_block_arena_bytes());
-    chunk_pass(seq, L, &m->blocks[0], rcos, rsin, 0, &ar);  /* blocks 0,1,2 */
-    chunk_pass(seq, L, &m->blocks[3], rcos, rsin, 1, &ar);  /* blocks 3,4,5 midpoint-shift */
-    aria_arena_free(&ar);
+    int nth = 1;
+    #ifdef _OPENMP
+    nth = omp_get_max_threads();
+    #endif
+    aria_arena *arenas = malloc((size_t)nth * sizeof(aria_arena));
+    for (int i = 0; i < nth; i++) aria_arena_init(&arenas[i], taae_block_arena_bytes());
+    chunk_pass(seq, L, &m->blocks[0], rcos, rsin, 0, arenas);  /* blocks 0,1,2 */
+    chunk_pass(seq, L, &m->blocks[3], rcos, rsin, 1, arenas);  /* blocks 3,4,5 midpoint-shift */
+    for (int i = 0; i < nth; i++) aria_arena_free(&arenas[i]);
+    free(arenas);
 
     /* extract last 16 of each 17-group -> feat[768, Tp*16] */
     int Lout = Tp * 16;
