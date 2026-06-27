@@ -543,7 +543,20 @@ extern "C" aria_cuda_dit *aria_cuda_dit_create(const aria_sa3_dit_view *v) {
     return h;
 }
 
+/* free per-request device buffers (so set_request can be re-called per generation) */
+static void free_request(aria_cuda_dit *h) {
+    if (!h->have_req) return;
+    cudaFree(h->dx); cudaFree(h->dv); cudaFree(h->dgcond);
+    cudaFree(h->rope_cos); cudaFree(h->rope_sin); cudaFree(h->arena.base);
+    if (h->cross_k) for (int b = 0; b < h->depth; b++) cudaFree(h->cross_k[b]);
+    if (h->cross_v) for (int b = 0; b < h->depth; b++) cudaFree(h->cross_v[b]);
+    free(h->cross_k); free(h->cross_v);
+    h->cross_k = h->cross_v = NULL; h->dx = h->dv = h->dgcond = NULL;
+    h->rope_cos = h->rope_sin = NULL; h->arena.base = NULL; h->have_req = 0;
+}
+
 extern "C" void aria_cuda_dit_set_request(aria_cuda_dit *h, const aria_sa3_dit_req_view *rv) {
+    free_request(h);   /* persistent weights, fresh per-request caches */
     int ed = h->ed, C = h->io_ch, S = rv->S, T = rv->T, H = h->H, hd = h->hd, n_cond = rv->n_cond, rh = h->rot / 2;
     h->T = T; h->S = S; h->n_cond = n_cond;
     cudaMalloc(&h->dx, (size_t)C * T * sizeof(float));
@@ -608,12 +621,6 @@ extern "C" void aria_cuda_dit_free(aria_cuda_dit *h) {
         cudaFree(d->ca_to_out); cudaFree(d->ff_in_w); cudaFree(d->ff_out_w);
     }
     free(h->blocks);
-    if (h->have_req) {
-        cudaFree(h->dx); cudaFree(h->dv); cudaFree(h->dgcond);
-        cudaFree(h->rope_cos); cudaFree(h->rope_sin); cudaFree(h->arena.base);
-        if (h->cross_k) for (int b = 0; b < h->depth; b++) cudaFree(h->cross_k[b]);
-        if (h->cross_v) for (int b = 0; b < h->depth; b++) cudaFree(h->cross_v[b]);
-        free(h->cross_k); free(h->cross_v);
-    }
+    free_request(h);
     free(h);
 }

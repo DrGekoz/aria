@@ -21,6 +21,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
+
+/* optional per-stage timing (set ARIA_PROFILE=1) */
+static double sa3_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 
 typedef struct {
     aria_sa3_config cfg;
@@ -34,6 +38,8 @@ typedef struct {
     /* text path (lazily loaded on first text prompt) */
     aria_t5enc *enc;
     aria_tokenizer *tok;
+    /* persistent device DiT (weights uploaded once, reused across generations) */
+    aria_cuda_dit *cdit;
 } sa3_state;
 
 /* Load the T5Gemma encoder + tokenizer on demand (text prompts only). */
@@ -99,6 +105,9 @@ fail:
 static void sa3_unload(void *state) {
     sa3_state *st = state;
     if (!st) return;
+#ifdef ARIA_CUDA
+    if (st->cdit) aria_cuda_dit_free(st->cdit);
+#endif
     aria_sa3_dit_free(st->dit);
     aria_sa3_dec_free(st->dec);
     if (st->enc) aria_t5enc_free(st->enc);
@@ -180,32 +189,42 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     float *sched = malloc((size_t)(steps + 1) * sizeof(float));
     aria_logsnr_schedule(sched, steps, 1.0f, -6.2f, 2000.0f, 1.0f, 2.0f, (float)T);
 
+    int profile = getenv("ARIA_PROFILE") != NULL;
+    double t0 = sa3_now();
     aria_sa3_dit_req *req = aria_sa3_dit_req_begin(st->dit, T, cross, n_cond, sec_emb);
     sa3_dctx dc = { st->dit, req, NULL, NULL, NULL };
 #ifdef ARIA_CUDA
     if (p->device == ARIA_DEVICE_CUDA && aria_cuda_available()) {
-        aria_sa3_dit_view view; aria_sa3_dit_get_view(st->dit, &view);
-        dc.cdit = aria_cuda_dit_create(&view);
-        if (dc.cdit) {
+        if (!st->cdit) {   /* upload weights once; reused across generations */
+            aria_sa3_dit_view view; aria_sa3_dit_get_view(st->dit, &view);
+            st->cdit = aria_cuda_dit_create(&view);
+            if (st->cdit) fprintf(stderr, "[aria] DiT: GPU device-resident (fp16 weights)\n");
+            else fprintf(stderr, "[aria] DiT: GPU unavailable/insufficient VRAM, using CPU\n");
+        }
+        if (st->cdit) {
             aria_sa3_dit_req_view rv; aria_sa3_dit_req_get_view(req, &rv);
-            aria_cuda_dit_set_request(dc.cdit, &rv);
+            aria_cuda_dit_set_request(st->cdit, &rv);
+            dc.cdit = st->cdit;
             dc.global_seconds = rv.global_seconds;
-            dc.gcond = malloc((size_t)6 * view.ed * sizeof(float));
-            fprintf(stderr, "[aria] DiT: GPU device-resident (fp16 weights)\n");
-        } else {
-            fprintf(stderr, "[aria] DiT: GPU unavailable/insufficient VRAM, using CPU\n");
+            dc.gcond = malloc((size_t)6 * st->cfg.embed_dim * sizeof(float));
         }
     }
 #endif
+    double t1 = sa3_now();
     aria_pingpong(x, n, sched, steps, sa3_denoise, &dc, &rng, NULL);
+    double t2 = sa3_now();
 #ifdef ARIA_CUDA
-    if (dc.cdit) { aria_cuda_dit_free(dc.cdit); free(dc.gcond); }
+    free(dc.gcond);   /* the device handle persists on st; only gcond is per-call */
 #endif
     aria_sa3_dit_req_end(req);
 
     /* decode -> interleaved stereo */
     float *audio = malloc((size_t)2 * T * 4096 * sizeof(float));
     aria_sa3_dec_forward(st->dec, audio, x, T);
+    double t3 = sa3_now();
+    if (profile)
+        fprintf(stderr, "[aria] profile: setup=%.2fs dit=%.2fs decode=%.2fs (T=%d steps=%d)\n",
+                t1 - t0, t2 - t1, t3 - t2, T, steps);
     aria_audio *a = aria_audio_alloc(st->sample_rate, 2, (int64_t)T * 4096);
     for (int64_t i = 0; i < (int64_t)T * 4096; i++) {
         a->data[i * 2 + 0] = audio[i];
