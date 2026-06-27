@@ -69,10 +69,12 @@ static void gate_sigmoid(float *y, const float *gate, int S, int dim) {
     }
 }
 
-/* Quantized mirror of a block's big linears, built on load when precision != f32
- * (additive overlay -- the f32 path and the CUDA view are untouched). */
+/* Quantized mirror of a block's per-step GEMMs, built on load when precision != f32
+ * (additive overlay -- the f32 path and the CUDA view are untouched). ca_to_kv is
+ * deliberately left f32: it projects the cross-attention K/V once per request (not
+ * per step), so quantizing it saves no per-step time and only slows the setup. */
 typedef struct {
-    aria_qweight sa_to_qkv, sa_to_out, ca_to_q, ca_to_kv, ca_to_out, ff_in_w, ff_out_w;
+    aria_qweight sa_to_qkv, sa_to_out, ca_to_q, ca_to_out, ff_in_w, ff_out_w;
 } dit_block_q;
 
 /* quant-aware GLU feed-forward (mirrors aria_ff_glu, but the two GEMMs dispatch
@@ -299,9 +301,8 @@ static void dit_free_bq(aria_sa3_dit *m) {
     for (int i = 0; i < m->depth; i++) {
         dit_block_q *q = &m->bq[i];
         aria_qweight_free(&q->sa_to_qkv); aria_qweight_free(&q->sa_to_out);
-        aria_qweight_free(&q->ca_to_q);   aria_qweight_free(&q->ca_to_kv);
-        aria_qweight_free(&q->ca_to_out); aria_qweight_free(&q->ff_in_w);
-        aria_qweight_free(&q->ff_out_w);
+        aria_qweight_free(&q->ca_to_q);   aria_qweight_free(&q->ca_to_out);
+        aria_qweight_free(&q->ff_in_w);   aria_qweight_free(&q->ff_out_w);
     }
     free(m->bq); m->bq = NULL;
 }
@@ -321,7 +322,6 @@ void aria_sa3_dit_quantize(aria_sa3_dit *m, aria_dtype dt) {
         aria_qweight_set(&q->sa_to_qkv, w->sa_to_qkv, 3 * ed, ed, dt);
         aria_qweight_set(&q->sa_to_out, w->sa_to_out, ed, ed, dt);
         aria_qweight_set(&q->ca_to_q,   w->ca_to_q,   ed, ed, dt);
-        aria_qweight_set(&q->ca_to_kv,  w->ca_to_kv,  2 * ed, ed, dt);
         aria_qweight_set(&q->ca_to_out, w->ca_to_out, ed, ed, dt);
         aria_qweight_set(&q->ff_in_w,   w->ff_in_w,   2 * inner, ed, dt);
         aria_qweight_set(&q->ff_out_w,  w->ff_out_w,  ed, inner, dt);
@@ -332,8 +332,8 @@ void aria_sa3_dit_quantize(aria_sa3_dit *m, aria_dtype dt) {
 size_t aria_sa3_dit_weight_bytes(const aria_sa3_dit *m) {
     if (!m) return 0;
     if (!m->bq) {
-        int ed = m->ed, inner = m->inner;
-        size_t per = ((size_t)3 * ed * ed + (size_t)ed * ed + (size_t)ed * ed + (size_t)2 * ed * ed
+        int ed = m->ed, inner = m->inner;   /* the 6 per-step GEMMs (ca_to_kv excluded) */
+        size_t per = ((size_t)3 * ed * ed + (size_t)ed * ed + (size_t)ed * ed
                       + (size_t)ed * ed + (size_t)2 * inner * ed + (size_t)ed * inner) * sizeof(float);
         return per * m->depth;
     }
@@ -341,9 +341,8 @@ size_t aria_sa3_dit_weight_bytes(const aria_sa3_dit *m) {
     for (int i = 0; i < m->depth; i++) {
         const dit_block_q *q = &m->bq[i];
         tot += aria_qweight_bytes(&q->sa_to_qkv) + aria_qweight_bytes(&q->sa_to_out)
-             + aria_qweight_bytes(&q->ca_to_q)   + aria_qweight_bytes(&q->ca_to_kv)
-             + aria_qweight_bytes(&q->ca_to_out) + aria_qweight_bytes(&q->ff_in_w)
-             + aria_qweight_bytes(&q->ff_out_w);
+             + aria_qweight_bytes(&q->ca_to_q)   + aria_qweight_bytes(&q->ca_to_out)
+             + aria_qweight_bytes(&q->ff_in_w)   + aria_qweight_bytes(&q->ff_out_w);
     }
     return tot;
 }
@@ -409,8 +408,7 @@ aria_sa3_dit_req *aria_sa3_dit_req_begin(const aria_sa3_dit *m, int T,
     float *kv = malloc((size_t)n_cond * 2 * dim * sizeof(float));
     for (int b = 0; b < depth; b++) {
         const aria_dit_block_w *w = &m->blocks[b];
-        if (m->bq) aria_linear_qw(kv, r->cross_ed, &m->bq[b].ca_to_kv, NULL, n_cond);
-        else       aria_linear(kv, r->cross_ed, w->ca_to_kv, NULL, n_cond, ed, 2 * dim);
+        aria_linear(kv, r->cross_ed, w->ca_to_kv, NULL, n_cond, ed, 2 * dim);  /* always f32 (once/request) */
         r->cross_k[b] = malloc((size_t)H * n_cond * hd * sizeof(float));
         r->cross_v[b] = malloc((size_t)H * n_cond * hd * sizeof(float));
         extract_heads(r->cross_k[b], kv, n_cond, H, hd, 2 * dim, 0);

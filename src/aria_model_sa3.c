@@ -250,14 +250,43 @@ static int sa3_generate(aria_ctx *ctx, void *state,
 
     int profile = getenv("ARIA_PROFILE") != NULL;
 
-    /* precision: q8/q4 quantize the DiT block GEMMs. On the GPU the weights are
-     * packed in VRAM and dequantized on use; on the CPU an overlay dispatches the
-     * dequant kernels. fp16/bf16 are not yet a distinct CPU format -> fp32 there.
-     * The host-side cross-K/V projection uses the CPU overlay (so it must run
-     * before req_begin), keeping it consistent with the quantized GPU weights. */
+    /* precision: q8/q4 quantize the DiT per-step GEMMs. Decide the backend FIRST so
+     * the host-side per-request work matches it: on the GPU the weights are packed
+     * in VRAM + dequantized there, so the host path stays fp32 (fast); the CPU
+     * dequant overlay is built only when the DiT actually runs on the CPU. fp16/bf16
+     * are not yet a distinct CPU format -> fp32 there. */
     aria_dtype prec = (p->precision == ARIA_Q8 || p->precision == ARIA_Q4) ? p->precision : ARIA_F32;
-    aria_sa3_dit_quantize(st->dit, prec);
     int quant = (prec != ARIA_F32);
+
+    int on_gpu = 0;
+#ifdef ARIA_CUDA
+    /* auto: GPU when it's worth it (sm_70+) and fits; cuda: force any device
+     * (CPU-fallback on OOM); cpu: never. Inpaint stays on the CPU DiT. */
+    int want_gpu = !p->init_audio &&
+                   ((p->device == ARIA_DEVICE_CUDA && aria_cuda_available()) ||
+                    (p->device == ARIA_DEVICE_AUTO && aria_cuda_recommended()));
+    if (want_gpu && !st->cdit) {   /* upload + quantize weights once; reused across gens */
+        aria_sa3_dit_view view; aria_sa3_dit_get_view(st->dit, &view);  /* f32 view (overlay-independent) */
+        st->cdit = aria_cuda_dit_create(&view, prec);
+        const char *how = p->device == ARIA_DEVICE_AUTO ? "auto" : "forced";
+        const char *pn = quant ? aria_dtype_name(prec) : "fp16";
+        if (st->cdit) fprintf(stderr, "[aria] DiT: GPU device-resident, %s (%s)\n", pn, how);
+        else fprintf(stderr, "[aria] DiT: GPU insufficient VRAM, using CPU (%s)\n", how);
+    }
+    on_gpu = want_gpu && st->cdit;
+#endif
+
+    /* CPU dequant overlay only when running on the CPU; the GPU path keeps st->dit
+     * f32 so the host cross-K/V projection (and any CPU fallback) stays fast. */
+    aria_sa3_dit_quantize(st->dit, (quant && !on_gpu) ? prec : ARIA_F32);
+    if (quant && !on_gpu) {
+        static int announced = 0;
+        if (!announced) {
+            fprintf(stderr, "[aria] DiT: %s block weights = %.0f MB (CPU)\n",
+                    aria_dtype_name(prec), aria_sa3_dit_weight_bytes(st->dit) / 1048576.0);
+            announced = 1;
+        }
+    }
 
     double t0 = sa3_now();
     aria_sa3_dit_req *req = aria_sa3_dit_req_begin(st->dit, T, cross, n_cond, sec_emb);
@@ -270,48 +299,19 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     }
     sa3_dctx dc = { st->dit, req, NULL, NULL, NULL };
 #ifdef ARIA_CUDA
-    /* auto: use the GPU only if it's worth it (sm_70+) and fits (create returns NULL
-     * on OOM -> CPU); cuda: force any device (still CPU-fallback on OOM); cpu: never.
-     * Inpaint stays on the CPU DiT -- the device DiT has no local-cond path yet.
-     * Quantized (q8/q4) runs on the GPU: weights packed in VRAM, dequant-on-use. */
-    int want_gpu = !p->init_audio &&
-                   ((p->device == ARIA_DEVICE_CUDA && aria_cuda_available()) ||
-                    (p->device == ARIA_DEVICE_AUTO && aria_cuda_recommended()));
-    if (want_gpu) {
-        if (!st->cdit) {   /* upload weights once; reused across generations */
-            aria_sa3_dit_view view; aria_sa3_dit_get_view(st->dit, &view);
-            st->cdit = aria_cuda_dit_create(&view, prec);
-            const char *how = p->device == ARIA_DEVICE_AUTO ? "auto" : "forced";
-            const char *pn = quant ? aria_dtype_name(prec) : "fp16";
-            if (st->cdit) fprintf(stderr, "[aria] DiT: GPU device-resident, %s (%s)\n", pn, how);
-            else fprintf(stderr, "[aria] DiT: GPU insufficient VRAM, using CPU (%s)\n", how);
-        }
-        if (st->cdit) {
-            aria_sa3_dit_req_view rv; aria_sa3_dit_req_get_view(req, &rv);
-            aria_cuda_dit_set_request(st->cdit, &rv);
-            dc.cdit = st->cdit;
-            dc.global_seconds = rv.global_seconds;
-            dc.gcond = malloc((size_t)6 * st->cfg.embed_dim * sizeof(float));
-            if (!st->cdec) {   /* decode on the GPU too (uploaded once, reused) */
-                aria_sa3_dec_view dv; aria_sa3_dec_get_view(st->dec, &dv);
-                st->cdec = aria_cuda_dec_create(&dv);
-                if (st->cdec) fprintf(stderr, "[aria] decoder: GPU device-resident, fp16\n");
-            }
+    if (on_gpu) {
+        aria_sa3_dit_req_view rv; aria_sa3_dit_req_get_view(req, &rv);
+        aria_cuda_dit_set_request(st->cdit, &rv);
+        dc.cdit = st->cdit;
+        dc.global_seconds = rv.global_seconds;
+        dc.gcond = malloc((size_t)6 * st->cfg.embed_dim * sizeof(float));
+        if (!st->cdec) {   /* decode on the GPU too (uploaded once, reused) */
+            aria_sa3_dec_view dv; aria_sa3_dec_get_view(st->dec, &dv);
+            st->cdec = aria_cuda_dec_create(&dv);
+            if (st->cdec) fprintf(stderr, "[aria] decoder: GPU device-resident, fp16\n");
         }
     }
 #endif
-    int on_gpu = 0;
-#ifdef ARIA_CUDA
-    on_gpu = (dc.cdit != NULL);
-#endif
-    if (quant && !on_gpu) {
-        static int announced = 0;
-        if (!announced) {
-            fprintf(stderr, "[aria] DiT: %s block weights = %.0f MB (CPU)\n",
-                    aria_dtype_name(prec), aria_sa3_dit_weight_bytes(st->dit) / 1048576.0);
-            announced = 1;
-        }
-    }
     double t1 = sa3_now();
     aria_pingpong(x, n, sched, steps, sa3_denoise, &dc, &rng, NULL);
     double t2 = sa3_now();
