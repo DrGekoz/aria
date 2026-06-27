@@ -7,6 +7,7 @@
 #include "aria_sa3.h"
 #include "aria_sa3_dit.h"
 #include "aria_sa3_dec.h"
+#include "aria_sa3_enc.h"
 #include "aria_t5enc.h"
 #include "aria_tokenizer.h"
 #include "aria_sampler.h"
@@ -31,6 +32,7 @@ typedef struct {
     aria_sa3_config cfg;
     aria_sa3_dit *dit;
     aria_sa3_dec *dec;
+    aria_sa3_enc *enc_taae;   /* taae encoder, lazily loaded for continue/inpaint */
     /* seconds_total NumberConditioner (borrowed from the mmap) */
     const float *sec_w;  /* [768,256] */
     const float *sec_b;  /* [768] */
@@ -113,6 +115,7 @@ static void sa3_unload(void *state) {
 #endif
     aria_sa3_dit_free(st->dit);
     aria_sa3_dec_free(st->dec);
+    if (st->enc_taae) aria_sa3_enc_free(st->enc_taae);
     if (st->enc) aria_t5enc_free(st->enc);
     if (st->tok) aria_tokenizer_free(st->tok);
     free(st);   /* sec_w/sec_b are borrowed from the mmap */
@@ -137,6 +140,59 @@ static void sa3_denoise(void *c, const float *x, float t, float *v, int n) {
     }
 #endif
     aria_sa3_dit_step(d->dit, d->req, v, x, t);
+}
+
+/* Build the local-additive inpaint conditioning for a continue/inpaint request:
+ * read + prepare the init clip (channel-major [2, T*4096], 44.1 kHz, pad/crop),
+ * encode it to a latent, build the keep/regenerate mask, and assemble
+ * local[T,257] = [mask | latent*mask]. Returns a malloc'd [T*257] buffer (caller
+ * frees), or NULL on error. Matches inference/generation.py's inpaint path. */
+static float *sa3_build_inpaint_local(aria_ctx *ctx, sa3_state *st,
+                                      const aria_gen_params *p, int T) {
+    int audio_len = T * 4096;
+    aria_audio *a = aria_wav_read(p->init_audio);
+    if (!a) { aria_set_error("inpaint: cannot read %s", p->init_audio); return NULL; }
+    if (a->sample_rate != st->sample_rate) {
+        aria_set_error("inpaint: %s is %d Hz but the model is %d Hz "
+                       "(resampling is not supported yet; resample to %d Hz first)",
+                       p->init_audio, a->sample_rate, st->sample_rate, st->sample_rate);
+        aria_audio_free(a); return NULL;
+    }
+    int clip = (int)(a->num_frames < audio_len ? a->num_frames : audio_len);
+    float *audio = malloc((size_t)2 * audio_len * sizeof(float));   /* channel-major */
+    for (int c = 0; c < 2; c++) {
+        int sc = (a->channels == 1) ? 0 : (c < a->channels ? c : a->channels - 1);
+        for (int t = 0; t < audio_len; t++)
+            audio[(size_t)c * audio_len + t] =
+                (t < clip) ? a->data[(size_t)t * a->channels + sc] : 0.0f;
+    }
+    aria_audio_free(a);
+
+    if (!st->enc_taae) st->enc_taae = aria_sa3_enc_load(ctx->sf);
+    if (!st->enc_taae) { aria_set_error("inpaint: taae encoder load failed"); free(audio); return NULL; }
+    float *latent = malloc((size_t)256 * T * sizeof(float));
+    aria_sa3_enc_forward(st->enc_taae, latent, audio, audio_len);
+    free(audio);
+
+    /* keep/regenerate mask (1=keep, 0=regenerate). continue: regenerate the tail. */
+    float from_s = p->inpaint_continue ? (float)clip / st->sample_rate : p->inpaint_from_s;
+    float to_s   = p->inpaint_continue ? p->seconds_total
+                 : (p->inpaint_to_s > 0 ? p->inpaint_to_s : p->seconds_total);
+    int from = (int)(from_s * st->sample_rate), to = (int)(to_s * st->sample_rate);
+    if (from < 0) from = 0;
+    if (from > audio_len) from = audio_len;
+    if (to < from) to = from;
+    if (to > audio_len) to = audio_len;
+    float *mask_audio = malloc((size_t)audio_len * sizeof(float));
+    for (int i = 0; i < audio_len; i++) mask_audio[i] = (i >= from && i < to) ? 0.0f : 1.0f;
+
+    float *mask_lat = malloc((size_t)T * sizeof(float));
+    aria_inpaint_mask_latent(mask_lat, mask_audio, audio_len, T);
+    float *local = malloc((size_t)T * 257 * sizeof(float));
+    aria_inpaint_local_cond(local, latent, mask_lat, T);
+
+    free(latent); free(mask_audio); free(mask_lat);
+    return local;
 }
 
 static int sa3_generate(aria_ctx *ctx, void *state,
@@ -195,12 +251,21 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     int profile = getenv("ARIA_PROFILE") != NULL;
     double t0 = sa3_now();
     aria_sa3_dit_req *req = aria_sa3_dit_req_begin(st->dit, T, cross, n_cond, sec_emb);
+    /* continue / inpaint: build + attach the local-additive conditioning (E7). */
+    if (p->init_audio) {
+        float *local_TC = sa3_build_inpaint_local(ctx, st, p, T);
+        if (!local_TC) { aria_sa3_dit_req_end(req); free(cross); free(x); free(sched); return -1; }
+        aria_sa3_dit_req_set_local(req, local_TC, T, 257);  /* projected once, then owned by req */
+        free(local_TC);
+    }
     sa3_dctx dc = { st->dit, req, NULL, NULL, NULL };
 #ifdef ARIA_CUDA
     /* auto: use the GPU only if it's worth it (sm_70+) and fits (create returns NULL
-     * on OOM -> CPU); cuda: force any device (still CPU-fallback on OOM); cpu: never. */
-    int want_gpu = (p->device == ARIA_DEVICE_CUDA && aria_cuda_available()) ||
-                   (p->device == ARIA_DEVICE_AUTO && aria_cuda_recommended());
+     * on OOM -> CPU); cuda: force any device (still CPU-fallback on OOM); cpu: never.
+     * Inpaint stays on the CPU DiT -- the device DiT has no local-cond path yet. */
+    int want_gpu = !p->init_audio &&
+                   ((p->device == ARIA_DEVICE_CUDA && aria_cuda_available()) ||
+                    (p->device == ARIA_DEVICE_AUTO && aria_cuda_recommended()));
     if (want_gpu) {
         if (!st->cdit) {   /* upload weights once; reused across generations */
             aria_sa3_dit_view view; aria_sa3_dit_get_view(st->dit, &view);

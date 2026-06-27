@@ -20,7 +20,7 @@ int8/q4 quantization, as a library + CLI — all parity-gated.
 |----|-----------|-----------|
 | **M1** ✅ | First audio: `text→audio` (precomputed embeddings + injected noise) matches Python | E6.4 |
 | **M2** ✅ | Self-contained text: T5Gemma encoder in C | E3.4 + E3.5 |
-| **M3** | continue / inpaint working | E7.4 |
+| **M3** ✅ | continue / inpaint working | E7.4 |
 | **M4** ✅ | CUDA end-to-end generation | E8.5 |
 | **M5** | Quantized (Q4) — medium fits low VRAM | E9.4 |
 | **M6** | medium model end-to-end | E10.2 |
@@ -29,13 +29,14 @@ int8/q4 quantization, as a library + CLI — all parity-gated.
 
 ## Status snapshot
 
-Milestones **M1, M2, M4** reached. Done: **E0–E6** (full `text→audio` pipeline:
-conditioning, DiT, taae decoder, T5Gemma encoder + tokenizer, sampler, end-to-end —
-all parity-verified), **E2.9/E2.9b** (CPU AVX2 GEMM + arena/KV-cache), **E8.1–E8.5b**
-(CUDA backend + device-resident DiT + GPU perf pass: 3070 warm 1.28 s), **E13.3**
+Milestones **M1, M2, M3, M4** reached. Done: **E0–E7** (full `text→audio` **+
+continue/inpaint** pipeline: conditioning, DiT, taae decoder **+ encoder**, T5Gemma
+encoder + tokenizer, sampler, inpaint local-cond, end-to-end — all parity-verified),
+**E2.9/E2.9b** (CPU AVX2 GEMM + arena/KV-cache), **E8.1–E8.5d** (CUDA backend +
+device-resident DiT/decoder + profile-guided kernels: 3070 warm 0.29 s), **E13.3**
 (concurrency-clean arenas). Build + hermetic + parity all green. Full snapshot in
-[STATUS.md](STATUS.md). Open: continue/inpaint (E7), precision/quant (E9), medium
-(E10), release polish (E11), steering (E12), batch APIs (E13.1/2).
+[STATUS.md](STATUS.md). Open: precision/quant (E9), medium (E10), release polish
+(E11), steering (E12), batch APIs (E13.1/2), GPU inpaint local-cond (E8.5e-adjacent).
 
 ## Critical path to M1 (first audio) — ✅ reached
 
@@ -117,7 +118,7 @@ quant), **E8.5c** (GPU decoder), **E10** (medium), **E12** (steering).
 - ✅ **E7.1** **P1** taae_v2 encoder (audio→latent): patchify (256-sample) → SAME encoder (pad to mult 32, WNConv1d mapping 512→768 k1, group-16 + 1 learned new_token → 17, two chunked S=34 transformer halves [0-2 unshifted, 3-5 midpoint-shift], take last of each 17-group, Linear 768→256) → softnorm fwd (`(x·scaling_factor + bias)/running_std`). The differential-attention block + chunk pass are now shared with the decoder via `aria_taae.{c,h}` (extracted; `test_dec` unchanged at 1.4e-4). Verify: staged `test_enc` parity vs `pretransform.encode` — patchify/softnorm exact, SAME encoder 8.9e-5, full encode 9e-4, zero-pad path 1.8e-2 (0.1% rel, softnorm-amplified). deps: E5.3, E2.7.
 - ✅ **E7.2** **P1** Inpaint mask build. `aria_inpaint_mask_latent` nearest-interps an audio-space mask (1=keep, 0=inpaint) to latent length (`mask_lat[t]=mask_audio[(t·audio_len)/T]`, matching torch `F.interpolate(mode='nearest')`); `aria_inpaint_local_cond` builds `local[T,257] = [mask | latent·mask]` (channel 0 = mask, 1..256 = masked_input), matching generation.py. deps: E7.1 · Verify: `test_inpaint` mask/local_cond parity — both **exact (0.0)**.
 - ✅ **E7.3** **P1** Local-additive cond live in DiT (E1.6 hook with a real mask). The DiT velocity with a live `local_add_cond` (built by E7.2) matches `dit._forward(..., local_add_cond=real)` at **2.8e-4** (max|ref| 63.7). deps: E1.6, E4.3, E7.2 · Verify: `test_inpaint` dit_velocity parity.
-- ⬜ **E7.4** **P1** `aria_continue` + `aria_inpaint` API + CLI (`--continue` / `--inpaint --from --to`) + init-noise blend. deps: E7.1–7.3, E6.4 · Verify: kept regions preserved, masked changes; parity vs `generate_diffusion_cond_inpaint`. **← M3**
+- ✅ **E7.4** **P1** continue/inpaint orchestration + CLI. `aria_gen_params` gains `init_audio` + `inpaint_from_s/to_s` + `inpaint_continue`; `sa3_generate` reads+prepares the clip (channel-major, pad/crop, 44.1 kHz), encodes it (E7.1), builds the keep/regenerate mask + local cond (E7.2), attaches it to the request (E7.3), and runs the normal pingpong+decode (pure-noise start). CLI: `--continue <wav>` (regenerate the tail) / `--inpaint <wav> --from <s> --to <s>` (regenerate a region). Inpaint runs on the CPU DiT (the device DiT has no local-cond path yet — follow-up). Verify: `test_inpaint_e2e` end-to-end parity vs the injected-noise PyTorch inpaint — **latent 6.6e-4, audio 2.4e-4**; CLI smoke (base→continue→inpaint) preserves kept regions (continue kept-L1 0.008; inpaint outside-mask 0.004 vs inside-mask 0.014). deps: E7.1–7.3, E6.4. **← M3**
 
 ## E8 — CUDA backend (parallelizable track)
 

@@ -31,8 +31,11 @@ static void usage(const char *prog) {
         "  %s -m <dir> -p \"prompt\" -d <seconds> -s <steps> --seed <n> [--device auto|cpu|cuda] -o out.wav\n"
         "  %s -m <dir> --uncond -d <seconds> -o out.wav\n"
         "  %s -m <dir> --prompt-embed <prompt.atns> -d <seconds> -o out.wav\n"
-        "    --device auto (default) runs the DiT device-resident on the GPU when one fits, else CPU\n",
-        prog, prog, prog, prog, prog, prog);
+        "  %s -m <dir> -p \"prompt\" -d <total> --continue <in.wav> -o out.wav   (extend a clip)\n"
+        "  %s -m <dir> -p \"prompt\" --inpaint <in.wav> --from <s> --to <s> -o out.wav  (regenerate a region)\n"
+        "    --device auto (default) runs the DiT device-resident on the GPU when one fits, else CPU\n"
+        "    --continue/--inpaint run on the CPU DiT; the init WAV must be at the model sample rate\n",
+        prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 static int cmd_wav_roundtrip(const char *in, const char *out) {
@@ -68,6 +71,9 @@ int main(int argc, char **argv) {
     long long seed = -1;
     aria_device device = ARIA_DEVICE_AUTO;
     int bench = 1;   /* --bench N: generate N times (model resident) for warm timing */
+    const char *init_audio = NULL;          /* continue / inpaint source WAV */
+    float inpaint_from = 0.0f, inpaint_to = 0.0f;
+    int inpaint_continue = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--wav-roundtrip") == 0 && i + 2 < argc) {
@@ -100,6 +106,14 @@ int main(int argc, char **argv) {
             else device = ARIA_DEVICE_AUTO;
         } else if (strcmp(argv[i], "--bench") == 0 && i + 1 < argc) {
             bench = atoi(argv[++i]); if (bench < 1) bench = 1;
+        } else if (strcmp(argv[i], "--inpaint") == 0 && i + 1 < argc) {
+            init_audio = argv[++i]; do_generate = 1;
+        } else if (strcmp(argv[i], "--continue") == 0 && i + 1 < argc) {
+            init_audio = argv[++i]; inpaint_continue = 1; do_generate = 1;
+        } else if (strcmp(argv[i], "--from") == 0 && i + 1 < argc) {
+            inpaint_from = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--to") == 0 && i + 1 < argc) {
+            inpaint_to = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]); return 0;
         } else {
@@ -128,6 +142,10 @@ int main(int argc, char **argv) {
         p.steps = steps;
         p.seed = seed;
         p.device = device;
+        p.init_audio = init_audio;
+        p.inpaint_from_s = inpaint_from;
+        p.inpaint_to_s = inpaint_to;
+        p.inpaint_continue = inpaint_continue;
         double best = 1e9;
         for (int b = 0; b < bench && rc == 0; b++) {
             aria_audio *audio = NULL;

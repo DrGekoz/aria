@@ -454,6 +454,77 @@ def dump_e2e(model_dir, out_dir):
     print(f"dumped end-to-end reference to {d} (T={T}, steps={steps})")
 
 
+def dump_inpaint_e2e(model_dir, out_dir):
+    """End-to-end inpaint (continue-style): encode a prepared init clip -> latent,
+    build the local-additive cond (keep first half, regenerate second half), then
+    pingpong(DiT denoiser with local_add_cond) from pure noise with injected
+    per-step noise -> latent -> decode -> audio. Unconditional (zero cross/global)
+    like dump_e2e. Validates the full E7.1-E7.4 inpaint chain in C."""
+    from stable_audio_tools.models.dit import DiffusionTransformer
+    from stable_audio_tools.inference.sampling import build_schedule, LogSNRShift
+    from safetensors.torch import load_file
+    from torch.nn.functional import interpolate
+
+    cfg = json.load(open(os.path.join(model_dir, "model_config.json")))
+    dcfg = cfg["model"]["diffusion"]["config"]
+    objective = cfg["model"]["diffusion"].get("diffusion_objective", "rf_denoiser")
+    dit = DiffusionTransformer(diffusion_objective=objective, **dcfg).eval()
+    sd = load_file(os.path.join(model_dir, "model.safetensors"))
+    dit.load_state_dict({k[len("model.model."):]: v for k, v in sd.items()
+                         if k.startswith("model.model.")}, strict=False)
+    ae = _load_decoder_ae(model_dir)
+
+    torch.manual_seed(13)
+    T, steps = 16, 8
+    audio_len = T * 4096
+    init_audio = torch.randn(1, 2, audio_len) * 0.3        # prepared init clip stand-in
+    cross = torch.zeros(1, 257, 768)
+    glob = torch.zeros(1, 768)
+    init_noise = torch.randn(1, 256, T)
+    step_noise = torch.randn(steps, 256, T)
+    shift = LogSNRShift(anchor_length=2000, anchor_logsnr=-6.2, rate=1.0, logsnr_end=2.0)
+    sched = build_schedule(steps=steps, sigma_max=1.0, dist_shift=shift, effective_seq_len=T)
+
+    # continue-style mask: keep [0, audio_len/2) (=1), regenerate the rest (=0)
+    mask_audio = torch.ones(1, audio_len)
+    mask_audio[:, audio_len // 2:] = 0.0
+
+    orig = torch.randn_like
+    torch.randn_like = lambda x, *a, **k: torch.zeros_like(x)
+    try:
+        with torch.no_grad():
+            init_latent = ae.bottleneck.encode(ae.encoder(ae.pretransform.encode(init_audio)))
+            mask_lat = interpolate(mask_audio.unsqueeze(1), size=T, mode='nearest').squeeze(1)
+            masked_input = init_latent * mask_lat.unsqueeze(1)
+            local = torch.cat([mask_lat.unsqueeze(1), masked_input], dim=1)   # [1,257,T]
+
+            x = init_noise.clone()
+            for i in range(steps):
+                tc = sched[i].item(); tn = sched[i + 1].item()
+                v = dit._forward(x, torch.tensor([tc]), cross_attn_cond=cross,
+                                 global_embed=glob, local_add_cond=local)
+                denoised = x - tc * v
+                x = (1 - tn) * denoised + tn * step_noise[i:i + 1]
+            latent = x
+            audio = ae.pretransform.decode(ae.decoder(ae.bottleneck.decode(latent)))
+    finally:
+        torch.randn_like = orig
+
+    d = os.path.join(out_dir, "inpaint_e2e")
+    os.makedirs(d, exist_ok=True)
+    save_atns(os.path.join(d, "init_audio.atns"), init_audio.squeeze(0).float().cpu().numpy())   # [2,audio_len]
+    save_atns(os.path.join(d, "init_latent.atns"), init_latent.squeeze(0).float().cpu().numpy())  # [256,T]
+    save_atns(os.path.join(d, "mask_audio.atns"), mask_audio.squeeze(0).float().cpu().numpy())    # [audio_len]
+    save_atns(os.path.join(d, "cross.atns"), cross.squeeze(0).float().cpu().numpy())
+    save_atns(os.path.join(d, "global.atns"), glob.squeeze(0).float().cpu().numpy())
+    save_atns(os.path.join(d, "init_noise.atns"), init_noise.squeeze(0).float().cpu().numpy())
+    save_atns(os.path.join(d, "step_noise.atns"), step_noise.float().cpu().numpy())
+    save_atns(os.path.join(d, "sched.atns"), sched.float().cpu().numpy())
+    save_atns(os.path.join(d, "latent.atns"), latent.squeeze(0).float().cpu().numpy())
+    save_atns(os.path.join(d, "audio.atns"), audio.squeeze(0).float().cpu().numpy())
+    print(f"dumped end-to-end inpaint reference to {d} (T={T}, steps={steps}, keep first half)")
+
+
 def dump_t5enc(model_dir, out_dir):
     """T5Gemma encoder reference via the real T5GemmaConditioner: dump token ids,
     pre-padding last_hidden, and final (post learned-padding) [256,768]."""
@@ -498,5 +569,6 @@ if __name__ == "__main__":
     dump_decoder(model_dir, out_dir)
     dump_encoder(model_dir, out_dir)
     dump_inpaint(model_dir, out_dir)
+    dump_inpaint_e2e(model_dir, out_dir)
     dump_e2e(model_dir, out_dir)
     dump_t5enc(model_dir, out_dir)
