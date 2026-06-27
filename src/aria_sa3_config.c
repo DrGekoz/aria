@@ -58,8 +58,9 @@ int aria_sa3_parse_config(const char *json, aria_sa3_config *cfg) {
         char buf[16];
         if (aria_json_get_string_in(ak0, ak1, "qk_norm", buf, sizeof(buf)) == 0)
             cfg->qk_norm_rms = (strcmp(buf, "rms") == 0);
-        if (aria_json_get_number_in(ak0, ak1, "differential", &v) == 0)
-            cfg->differential_attn = (v != 0.0);
+        int db;
+        if (aria_json_get_bool_in(ak0, ak1, "differential", &db) == 0)  /* JSON true/false */
+            cfg->differential_attn = db;
     }
 
     /* ---- pretransform.config ---- */

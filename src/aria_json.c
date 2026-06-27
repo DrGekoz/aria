@@ -76,6 +76,14 @@ int aria_json_get_number_in(const char *start, const char *end, const char *key,
     return 0;
 }
 
+int aria_json_get_bool_in(const char *start, const char *end, const char *key, int *out) {
+    const char *v = find_key_b(start, end, key);
+    if (!v) return -1;
+    if (*v == 't' || *v == '1') { *out = 1; return 0; }
+    if (*v == 'f' || *v == '0') { *out = 0; return 0; }
+    return -1;
+}
+
 int aria_json_get_string_in(const char *start, const char *end, const char *key,
                             char *out, size_t outlen) {
     const char *v = find_key_b(start, end, key);

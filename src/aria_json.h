@@ -31,5 +31,7 @@ int aria_json_object(const char *start, const char *end, const char *key,
 int aria_json_get_number_in(const char *start, const char *end, const char *key, double *out);
 int aria_json_get_string_in(const char *start, const char *end, const char *key,
                             char *out, size_t outlen);
+/* Find "key": true/false (or 1/0) -> *out (0/1). Returns 0 on success. */
+int aria_json_get_bool_in(const char *start, const char *end, const char *key, int *out);
 
 #endif /* ARIA_JSON_H */
