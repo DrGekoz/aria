@@ -29,6 +29,7 @@ LIB_SRCS := \
   $(SRC)/aria_sa3_dit.c \
   $(SRC)/aria_taae.c \
   $(SRC)/aria_sa3_dec.c \
+  $(SRC)/aria_sa3_dec_medium.c \
   $(SRC)/aria_sa3_enc.c \
   $(SRC)/aria_t5enc.c \
   $(SRC)/aria_tokenizer.c \

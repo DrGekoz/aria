@@ -26,6 +26,14 @@ typedef struct aria_sa3_dec aria_sa3_dec;
 aria_sa3_dec *aria_sa3_dec_load(safetensors_file_t *sf);
 void aria_sa3_dec_free(aria_sa3_dec *m);
 
+/* ---- MEDIUM model decoder (taae_v2 dim 1536/depth 12, sliding-window + sin FF) ----
+ * Separate path because medium's resampling differs structurally from small-music's
+ * (full-sequence banded attention, no chunk halo). See aria_sa3_dec_medium.c. */
+typedef struct aria_sa3_dec_medium aria_sa3_dec_medium;
+aria_sa3_dec_medium *aria_sa3_dec_medium_load(safetensors_file_t *sf);
+void aria_sa3_dec_medium_free(aria_sa3_dec_medium *m);
+void aria_sa3_dec_medium_forward(const aria_sa3_dec_medium *m, float *audio, const float *latent, int T);
+
 /* full decode: latent[256,T] -> out_audio[2, T*4096] (caller allocates). */
 void aria_sa3_dec_forward(const aria_sa3_dec *m, float *out_audio, const float *latent, int T);
 
