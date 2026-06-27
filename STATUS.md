@@ -10,7 +10,7 @@ A from-scratch, dependency-free **C runtime for Stable Audio 3 (small-music)**: 
 **text → audio** inference **+ continue/inpaint**, parity-verified against PyTorch/`stable-audio-tools`,
 on **CPU** (AVX2/FMA + OpenMP) and **CUDA** (device-resident DiT, cuBLAS tensor-core GEMMs).
 Milestones **M1 (end-to-end), M2 (self-contained text), M3 (continue/inpaint), M4 (CUDA
-generation)** reached.
+generation), M5 (Q4 quantization — medium fits low VRAM)** reached.
 
 ## What works (verified end-to-end)
 
@@ -71,7 +71,12 @@ near q8 — at 300 MB (4.8×, still smaller than q8). `test_quant`
 (hermetic) + `test_quant_dit` (model-level, 13 % gate) gate it. **On the GPU (E9.4)** `--precision
 q8|q4` keeps the DiT block weights **packed in VRAM** and dequantizes on use into a reused fp16
 scratch before the tensor-core GEMM, so resident VRAM shrinks — the path that lets medium fit.
-Verified: GPU q4 is finite and matches the CPU q4 path (1.06 % rel-RMS, fp16-dequant level). **Caveat:** CPU quant is a *footprint* win, not
+Verified: GPU q4 is finite and matches the CPU q4 path (1.06 % rel-RMS, fp16-dequant level).
+**Offline packing (E9.2):** `make quantize` → `aria-quantize <model> <out.aria> [q8|q4]` writes a
+packed DiT overlay; `aria --load-quant <out.aria>` loads it (bit-identical to on-the-fly, md5-checked).
+**Medium fit (M5):** the medium model (embed 1536, depth 24) loads + runs + **fits** on the RTX 3070
+at q4 (GPU 2.84 GB fp16 → **1.91 GB q4**); the infra/quantization handle its scale. A *correct*
+medium run still needs differential DiT attention (E4.5 → M6) — medium's `to_qkv` is `[5·ed,ed]`. **Caveat:** CPU quant is a *footprint* win, not
 speed (scalar dequant GEMM ~6–8× slower than the AVX2 f32 kernel); the GPU speed win wants tensor
 cores (RTX 3070, sm_86 — bench there). fp16/bf16 fall back to fp32/fp16 for now.
 
@@ -96,7 +101,7 @@ cores (RTX 3070, sm_86 — bench there). fp16/bf16 fall back to fp32/fp16 for no
 | **M2** self-contained text (T5Gemma encoder in C) | ✅ |
 | **M3** continue / inpaint | ✅ |
 | **M4** CUDA end-to-end generation | ✅ |
-| M5 quantized (Q4) | ⬜ |
+| **M5** quantized (Q4) — medium fits low VRAM | ✅ |
 | M6 medium model | ⬜ |
 | M7 steering (TasteSteer) | ⬜ |
 
@@ -113,8 +118,8 @@ cores (RTX 3070, sm_86 — bench there). fp16/bf16 fall back to fp32/fp16 for no
 | **E6** Sampler + end-to-end | ✅ (E6.5 ⬜) | LogSNR + xoshiro + pingpong + e2e WAV; CFG/`--cfg` flag ⬜ (base-checkpoint only) |
 | **E7** continue / inpaint | ✅ | taae **encoder** (parity 9e-4), inpaint mask + local-add cond (exact), `--continue`/`--inpaint`, e2e parity (audio 2.4e-4); CPU DiT (GPU local-cond ⬜) |
 | **E8** CUDA backend | ✅ E8.1–E8.5d · ⬜ E8.5e/E8.6 | scaffold, all op kernels, device-resident **DiT + decoder**, profile-guided kernels (4.73→**0.29 s** warm — **on par with / ahead of PyTorch**); last micro-opts (E8.5e) + SSD streaming ⬜ |
-| **E9** Precision & Quantization | 🟡 E9.0/E9.1 · 🟡 E9.3 · ✅ E9.4 | `aria_quant` (Q8/Q4 pack + dequant GEMM) + `--precision` seam wired into the DiT on **CPU and GPU**; q8 usable (3.1 % velocity, 4× smaller), q4 coarse; **GPU keeps weights packed in VRAM, dequant-on-use** (fp16 1.73 → q8 1.40 → q4 1.25 GB; lets medium fit). ⬜ q4 fidelity, E9.2 `aria-quantize` tool |
-| **E10** medium model | ⬜ | embed 1536 / depth 24 / differential DiT attn |
+| **E9** Precision & Quantization | ✅ E9.1–E9.4 · 🟡 E9.0 | `aria_quant` (Q8/Q4 pack + dequant GEMM) + `--precision` seam on **CPU and GPU**; q8 2.45 %, **q4 fidelity-tuned to 9.3 %** (asym int4 + Q8 attention); GPU packs weights in VRAM (dequant-on-use); offline **`aria-quantize`** + `--load-quant`. **M5 reached** (medium fits the 3070 at q4). 🟡 E9.0 fp16/bf16 CPU storage still falls back to fp32 |
+| **E10** medium model | 🟡 E10.1 | medium loads/runs/**fits** on the 3070 at q4 (1.91 GB); correct run needs differential DiT attn (E4.5 → M6) |
 | **E11** Release polish (v1.0.0) | ⬜ | API/install finalize, CLI UX, Philox RNG, docs, CI |
 | **E12** Steering (TasteSteer) | ⬜ | latent / DiT-residual / cond-space hooks + `--steer` |
 | **E13** Batch / server | ✅ E13.3 · ⬜ E13.1/2 | enc/dec arena done (concurrency-clean); request-parallel + batched-forward APIs ⬜ |

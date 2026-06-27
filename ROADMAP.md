@@ -22,21 +22,22 @@ int8/q4 quantization, as a library + CLI — all parity-gated.
 | **M2** ✅ | Self-contained text: T5Gemma encoder in C | E3.4 + E3.5 |
 | **M3** ✅ | continue / inpaint working | E7.4 |
 | **M4** ✅ | CUDA end-to-end generation | E8.5 |
-| **M5** 🟡 | Quantized (Q4) — medium fits low VRAM | E9.4 |  ← mechanism done (CPU+GPU Q8/Q4); q4 fidelity tuning + medium (E10) remain |
+| **M5** ✅ | Quantized (Q4) — medium fits low VRAM | E9.4 |  ← Q4 mechanism (CPU+GPU), fidelity-tuned (9.3%), offline `aria-quantize`; medium loads/runs/**fits** on the 3070 at q4 (1.91 GB). A *correct* medium run needs differential DiT attn (E4.5 → M6). |
 | **M6** | medium model end-to-end | E10.2 |
 | **M7** | Steering (TasteSteer): latent + DiT-residual + cond-space injection, training-free | E12.7 |
 | **v1.0.0** | Release checklist green | E11.7 |
 
 ## Status snapshot
 
-Milestones **M1, M2, M3, M4** reached. Done: **E0–E7** (full `text→audio` **+
-continue/inpaint** pipeline: conditioning, DiT, taae decoder **+ encoder**, T5Gemma
-encoder + tokenizer, sampler, inpaint local-cond, end-to-end — all parity-verified),
-**E2.9/E2.9b** (CPU AVX2 GEMM + arena/KV-cache), **E8.1–E8.5d** (CUDA backend +
-device-resident DiT/decoder + profile-guided kernels: 3070 warm 0.29 s), **E13.3**
-(concurrency-clean arenas). Build + hermetic + parity all green. Full snapshot in
-[STATUS.md](STATUS.md). Open: precision/quant (E9), medium (E10), release polish
-(E11), steering (E12), batch APIs (E13.1/2), GPU inpaint local-cond (E8.5e-adjacent).
+Milestones **M1, M2, M3, M4, M5** reached. Done: **E0–E7** (full `text→audio` **+
+continue/inpaint** pipeline — all parity-verified), **E2.9/E2.9b** (CPU AVX2 GEMM +
+arena/KV-cache), **E8.1–E8.5d** (CUDA backend + device-resident DiT/decoder +
+profile-guided kernels: 3070 warm 0.29 s), **E9.0–E9.4** (precision/quant: `--precision`
+fp32/q8/q4 on CPU+GPU, **fidelity-tuned q4 9.3 %**, offline `aria-quantize`, GPU
+dequant-on-use — medium fits the 3070 at q4), **E13.3** (concurrency-clean arenas).
+Build + hermetic + parity all green. Full snapshot in [STATUS.md](STATUS.md). Open:
+**E4.5/E10** (differential DiT attn → correct medium, M6), release polish (E11),
+steering (E12), batch APIs (E13.1/2), GPU inpaint local-cond (E8.5e-adjacent).
 
 ## Critical path to M1 (first audio) — ✅ reached
 
@@ -143,7 +144,7 @@ quant), **E8.5c** (GPU decoder), **E10** (medium), **E12** (steering).
 
 ## E10 — medium model
 
-- ⬜ **E10.1** **P1** Load medium config/weights (embed 1536, depth 24, heads 24) + SAME-L decoder. deps: E4.4, E5.4 · Verify: tensors/shapes.
+- 🟡 **E10.1** **P1** Load medium config/weights (embed 1536, depth 24, heads 24) + SAME-L decoder. deps: E4.4, E5.4 · Verify: tensors/shapes. **Partial:** aria already parses the medium config and loads/runs it end-to-end on the GPU (the loader is dim-driven; q8/q4 quantize + upload + decode all handle medium's scale — verified on the RTX 3070: fp16 2.84 GB → **q4 1.91 GB**, fits comfortably). But the run is **not numerically correct**: medium's DiT uses **differential attention** (`self_attn.to_qkv` is `[5·ed,ed]`, `cross_attn.to_q` `[2·ed]`, `to_kv` `[3·ed]` + `lambda_*`), and aria currently runs standard attention on the first `3·ed` of those — so E4.5 (differential DiT) is the gate for a correct medium (→ E10.2/M6).
 - ⬜ **E10.2** **P1** Medium end-to-end (differential DiT attn + larger decoder, quantized). deps: E10.1, E4.5, E9.3 · Verify: medium WAV parity. **← M6**
 
 ## E11 — Release polish (v1.0.0)
