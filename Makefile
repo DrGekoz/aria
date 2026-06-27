@@ -1,10 +1,6 @@
 # aria.c - audio diffusion inference runtime
 #
-# Targets:
-#   make            # CPU build (default): libaria.a + aria CLI
-#   make test       # build & run unit tests
-#   make cuda CUDA_ARCH=sm_86   # CUDA build (Phase 3; sm_61 for GT 1030)
-#   make clean
+#   make help       # list all targets + key variables
 #
 # CPU-first per design: AVX2/FMA + OpenMP, no third-party deps.
 
@@ -41,9 +37,32 @@ EXTRA_LIB_OBJS ?=
 LIB_OBJS := $(patsubst $(SRC)/%.c,$(BUILD)/%.o,$(LIB_SRCS)) $(EXTRA_LIB_OBJS)
 LIB := $(BUILD)/libaria.a
 
-.PHONY: all cpu clean test cuda test_cuda blas bench bench-sweep profile
+.PHONY: all cpu clean test cuda test_cuda blas bench bench-sweep profile help
 all: cpu
 cpu: aria
+
+help:
+	@echo "aria.c - make targets:"
+	@echo ""
+	@echo "  Build"
+	@echo "    make / make cpu    CPU build (default): build/libaria.a + ./aria"
+	@echo "    make cuda          CUDA build (CUDA_ARCH=sm_86 for RTX 3070; default sm_61."
+	@echo "                       also NVCC, CUDA_HOME, CUDA_CCBIN)"
+	@echo "    make blas          CPU build routing GEMM to a BLAS (BLAS_LIB=-lopenblas)"
+	@echo "    make clean         remove build/ and ./aria"
+	@echo ""
+	@echo "  Test"
+	@echo "    make test          hermetic unit tests (no model needed)"
+	@echo "    make test_cuda     CUDA op parity vs CPU (skips cleanly with no device)"
+	@echo "    make parity        full parity vs PyTorch (ARIA_MODEL=<dir>; needs the venv)"
+	@echo ""
+	@echo "  Benchmark / profile"
+	@echo "    make bench         GEMM microbenchmark on the dominant SA3 shapes"
+	@echo "    make bench-sweep   sweep the AVX2 register tile (MR x NR)"
+	@echo "    make profile ARGS=\"-m <model> --uncond -d 10 -s 8 --device cuda\""
+	@echo "                       stages + memory, plus per-kernel GPU time (nsys). See PROFILING.md"
+	@echo ""
+	@echo "  Key vars: CC, CUDA_ARCH, NVCC, CUDA_HOME, ARIA_MODEL, ARGS, BLAS_LIB"
 
 # GEMM microbenchmark on the dominant SA3 shapes (no model load)
 bench: $(LIB)
