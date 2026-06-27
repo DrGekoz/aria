@@ -53,7 +53,7 @@ void aria_dit_block_forward(float *x, int S, int dim, int num_heads, int head_di
                             const float *context, int Sc, int dim_ctx,
                             const float *global_cond,
                             const float *rope_cos, const float *rope_sin, int rot_dim,
-                            const aria_dit_block_w *w);
+                            const aria_dit_block_w *w, int differential);
 
 /* ---- full DiT model ---- */
 

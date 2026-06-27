@@ -246,6 +246,63 @@ def dump_schedule(out_dir):
     print(f"dumped LogSNR schedules to {d}")
 
 
+def dump_dit_block_diff(out_dir):
+    """Differential DiT block (medium's attention variant) with random weights, so
+    the C differential path can be parity-checked without the medium model. Small
+    dims (head_dim 64 like medium); both self- and cross-attention are differential:
+    out = attn(q,k,v) - attn(q_diff,k_diff,v)."""
+    from stable_audio_tools.models.transformer import TransformerBlock, RotaryEmbedding
+
+    dim, num_heads, head_dim = 256, 4, 64
+    block = TransformerBlock(
+        dim, dim_heads=head_dim, cross_attend=True, dim_context=dim,
+        global_cond_dim=dim, norm_type="rms_norm", norm_kwargs={"force_fp32": True},
+        attn_kwargs={"qk_norm": "rms", "differential": True}, ff_kwargs={"mult": 4.0},
+    ).eval()
+    # the block zero-inits branch outputs (to_out, ff.2) -> randomize so the test is non-degenerate
+    torch.manual_seed(31)
+    with torch.no_grad():
+        for name, p in block.named_parameters():
+            if name.endswith("gamma"):
+                p.copy_(1.0 + 0.02 * torch.randn_like(p))      # RMSNorm gains ~ 1
+            elif "to_scale_shift_gate" in name:
+                p.copy_(0.02 * torch.randn_like(p))
+            elif name.endswith("bias"):
+                p.copy_(0.01 * torch.randn_like(p))
+            else:
+                p.copy_(0.04 * torch.randn_like(p))
+
+    torch.manual_seed(32)
+    S, Sc = 12, 7
+    x = torch.randn(1, S, dim) * 0.5
+    context = torch.randn(1, Sc, dim) * 0.5
+    global_cond = torch.randn(1, 6 * dim) * 0.1
+    rope = RotaryEmbedding(max(head_dim // 2, 32)).forward_from_seq_len(S)
+    with torch.no_grad():
+        out = block(x, context=context, global_cond=global_cond, rotary_pos_emb=rope, local_add_cond=None)
+
+    d = os.path.join(out_dir, "dit_diff")
+    os.makedirs(d, exist_ok=True)
+    save_atns(os.path.join(d, "x.atns"), x.squeeze(0).float().cpu().numpy())
+    save_atns(os.path.join(d, "context.atns"), context.squeeze(0).float().cpu().numpy())
+    save_atns(os.path.join(d, "global.atns"), global_cond.squeeze(0).float().cpu().numpy())
+    save_atns(os.path.join(d, "out.atns"), out.squeeze(0).float().cpu().numpy())
+    sd = block.state_dict()
+    wmap = {
+        "pre_norm": "pre_norm.gamma", "cross_norm": "cross_attend_norm.gamma", "ff_norm": "ff_norm.gamma",
+        "sa_to_qkv": "self_attn.to_qkv.weight", "sa_q_norm": "self_attn.q_norm.gamma",
+        "sa_k_norm": "self_attn.k_norm.gamma", "sa_to_out": "self_attn.to_out.weight",
+        "ca_to_q": "cross_attn.to_q.weight", "ca_to_kv": "cross_attn.to_kv.weight",
+        "ca_q_norm": "cross_attn.q_norm.gamma", "ca_k_norm": "cross_attn.k_norm.gamma",
+        "ca_to_out": "cross_attn.to_out.weight", "ssg": "to_scale_shift_gate",
+        "ff_in_w": "ff.ff.0.proj.weight", "ff_in_b": "ff.ff.0.proj.bias",
+        "ff_out_w": "ff.ff.2.weight", "ff_out_b": "ff.ff.2.bias",
+    }
+    for fn, key in wmap.items():
+        save_atns(os.path.join(d, fn + ".atns"), sd[key].float().cpu().numpy())
+    print(f"dumped differential DiT block reference to {d} (dim={dim}, S={S}, Sc={Sc})")
+
+
 def dump_dit_full(model_dir, out_dir):
     """Full DiT denoiser_forward: instantiate the real DiffusionTransformer from
     the config, load model.model.* weights, run _forward on seeded synthetic
@@ -563,6 +620,7 @@ if __name__ == "__main__":
     dump_number_cond(model_dir, out_dir)
     dump_ops(out_dir)
     dump_dit_block(model_dir, out_dir)
+    dump_dit_block_diff(out_dir)
     dump_dit_full(model_dir, out_dir)
     dump_schedule(out_dir)
     dump_taae_block(model_dir, out_dir)

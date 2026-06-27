@@ -97,7 +97,7 @@ quant), **E8.5c** (GPU decoder), **E10** (medium), **E12** (steering).
 - ✅ **E4.2** **P0** Input path: `preprocess_conv` + project to embed_dim + prepend 64 memory tokens + RoPE positions. deps: E4.1, E2.7, E2.1 · Verify: pre-block hidden parity.
 - ✅ **E4.3** **P0** DiT block forward (one block): adaLN(6) → self-attn(qk-rms,rope)+`σ(1−gate)`+res → cross-attn+res → local-add(NULL-safe) → FFN GLU+gate+res. deps: E2.1–2.4, E2.8, E1.4, E1.5 · Verify: **block-0 parity** vs Python (keystone op test).
 - ✅ **E4.4** **P0** Full DiT: 20 blocks + final norm + `postprocess` → velocity `[256,T]`. deps: E4.2, E4.3 · Verify: full `denoiser_forward(x,t,cond)` parity.
-- ⬜ **E4.5** **P1** Differential attention path for medium (config-gated). deps: E2.6, E4.4 · Verify: medium block parity.
+- ✅ **E4.5** **P1** Differential attention path for medium (config-gated by `attn_kwargs.differential`). Both self- AND cross-attention: `to_qkv` is `[5·ed,ed]` (q,k,v,q_diff,k_diff), cross `to_q [2·ed]` (q,q_diff), `to_kv [3·ed]` (k,k_diff,v); `out = attn(q,k,v) − attn(q_diff,k_diff,v)` (no λ — medium has no `feat_scale`), RMS qk-norm on base+diff, RoPE on self only, `v` shared. The request caches `cross_kd` (k_diff post k_norm). deps: E2.6, E4.4 · Verify: `test_dit_diff` (synthetic differential block, random weights) parity **7.7e-7**; small-music (non-diff) unchanged (block0 5.5e-4, full 8.3e-4).
 
 ## E5 — taae_v2 autoencoder decoder
 

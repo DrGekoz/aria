@@ -96,11 +96,11 @@ static void ff_glu_qw(float *out, const float *x, int N, int inner, int dim_out,
  * from `ar` (save/restore-scoped), so the hot loop never malloc/frees. `bq` is the
  * quantized weight overlay (NULL = f32; that branch is bit-identical to before). */
 static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
-                           const float *cross_k, const float *cross_v, int Sc,
+                           const float *cross_k, const float *cross_v, const float *cross_kd, int Sc,
                            const float *global_cond,
                            const float *rope_cos, const float *rope_sin, int rot_dim,
                            const float *local_emb, const aria_dit_block_w *w,
-                           const dit_block_q *bq, aria_arena *ar) {
+                           const dit_block_q *bq, int diff, aria_arena *ar) {
     const float eps_norm = 1e-5f, eps_qk = 1e-6f;
     size_t mark = aria_arena_save(ar);
 
@@ -118,6 +118,11 @@ static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
     float *kh       = aria_arena_floats(ar, (size_t)H * S * hd);
     float *vh       = aria_arena_floats(ar, (size_t)H * S * hd);
     float *ao       = aria_arena_floats(ar, (size_t)H * S * hd);
+    /* differential attention (medium): extra diff q/k + a second attention output.
+     * out = attn(q,k,v) - attn(q_diff,k_diff,v) (no lambda; v shared). */
+    float *qdh = diff ? aria_arena_floats(ar, (size_t)H * S * hd) : NULL;
+    float *kdh = diff ? aria_arena_floats(ar, (size_t)H * S * hd) : NULL;
+    float *aod = diff ? aria_arena_floats(ar, (size_t)H * S * hd) : NULL;
     float *scores   = aria_arena_floats(ar, (size_t)S * (S > Sc ? S : Sc));
 
     /* ---------- self-attention ---------- */
@@ -125,18 +130,31 @@ static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
     aria_rmsnorm(h, x, w->pre_norm, S, dim, eps_norm);
     adaln_modulate(h, scale_self, shift_self, S, dim);
     {
-        float *qkv = aria_arena_floats(ar, (size_t)S * 3 * dim);
-        if (bq) aria_linear_qw(qkv, h, &bq->sa_to_qkv, NULL, S);
-        else    aria_linear(qkv, h, w->sa_to_qkv, NULL, S, dim, 3 * dim);
-        extract_heads(qh, qkv, S, H, hd, 3 * dim, 0);
-        extract_heads(kh, qkv, S, H, hd, 3 * dim, dim);
-        extract_heads(vh, qkv, S, H, hd, 3 * dim, 2 * dim);
+        int nq = diff ? 5 : 3;
+        float *qkv = aria_arena_floats(ar, (size_t)S * nq * dim);
+        if (bq && !diff) aria_linear_qw(qkv, h, &bq->sa_to_qkv, NULL, S);
+        else             aria_linear(qkv, h, w->sa_to_qkv, NULL, S, dim, nq * dim);
+        extract_heads(qh, qkv, S, H, hd, nq * dim, 0);
+        extract_heads(kh, qkv, S, H, hd, nq * dim, dim);
+        extract_heads(vh, qkv, S, H, hd, nq * dim, 2 * dim);
+        if (diff) {
+            extract_heads(qdh, qkv, S, H, hd, nq * dim, 3 * dim);
+            extract_heads(kdh, qkv, S, H, hd, nq * dim, 4 * dim);
+        }
     }
     aria_rmsnorm(qh, qh, w->sa_q_norm, H * S, hd, eps_qk);
     aria_rmsnorm(kh, kh, w->sa_k_norm, H * S, hd, eps_qk);
     aria_rope_apply(qh, rope_cos, rope_sin, H, S, hd, rot_dim);
     aria_rope_apply(kh, rope_cos, rope_sin, H, S, hd, rot_dim);
     aria_attention(ao, qh, kh, vh, H, S, S, hd, NULL, scores);
+    if (diff) {
+        aria_rmsnorm(qdh, qdh, w->sa_q_norm, H * S, hd, eps_qk);
+        aria_rmsnorm(kdh, kdh, w->sa_k_norm, H * S, hd, eps_qk);
+        aria_rope_apply(qdh, rope_cos, rope_sin, H, S, hd, rot_dim);
+        aria_rope_apply(kdh, rope_cos, rope_sin, H, S, hd, rot_dim);
+        aria_attention(aod, qdh, kdh, vh, H, S, S, hd, NULL, scores);
+        for (size_t i = 0; i < (size_t)H * S * hd; i++) ao[i] -= aod[i];
+    }
     merge_heads(merged, ao, S, H, hd);
     if (bq) aria_linear_qw(o, merged, &bq->sa_to_out, NULL, S);
     else    aria_linear(o, merged, w->sa_to_out, NULL, S, dim, dim);
@@ -147,12 +165,19 @@ static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
     memcpy(residual, x, (size_t)S * dim * sizeof(float));
     aria_rmsnorm(h, x, w->cross_norm, S, dim, eps_norm);
     {
-        float *q = aria_arena_floats(ar, (size_t)S * dim);
-        if (bq) aria_linear_qw(q, h, &bq->ca_to_q, NULL, S);
-        else    aria_linear(q, h, w->ca_to_q, NULL, S, dim, dim);
-        extract_heads(qh, q, S, H, hd, dim, 0);
+        int nq = diff ? 2 : 1;
+        float *q = aria_arena_floats(ar, (size_t)S * nq * dim);
+        if (bq && !diff) aria_linear_qw(q, h, &bq->ca_to_q, NULL, S);
+        else             aria_linear(q, h, w->ca_to_q, NULL, S, dim, nq * dim);
+        extract_heads(qh, q, S, H, hd, nq * dim, 0);
         aria_rmsnorm(qh, qh, w->ca_q_norm, H * S, hd, eps_qk);
         aria_attention(ao, qh, cross_k, cross_v, H, S, Sc, hd, NULL, scores);
+        if (diff) {
+            extract_heads(qdh, q, S, H, hd, nq * dim, dim);
+            aria_rmsnorm(qdh, qdh, w->ca_q_norm, H * S, hd, eps_qk);
+            aria_attention(aod, qdh, cross_kd, cross_v, H, S, Sc, hd, NULL, scores);
+            for (size_t i = 0; i < (size_t)H * S * hd; i++) ao[i] -= aod[i];
+        }
         merge_heads(merged, ao, S, H, hd);
     }
     if (bq) aria_linear_qw(o, merged, &bq->ca_to_out, NULL, S);
@@ -184,31 +209,42 @@ void aria_dit_block_forward(float *x, int S, int dim, int num_heads, int head_di
                             const float *context, int Sc, int dim_ctx,
                             const float *global_cond,
                             const float *rope_cos, const float *rope_sin, int rot_dim,
-                            const aria_dit_block_w *w) {
+                            const aria_dit_block_w *w, int differential) {
     int H = num_heads, hd = head_dim;
-    float *kv = malloc((size_t)Sc * 2 * dim * sizeof(float));
+    int nkv = differential ? 3 : 2;   /* to_kv = [k,v] or [k,k_diff,v] */
+    float *kv = malloc((size_t)Sc * nkv * dim * sizeof(float));
     float *cross_k = malloc((size_t)H * Sc * hd * sizeof(float));
     float *cross_v = malloc((size_t)H * Sc * hd * sizeof(float));
-    aria_linear(kv, context, w->ca_to_kv, NULL, Sc, dim_ctx, 2 * dim);
-    extract_heads(cross_k, kv, Sc, H, hd, 2 * dim, 0);
-    extract_heads(cross_v, kv, Sc, H, hd, 2 * dim, dim);
-    aria_rmsnorm(cross_k, cross_k, w->ca_k_norm, H * Sc, hd, 1e-6f);
+    float *cross_kd = differential ? malloc((size_t)H * Sc * hd * sizeof(float)) : NULL;
+    aria_linear(kv, context, w->ca_to_kv, NULL, Sc, dim_ctx, nkv * dim);
+    if (differential) {                /* chunk order: k, k_diff, v */
+        extract_heads(cross_k,  kv, Sc, H, hd, nkv * dim, 0);
+        extract_heads(cross_kd, kv, Sc, H, hd, nkv * dim, dim);
+        extract_heads(cross_v,  kv, Sc, H, hd, nkv * dim, 2 * dim);
+        aria_rmsnorm(cross_k,  cross_k,  w->ca_k_norm, H * Sc, hd, 1e-6f);
+        aria_rmsnorm(cross_kd, cross_kd, w->ca_k_norm, H * Sc, hd, 1e-6f);
+    } else {
+        extract_heads(cross_k, kv, Sc, H, hd, nkv * dim, 0);
+        extract_heads(cross_v, kv, Sc, H, hd, nkv * dim, dim);
+        aria_rmsnorm(cross_k, cross_k, w->ca_k_norm, H * Sc, hd, 1e-6f);
+    }
     free(kv);
 
     aria_arena ar;
-    size_t cap = ((size_t)6 * dim + 24 * (size_t)S * dim + (size_t)S * (S > Sc ? S : Sc)
+    size_t cap = ((size_t)6 * dim + 30 * (size_t)S * dim + (size_t)S * (S > Sc ? S : Sc)
                   + (1u << 18)) * sizeof(float);
     aria_arena_init(&ar, cap);
-    dit_block_core(x, S, dim, H, hd, inner, cross_k, cross_v, Sc, global_cond,
-                   rope_cos, rope_sin, rot_dim, NULL, w, NULL, &ar);
+    dit_block_core(x, S, dim, H, hd, inner, cross_k, cross_v, cross_kd, Sc, global_cond,
+                   rope_cos, rope_sin, rot_dim, NULL, w, NULL, differential, &ar);
     aria_arena_free(&ar);
-    free(cross_k); free(cross_v);
+    free(cross_k); free(cross_v); free(cross_kd);
 }
 
 /* ---------------- full DiT model ---------------- */
 
 struct aria_sa3_dit {
     int depth, ed, num_heads, head_dim, inner, io_ch, n_mem, rot_dim, cond_dim, ts_feat_dim;
+    int differential;   /* medium: differential self+cross attention */
     const float *preprocess, *postprocess, *project_in, *project_out, *memory_tokens;
     const float *to_cond0, *to_cond2, *to_global0, *to_global2;
     const float *to_ts0_w, *to_ts0_b, *to_ts2_w, *to_ts2_b;
@@ -241,6 +277,7 @@ aria_sa3_dit *aria_sa3_dit_load(safetensors_file_t *sf, const aria_sa3_config *c
     m->rot_dim = cfg->head_dim / 2 < 32 ? 32 : cfg->head_dim / 2;  /* max(head_dim//2, 32) */
     m->cond_dim = cfg->cond_token_dim;
     m->ts_feat_dim = 256;
+    m->differential = cfg->differential_attn;
     m->blocks = calloc((size_t)m->depth, sizeof(aria_dit_block_w));
 
     m->preprocess    = track(m, sf, "model.model.preprocess_conv.weight");
@@ -436,6 +473,7 @@ struct aria_sa3_dit_req {
     float *global_seconds;  /* [ed]          to_global_embed(seconds) (timestep added per step) */
     float *rope_cos, *rope_sin;             /* [S, rot/2] */
     float **cross_k, **cross_v;             /* [depth] each [H, n_cond, hd]; cross_k post k_norm */
+    float **cross_kd;                       /* [depth] differential cross k_diff (post k_norm), or NULL */
     float **local_emb; int has_local;       /* [depth] each [S, ed] (left-padded) or NULL */
 };
 
@@ -460,16 +498,25 @@ aria_sa3_dit_req *aria_sa3_dit_req_begin(const aria_sa3_dit *m, int T,
 
     /* per-block cross-attention K/V: projected once from cross_ed (constant across
      * all steps), head-split, with k_norm folded into the cached K. */
+    int diff = m->differential, nkv = diff ? 3 : 2;   /* to_kv = [k,v] or [k,k_diff,v] */
     r->cross_k = calloc((size_t)depth, sizeof(float *));
     r->cross_v = calloc((size_t)depth, sizeof(float *));
-    float *kv = malloc((size_t)n_cond * 2 * dim * sizeof(float));
+    r->cross_kd = diff ? calloc((size_t)depth, sizeof(float *)) : NULL;
+    float *kv = malloc((size_t)n_cond * nkv * dim * sizeof(float));
     for (int b = 0; b < depth; b++) {
         const aria_dit_block_w *w = &m->blocks[b];
-        aria_linear(kv, r->cross_ed, w->ca_to_kv, NULL, n_cond, ed, 2 * dim);  /* always f32 (once/request) */
+        aria_linear(kv, r->cross_ed, w->ca_to_kv, NULL, n_cond, ed, nkv * dim);  /* always f32 (once/request) */
         r->cross_k[b] = malloc((size_t)H * n_cond * hd * sizeof(float));
         r->cross_v[b] = malloc((size_t)H * n_cond * hd * sizeof(float));
-        extract_heads(r->cross_k[b], kv, n_cond, H, hd, 2 * dim, 0);
-        extract_heads(r->cross_v[b], kv, n_cond, H, hd, 2 * dim, dim);
+        extract_heads(r->cross_k[b], kv, n_cond, H, hd, nkv * dim, 0);
+        if (diff) {                                      /* chunk order: k, k_diff, v */
+            r->cross_kd[b] = malloc((size_t)H * n_cond * hd * sizeof(float));
+            extract_heads(r->cross_kd[b], kv, n_cond, H, hd, nkv * dim, dim);
+            extract_heads(r->cross_v[b],  kv, n_cond, H, hd, nkv * dim, 2 * dim);
+            aria_rmsnorm(r->cross_kd[b], r->cross_kd[b], w->ca_k_norm, H * n_cond, hd, 1e-6f);
+        } else {
+            extract_heads(r->cross_v[b], kv, n_cond, H, hd, nkv * dim, dim);
+        }
         aria_rmsnorm(r->cross_k[b], r->cross_k[b], w->ca_k_norm, H * n_cond, hd, 1e-6f);
     }
     free(kv);
@@ -477,8 +524,11 @@ aria_sa3_dit_req *aria_sa3_dit_req_begin(const aria_sa3_dit *m, int T,
     /* arena holds the persistent residual stream + step input scratch + one block's
      * worth of temporaries (blocks save/restore, so only one is live at a time). */
     int inner = m->inner;
-    size_t block_floats = (size_t)6 * dim + 24 * (size_t)S * dim + (size_t)S * (S > n_cond ? S : n_cond);
-    (void)inner;  /* 3*S*inner == 12*S*dim is already inside the 24*S*dim bound */
+    /* one block's live scratch (no intra-block restore): ~20*S*dim non-diff,
+     * ~30*S*dim with differential (extra 5-way qkv + q/k_diff + 2nd attn out). */
+    size_t block_floats = (size_t)6 * dim + (diff ? 32 : 24) * (size_t)S * dim
+                          + (size_t)S * (S > n_cond ? S : n_cond);
+    (void)inner;  /* 3*S*inner == 12*S*dim is already inside the bound */
     size_t step_floats  = (size_t)S * ed + 8 * (size_t)T * m->io_ch + 8 * (size_t)ed;
     aria_arena_init(&r->arena, (block_floats + step_floats + (1u << 20)) * sizeof(float));
     return r;
@@ -532,10 +582,10 @@ void aria_sa3_dit_step(const aria_sa3_dit *m, aria_sa3_dit_req *r,
 
     for (int b = 0; b < m->depth; b++)
         dit_block_core(seq, S, ed, m->num_heads, m->head_dim, m->inner,
-                       r->cross_k[b], r->cross_v[b], r->n_cond, gcond,
+                       r->cross_k[b], r->cross_v[b], r->cross_kd ? r->cross_kd[b] : NULL, r->n_cond, gcond,
                        r->rope_cos, r->rope_sin, rot,
                        r->has_local ? r->local_emb[b] : NULL, &m->blocks[b],
-                       m->bq ? &m->bq[b] : NULL, ar);
+                       m->bq ? &m->bq[b] : NULL, m->differential, ar);
 
     /* strip memory tokens, project_out [T,ed] -> [T,C] */
     float *outtc = aria_arena_floats(ar, (size_t)T * C);
@@ -556,7 +606,8 @@ void aria_sa3_dit_req_end(aria_sa3_dit_req *r) {
     free(r->cross_ed); free(r->global_seconds); free(r->rope_cos); free(r->rope_sin);
     if (r->cross_k) for (int b = 0; b < r->m->depth; b++) free(r->cross_k[b]);
     if (r->cross_v) for (int b = 0; b < r->m->depth; b++) free(r->cross_v[b]);
-    free(r->cross_k); free(r->cross_v);
+    if (r->cross_kd) for (int b = 0; b < r->m->depth; b++) free(r->cross_kd[b]);
+    free(r->cross_k); free(r->cross_v); free(r->cross_kd);
     if (r->local_emb) for (int b = 0; b < r->m->depth; b++) free(r->local_emb[b]);
     free(r->local_emb);
     free(r);

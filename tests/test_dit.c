@@ -78,7 +78,7 @@ int main(void) {
     float *out = malloc((size_t)S * dim * sizeof(float));
     memcpy(out, x.data, (size_t)S * dim * sizeof(float));
     aria_dit_block_forward(out, S, dim, num_heads, head_dim, inner,
-                           ctx.data, Sc, dim, glob.data, cosb, sinb, rot_dim, &w);
+                           ctx.data, Sc, dim, glob.data, cosb, sinb, rot_dim, &w, 0);
 
     float md = aria_parity_maxabsdiff(out, ref.data, ref.numel);
     float maxref = 0.0f;
