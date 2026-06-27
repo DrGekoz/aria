@@ -334,6 +334,57 @@ void aria_sa3_dit_quantize(aria_sa3_dit *m, aria_dtype dt) {
     }
 }
 
+/* ---- offline packed quantized DiT (E9.2) ---- */
+#define ARIA_DIT_QMAGIC "ARIAQNT1"
+
+/* the 6 packed per-block GEMM weights, in a stable order for (de)serialization. */
+static aria_qweight *dit_block_q_weights(dit_block_q *q, aria_qweight **out6) {
+    out6[0] = &q->sa_to_qkv; out6[1] = &q->sa_to_out; out6[2] = &q->ca_to_q;
+    out6[3] = &q->ca_to_out; out6[4] = &q->ff_in_w;  out6[5] = &q->ff_out_w;
+    return NULL;
+}
+
+/* Quantize `m` to `dt` and write the packed block overlay to `path`. 0 on success. */
+int aria_sa3_dit_quant_save(aria_sa3_dit *m, aria_dtype dt, const char *path) {
+    if (!m || (dt != ARIA_Q8 && dt != ARIA_Q4)) return -1;
+    aria_sa3_dit_quantize(m, dt);
+    if (!m->bq) return -1;
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    int32_t hdr[4] = { (int32_t)dt, m->depth, m->ed, m->inner };
+    int ok = (fwrite(ARIA_DIT_QMAGIC, 1, 8, f) == 8) && (fwrite(hdr, sizeof(int32_t), 4, f) == 4);
+    for (int i = 0; ok && i < m->depth; i++) {
+        aria_qweight *w6[6]; dit_block_q_weights(&m->bq[i], w6);
+        for (int j = 0; j < 6; j++) if (aria_qweight_write(f, w6[j]) != 0) { ok = 0; break; }
+    }
+    fclose(f);
+    return ok ? 0 : -1;
+}
+
+/* Load a packed block overlay (from aria_sa3_dit_quant_save) into m->bq. The
+ * model keeps its f32 weights for the non-block parts; only the per-step GEMMs
+ * come from the file. Returns 0 on success, <0 on error / shape mismatch. */
+int aria_sa3_dit_quant_load(aria_sa3_dit *m, const char *path) {
+    if (!m) return -1;
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    char magic[8]; int32_t hdr[4];
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, ARIA_DIT_QMAGIC, 8) != 0 ||
+        fread(hdr, sizeof(int32_t), 4, f) != 4 ||
+        hdr[1] != m->depth || hdr[2] != m->ed || hdr[3] != m->inner) { fclose(f); return -1; }
+    dit_free_bq(m);
+    m->precision = (aria_dtype)hdr[0];
+    m->bq = calloc((size_t)m->depth, sizeof(dit_block_q));
+    int ok = (m->bq != NULL);
+    for (int i = 0; ok && i < m->depth; i++) {
+        aria_qweight *w6[6]; dit_block_q_weights(&m->bq[i], w6);
+        for (int j = 0; j < 6; j++) if (aria_qweight_read(f, w6[j]) != 0) { ok = 0; break; }
+    }
+    fclose(f);
+    if (!ok) { dit_free_bq(m); m->precision = ARIA_F32; return -1; }
+    return 0;
+}
+
 /* total bytes of the block GEMM weights at the current precision (for reporting). */
 size_t aria_sa3_dit_weight_bytes(const aria_sa3_dit *m) {
     if (!m) return 0;

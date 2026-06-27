@@ -33,6 +33,7 @@ typedef struct {
     aria_sa3_dit *dit;
     aria_sa3_dec *dec;
     aria_sa3_enc *enc_taae;   /* taae encoder, lazily loaded for continue/inpaint */
+    int quant_loaded;         /* a packed .aria DiT overlay has been loaded (E9.2) */
     /* seconds_total NumberConditioner (borrowed from the mmap) */
     const float *sec_w;  /* [768,256] */
     const float *sec_b;  /* [768] */
@@ -258,11 +259,25 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     aria_dtype prec = (p->precision == ARIA_Q8 || p->precision == ARIA_Q4) ? p->precision : ARIA_F32;
     int quant = (prec != ARIA_F32);
 
+    /* E9.2: a pre-quantized DiT overlay (.aria from aria-quantize) -> CPU path,
+     * skips on-the-fly quantization. Loaded once, then cached across generations. */
+    int loaded_quant = (p->load_quant != NULL);
+    if (loaded_quant && !st->quant_loaded) {
+        if (aria_sa3_dit_quant_load(st->dit, p->load_quant) != 0) {
+            aria_set_error("generate: cannot load packed quant '%s' (missing or shape mismatch)", p->load_quant);
+            free(cross); free(x); free(sched); return -1;
+        }
+        st->quant_loaded = 1;
+        fprintf(stderr, "[aria] DiT: loaded packed quant %s = %.0f MB (CPU)\n",
+                p->load_quant, aria_sa3_dit_weight_bytes(st->dit) / 1048576.0);
+    }
+    if (loaded_quant) quant = 1;
+
     int on_gpu = 0;
 #ifdef ARIA_CUDA
     /* auto: GPU when it's worth it (sm_70+) and fits; cuda: force any device
-     * (CPU-fallback on OOM); cpu: never. Inpaint stays on the CPU DiT. */
-    int want_gpu = !p->init_audio &&
+     * (CPU-fallback on OOM); cpu: never. Inpaint + packed-quant stay on the CPU DiT. */
+    int want_gpu = !p->init_audio && !loaded_quant &&
                    ((p->device == ARIA_DEVICE_CUDA && aria_cuda_available()) ||
                     (p->device == ARIA_DEVICE_AUTO && aria_cuda_recommended()));
     if (want_gpu && !st->cdit) {   /* upload + quantize weights once; reused across gens */
@@ -278,13 +293,15 @@ static int sa3_generate(aria_ctx *ctx, void *state,
 
     /* CPU dequant overlay only when running on the CPU; the GPU path keeps st->dit
      * f32 so the host cross-K/V projection (and any CPU fallback) stays fast. */
-    aria_sa3_dit_quantize(st->dit, (quant && !on_gpu) ? prec : ARIA_F32);
-    if (quant && !on_gpu) {
-        static int announced = 0;
-        if (!announced) {
-            fprintf(stderr, "[aria] DiT: %s block weights = %.0f MB (CPU)\n",
-                    aria_dtype_name(prec), aria_sa3_dit_weight_bytes(st->dit) / 1048576.0);
-            announced = 1;
+    if (!loaded_quant) {
+        aria_sa3_dit_quantize(st->dit, (quant && !on_gpu) ? prec : ARIA_F32);
+        if (quant && !on_gpu) {
+            static int announced = 0;
+            if (!announced) {
+                fprintf(stderr, "[aria] DiT: %s block weights = %.0f MB (CPU)\n",
+                        aria_dtype_name(prec), aria_sa3_dit_weight_bytes(st->dit) / 1048576.0);
+                announced = 1;
+            }
         }
     }
 

@@ -35,6 +35,7 @@ static void usage(const char *prog) {
         "  %s -m <dir> -p \"prompt\" --inpaint <in.wav> --from <s> --to <s> -o out.wav  (regenerate a region)\n"
         "    --device auto (default) runs the DiT device-resident on the GPU when one fits, else CPU\n"
         "    --precision fp32|q8|q4 selects the CPU DiT weight precision (q8/q4 force the CPU path)\n"
+        "    --load-quant <file.aria> loads a pre-quantized DiT from aria-quantize (CPU)\n"
         "    --continue/--inpaint run on the CPU DiT; the init WAV must be at the model sample rate\n",
         prog, prog, prog, prog, prog, prog, prog, prog);
 }
@@ -76,6 +77,7 @@ int main(int argc, char **argv) {
     float inpaint_from = 0.0f, inpaint_to = 0.0f;
     int inpaint_continue = 0;
     aria_dtype precision = ARIA_F32;
+    const char *load_quant = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--wav-roundtrip") == 0 && i + 2 < argc) {
@@ -121,6 +123,8 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "unknown --precision %s (use fp32|fp16|bf16|q8|q4)\n", argv[i]);
                 return 1;
             }
+        } else if (strcmp(argv[i], "--load-quant") == 0 && i + 1 < argc) {
+            load_quant = argv[++i];
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]); return 0;
         } else {
@@ -150,6 +154,7 @@ int main(int argc, char **argv) {
         p.seed = seed;
         p.device = device;
         p.precision = precision;
+        p.load_quant = load_quant;
         p.init_audio = init_audio;
         p.inpaint_from_s = inpaint_from;
         p.inpaint_to_s = inpaint_to;

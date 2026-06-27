@@ -40,9 +40,14 @@ EXTRA_LIB_OBJS ?=
 LIB_OBJS := $(patsubst $(SRC)/%.c,$(BUILD)/%.o,$(LIB_SRCS)) $(EXTRA_LIB_OBJS)
 LIB := $(BUILD)/libaria.a
 
-.PHONY: all cpu clean test cuda test_cuda blas bench bench-sweep profile help
+.PHONY: all cpu clean test cuda test_cuda blas bench bench-sweep profile help quantize
 all: cpu
 cpu: aria
+
+# offline weight quantizer (E9.2): model.safetensors -> packed .aria DiT overlay
+quantize: aria-quantize
+aria-quantize: $(LIB)
+	$(CC) $(CFLAGS) -I$(SRC) tools/aria_quantize.c -L$(BUILD) -laria $(LDFLAGS) -o aria-quantize
 
 help:
 	@echo "aria.c - make targets:"
@@ -52,6 +57,7 @@ help:
 	@echo "    make cuda          CUDA build (CUDA_ARCH=sm_86 for RTX 3070; default sm_61."
 	@echo "                       also NVCC, CUDA_HOME, CUDA_CCBIN)"
 	@echo "    make blas          CPU build routing GEMM to a BLAS (BLAS_LIB=-lopenblas)"
+	@echo "    make quantize      offline DiT quantizer -> ./aria-quantize (E9.2)"
 	@echo "    make clean         remove build/ and ./aria"
 	@echo ""
 	@echo "  Test"
@@ -165,4 +171,4 @@ test_cuda:
 	$(BUILD)/test_cuda
 
 clean:
-	rm -rf $(BUILD) aria
+	rm -rf $(BUILD) aria aria-quantize

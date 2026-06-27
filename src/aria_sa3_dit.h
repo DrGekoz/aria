@@ -72,6 +72,12 @@ void aria_sa3_dit_quantize(aria_sa3_dit *m, aria_dtype dt);
 /* total bytes of the block GEMM weights at the current precision (reporting). */
 size_t aria_sa3_dit_weight_bytes(const aria_sa3_dit *m);
 
+/* Offline packed quantized DiT (E9.2): save quantizes to `dt` and writes the
+ * per-block GEMM overlay to `path`; load fills m->bq from such a file (the model
+ * keeps its f32 weights for the non-block parts). 0 on success, <0 on error. */
+int aria_sa3_dit_quant_save(aria_sa3_dit *m, aria_dtype dt, const char *path);
+int aria_sa3_dit_quant_load(aria_sa3_dit *m, const char *path);
+
 /* Per-request context: a reusable scratch arena plus the step-invariant state
  * cached once and reused across all denoising steps -- cross_ed (to_cond_embed),
  * RoPE tables, to_global_embed(seconds), and the per-block cross-attention K/V

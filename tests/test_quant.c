@@ -114,6 +114,29 @@ int main(void) {
         check_le("q8 gemm+bias relerr", gemm_relerr(yq, yref, Mb * N), 0.03f);
     }
 
+    /* E9.2: aria_qweight serialization round-trip must be bit-identical */
+    for (int qi = 0; qi < 2; qi++) {
+        aria_dtype dt = qi ? ARIA_Q4 : ARIA_Q8;
+        int K = 130, N = 48, Mb = 3;   /* odd K to exercise the tail */
+        float *W = malloc((size_t)N * K * sizeof(float)), *x = malloc((size_t)Mb * K * sizeof(float));
+        float *y1 = malloc((size_t)Mb * N * sizeof(float)), *y2 = malloc((size_t)Mb * N * sizeof(float));
+        for (int i = 0; i < N * K; i++) W[i] = 0.1f * frandn();
+        for (int i = 0; i < Mb * K; i++) x[i] = frandn();
+        aria_qweight a, c;
+        aria_qweight_set(&a, W, N, K, dt);
+        aria_linear_qw(y1, x, &a, NULL, Mb);
+        FILE *f = tmpfile();
+        int io = aria_qweight_write(f, &a); rewind(f);
+        io |= aria_qweight_read(f, &c); fclose(f);
+        aria_linear_qw(y2, x, &c, NULL, Mb);
+        float md = 0; for (int i = 0; i < Mb * N; i++) { float d = fabsf(y1[i] - y2[i]); if (d > md) md = d; }
+        char tag[48]; snprintf(tag, sizeof(tag), "%s serialize roundtrip (exact)", aria_dtype_name(dt));
+        if (io != 0) { printf("FAIL %s: io error\n", tag); fails++; }
+        else check_le(tag, md, 0.0f);
+        aria_qweight_free(&a); aria_qweight_free(&c);
+        free(W); free(x); free(y1); free(y2);
+    }
+
     if (fails) { printf("test_quant: %d failures\n", fails); return 1; }
     printf("test_quant: OK\n");
     return 0;

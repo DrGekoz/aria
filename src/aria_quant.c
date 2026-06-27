@@ -145,6 +145,35 @@ size_t aria_qweight_bytes(const aria_qweight *w) {
     return (size_t)w->N * w->K * sizeof(float);
 }
 
+int aria_qweight_write(FILE *f, const aria_qweight *w) {
+    if (w->dt != ARIA_Q8 && w->dt != ARIA_Q4) return -1;
+    int32_t hdr[3] = { (int32_t)w->dt, w->N, w->K };
+    size_t qb = (w->dt == ARIA_Q8) ? aria_q8_qbytes(w->N, w->K) : aria_q4_qbytes(w->N, w->K);
+    size_t ns = (w->dt == ARIA_Q8) ? aria_q8_nscale(w->N, w->K) : aria_q4_nscale(w->N, w->K);
+    uint64_t qb64 = qb, ns64 = ns;
+    if (fwrite(hdr, sizeof(int32_t), 3, f) != 3) return -1;
+    if (fwrite(&qb64, sizeof(uint64_t), 1, f) != 1) return -1;
+    if (fwrite(w->q, 1, qb, f) != qb) return -1;
+    if (fwrite(&ns64, sizeof(uint64_t), 1, f) != 1) return -1;
+    if (fwrite(w->scale, sizeof(float), ns, f) != ns) return -1;
+    return 0;
+}
+
+int aria_qweight_read(FILE *f, aria_qweight *w) {
+    int32_t hdr[3];
+    if (fread(hdr, sizeof(int32_t), 3, f) != 3) return -1;
+    w->dt = (aria_dtype)hdr[0]; w->N = hdr[1]; w->K = hdr[2]; w->f32 = NULL; w->q = NULL; w->scale = NULL;
+    if (w->dt != ARIA_Q8 && w->dt != ARIA_Q4) return -1;
+    uint64_t qb64, ns64;
+    if (fread(&qb64, sizeof(uint64_t), 1, f) != 1) return -1;
+    w->q = malloc(qb64);
+    if (!w->q || fread(w->q, 1, qb64, f) != qb64) return -1;
+    if (fread(&ns64, sizeof(uint64_t), 1, f) != 1) return -1;
+    w->scale = (float *)malloc(ns64 * sizeof(float));
+    if (!w->scale || fread(w->scale, sizeof(float), ns64, f) != ns64) return -1;
+    return 0;
+}
+
 void aria_linear_q4(float *y, const float *x, const uint8_t *q, const float *scale,
                     const float *b, int M, int K, int N) {
     int nblk = aria_q4_nblocks(K);

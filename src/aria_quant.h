@@ -18,6 +18,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -77,6 +78,12 @@ void aria_qweight_free(aria_qweight *w);
 void aria_linear_qw(float *y, const float *x, const aria_qweight *w, const float *b, int M);
 /* packed size in bytes (q data + scales), for footprint reporting. */
 size_t aria_qweight_bytes(const aria_qweight *w);
+
+/* serialize a Q8/Q4 weight to/from a binary stream (offline packing, E9.2).
+ * Layout: [int32 dt][int32 N][int32 K][u64 qbytes][q...][u64 nscale][f32 scale...].
+ * _read allocates q/scale (owned). Both return 0 on success, <0 on error. */
+int aria_qweight_write(FILE *f, const aria_qweight *w);
+int aria_qweight_read(FILE *f, aria_qweight *w);
 
 #ifdef __cplusplus
 }
