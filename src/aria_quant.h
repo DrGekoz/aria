@@ -17,6 +17,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef enum {
     ARIA_F32  = 0,   /* float32 (zero-copy from the mmap; the default) */
     ARIA_F16  = 1,   /* float16 storage, fp32 compute (E9.0 wiring) */
@@ -69,5 +73,9 @@ void aria_qweight_free(aria_qweight *w);
 void aria_linear_qw(float *y, const float *x, const aria_qweight *w, const float *b, int M);
 /* packed size in bytes (q data + scales), for footprint reporting. */
 size_t aria_qweight_bytes(const aria_qweight *w);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* ARIA_QUANT_H */

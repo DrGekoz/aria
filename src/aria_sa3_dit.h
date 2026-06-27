@@ -127,7 +127,9 @@ void aria_sa3_dit_global_cond(const aria_sa3_dit *m, const float *global_seconds
  * Weights are uploaded once as fp16 (fp32 compute); the denoise loop runs on the
  * device, only the per-step latent/velocity cross the bus. All host pointers. */
 typedef struct aria_cuda_dit aria_cuda_dit;
-aria_cuda_dit *aria_cuda_dit_create(const aria_sa3_dit_view *v);   /* NULL if no device / no fit */
+/* precision: ARIA_F32 (fp16 storage), or ARIA_Q8/ARIA_Q4 (weights packed in VRAM,
+ * dequant-on-use to fp16 -> medium fits low VRAM). NULL if no device / no fit. */
+aria_cuda_dit *aria_cuda_dit_create(const aria_sa3_dit_view *v, aria_dtype precision);
 void aria_cuda_dit_free(aria_cuda_dit *h);
 void aria_cuda_dit_set_request(aria_cuda_dit *h, const aria_sa3_dit_req_view *rv);
 /* v_CT = velocity(x_CT, gcond); x_CT/v_CT are [io_channels, T], gcond is [6*ed]. */

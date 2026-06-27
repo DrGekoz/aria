@@ -22,7 +22,7 @@ int8/q4 quantization, as a library + CLI — all parity-gated.
 | **M2** ✅ | Self-contained text: T5Gemma encoder in C | E3.4 + E3.5 |
 | **M3** ✅ | continue / inpaint working | E7.4 |
 | **M4** ✅ | CUDA end-to-end generation | E8.5 |
-| **M5** | Quantized (Q4) — medium fits low VRAM | E9.4 |
+| **M5** 🟡 | Quantized (Q4) — medium fits low VRAM | E9.4 |  ← mechanism done (CPU+GPU Q8/Q4); q4 fidelity tuning + medium (E10) remain |
 | **M6** | medium model end-to-end | E10.2 |
 | **M7** | Steering (TasteSteer): latent + DiT-residual + cond-space injection, training-free | E12.7 |
 | **v1.0.0** | Release checklist green | E11.7 |
@@ -139,7 +139,7 @@ quant), **E8.5c** (GPU decoder), **E10** (medium), **E12** (steering).
 - 🟡 **E9.1** `∥` **P1** Q8 (int8 per-row) pack/unpack + CPU dequant-on-use gemm. **Primitive done** (`aria_quant.{c,h}`): `aria_q8_quant` (per-row symmetric, scale=max\|·\|/127) + `aria_linear_q8` (dequant-on-use, scale factors out per row). Hermetic `test_quant`: round-trip within half-step, GEMM relerr 0.6–1.0 % on the SA3 shapes (4× smaller than f32). **Wired** into the DiT (E9.0 overlay): `--precision q8` quantizes the block GEMMs on first use; `test_quant_dit` gates the model-level effect at **3.1 % velocity rel-RMS** (4.0× smaller block weights, 1.6 GB → 401 MB), and the f32 round-trip is bit-identical. deps: E9.0.
 - ⬜ **E9.2** **P1** `aria-quantize` offline tool (safetensors → packed `.aria`: fp16/Q8/Q4). deps: E9.1 · Verify: round-trip; aria loads packed model + generates.
 - 🟡 **E9.3** **P1** Q4 (block) pack + dequant-on-use. **Primitive done** (`aria_quant.{c,h}`): `aria_q4_quant` (per-block symmetric, block 32, scale=max\|·\|/7, 2 nibbles/byte stored as v+8) + `aria_linear_q4` (dequant-on-use, scale factors out per block). Hermetic `test_quant`: GEMM relerr 9–11 % on the SA3 shapes (~8× smaller than f32; Q4 is coarse — end-to-end quality tuning rides on model wiring). **Wired** into the DiT (`--precision q4`): 6.4× smaller block weights (1.6 GB → 250 MB). But at full precision elsewhere it's **coarse** — `test_quant_dit` shows 36.8 % velocity rel-RMS (bounded/finite, no NaN). Usable Q4 fidelity needs **mixed precision** (keep the FFN — the largest, most error-prone weights — in q8) or smaller blocks; that tuning + the CUDA dequant path (E9.4) is what closes M5. deps: E9.1.
-- ⬜ **E9.4** **P1** CUDA dequant-on-use kernels (Q8/Q4). deps: E8.2, E9.3 · Verify: cuda quant parity. **← M5**
+- ✅ **E9.4** **P1** CUDA dequant-on-use kernels (Q8/Q4). The device DiT stores the block GEMM weights **packed in VRAM** (`dqw`: q8/q4 + scales) and dequantizes each into a reused fp16 scratch (`k_dequant_q8/q4`) before the tensor-core cuBLAS GEMM — so resident VRAM shrinks (small-music 3070-class: fp16 ~1.73 GB → **q8 1.40 GB → q4 1.25 GB**), which is what lets medium fit. `--precision q8|q4` now runs on the GPU (host-quantizes the f32 view, uploads packed; host cross-K/V uses the CPU overlay, so it stays consistent). deps: E8.2, E9.3 · Verified on the GT 1030: compiles (nvcc 11.2), output **finite and numerically identical to the CPU quant path** (q8/q4 RMS match to 5 dp), `test_cuda` op-parity unchanged. **Note:** the GT 1030 (no tensor cores) is slightly *slower* at q8/q4 (dequant overhead, fp16 falls back to fp32); the speed win + the medium-fits payoff want the **RTX 3070** (sm_86) — bench there. **← M5 (mechanism; the medium demo lands with E10)**
 
 ## E10 — medium model
 

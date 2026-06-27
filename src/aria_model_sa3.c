@@ -250,20 +250,14 @@ static int sa3_generate(aria_ctx *ctx, void *state,
 
     int profile = getenv("ARIA_PROFILE") != NULL;
 
-    /* precision: q8/q4 quantize the DiT block GEMMs (CPU path); fp16/bf16 are not
-     * yet a distinct CPU storage format, so they fall back to fp32 here. Idempotent
-     * + must run before req_begin (the cross-K/V projection uses the overlay). */
-    aria_dtype cpu_prec = (p->precision == ARIA_Q8 || p->precision == ARIA_Q4) ? p->precision : ARIA_F32;
-    aria_sa3_dit_quantize(st->dit, cpu_prec);
-    int quant = (cpu_prec != ARIA_F32);
-    if (quant) {
-        static int announced = 0;
-        if (!announced) {
-            fprintf(stderr, "[aria] DiT: %s block weights = %.0f MB (CPU)\n",
-                    aria_dtype_name(cpu_prec), aria_sa3_dit_weight_bytes(st->dit) / 1048576.0);
-            announced = 1;
-        }
-    }
+    /* precision: q8/q4 quantize the DiT block GEMMs. On the GPU the weights are
+     * packed in VRAM and dequantized on use; on the CPU an overlay dispatches the
+     * dequant kernels. fp16/bf16 are not yet a distinct CPU format -> fp32 there.
+     * The host-side cross-K/V projection uses the CPU overlay (so it must run
+     * before req_begin), keeping it consistent with the quantized GPU weights. */
+    aria_dtype prec = (p->precision == ARIA_Q8 || p->precision == ARIA_Q4) ? p->precision : ARIA_F32;
+    aria_sa3_dit_quantize(st->dit, prec);
+    int quant = (prec != ARIA_F32);
 
     double t0 = sa3_now();
     aria_sa3_dit_req *req = aria_sa3_dit_req_begin(st->dit, T, cross, n_cond, sec_emb);
@@ -278,16 +272,18 @@ static int sa3_generate(aria_ctx *ctx, void *state,
 #ifdef ARIA_CUDA
     /* auto: use the GPU only if it's worth it (sm_70+) and fits (create returns NULL
      * on OOM -> CPU); cuda: force any device (still CPU-fallback on OOM); cpu: never.
-     * Inpaint stays on the CPU DiT -- the device DiT has no local-cond path yet. */
-    int want_gpu = !p->init_audio && !quant &&
+     * Inpaint stays on the CPU DiT -- the device DiT has no local-cond path yet.
+     * Quantized (q8/q4) runs on the GPU: weights packed in VRAM, dequant-on-use. */
+    int want_gpu = !p->init_audio &&
                    ((p->device == ARIA_DEVICE_CUDA && aria_cuda_available()) ||
                     (p->device == ARIA_DEVICE_AUTO && aria_cuda_recommended()));
     if (want_gpu) {
         if (!st->cdit) {   /* upload weights once; reused across generations */
             aria_sa3_dit_view view; aria_sa3_dit_get_view(st->dit, &view);
-            st->cdit = aria_cuda_dit_create(&view);
+            st->cdit = aria_cuda_dit_create(&view, prec);
             const char *how = p->device == ARIA_DEVICE_AUTO ? "auto" : "forced";
-            if (st->cdit) fprintf(stderr, "[aria] DiT: GPU device-resident, fp16 (%s)\n", how);
+            const char *pn = quant ? aria_dtype_name(prec) : "fp16";
+            if (st->cdit) fprintf(stderr, "[aria] DiT: GPU device-resident, %s (%s)\n", pn, how);
             else fprintf(stderr, "[aria] DiT: GPU insufficient VRAM, using CPU (%s)\n", how);
         }
         if (st->cdit) {
@@ -304,6 +300,18 @@ static int sa3_generate(aria_ctx *ctx, void *state,
         }
     }
 #endif
+    int on_gpu = 0;
+#ifdef ARIA_CUDA
+    on_gpu = (dc.cdit != NULL);
+#endif
+    if (quant && !on_gpu) {
+        static int announced = 0;
+        if (!announced) {
+            fprintf(stderr, "[aria] DiT: %s block weights = %.0f MB (CPU)\n",
+                    aria_dtype_name(prec), aria_sa3_dit_weight_bytes(st->dit) / 1048576.0);
+            announced = 1;
+        }
+    }
     double t1 = sa3_now();
     aria_pingpong(x, n, sched, steps, sa3_denoise, &dc, &rng, NULL);
     double t2 = sa3_now();

@@ -60,10 +60,13 @@ GEMMs dispatch through an `aria_qweight` overlay (`aria_quant.{c,h}`): fp32 keep
 mmap path (bit-identical), **q8** quantizes to per-row int8 (4.0× smaller block weights:
 1.6 GB → 401 MB; **3.1 % velocity rel-RMS** — usable), **q4** to per-block int4 (6.4× smaller →
 250 MB; coarse at **36.8 %** — needs better quantization on the attention path). `test_quant`
-(hermetic) + `test_quant_dit` (model-level) gate it. CUDA stays fp16/fp32-accumulate (GPU
-precision selection + dequant kernels are **E9.4**). **Caveat:** CPU quant is a *footprint* win,
-not speed — the scalar dequant GEMM is ~6–8× slower than the AVX2 f32 microkernel; the speed win
-is the GPU (E9.4). fp16/bf16 fall back to fp32 on CPU for now.
+(hermetic) + `test_quant_dit` (model-level) gate it. **On the GPU (E9.4)** `--precision q8|q4`
+keeps the DiT block weights **packed in VRAM** and dequantizes on use into a reused fp16 scratch
+before the tensor-core GEMM, so resident VRAM shrinks (small-music: fp16 ~1.73 GB → q8 1.40 GB →
+q4 1.25 GB) — the path that lets medium fit. Verified on the GT 1030: output is finite and
+numerically identical to the CPU quant path. **Caveat:** CPU quant is a *footprint* win, not
+speed (scalar dequant GEMM ~6–8× slower than the AVX2 f32 kernel); the GPU speed win wants tensor
+cores (RTX 3070, sm_86 — bench there). fp16/bf16 fall back to fp32/fp16 for now.
 
 ## Source map (`src/`)
 
@@ -103,7 +106,7 @@ is the GPU (E9.4). fp16/bf16 fall back to fp32 on CPU for now.
 | **E6** Sampler + end-to-end | ✅ (E6.5 ⬜) | LogSNR + xoshiro + pingpong + e2e WAV; CFG/`--cfg` flag ⬜ (base-checkpoint only) |
 | **E7** continue / inpaint | ✅ | taae **encoder** (parity 9e-4), inpaint mask + local-add cond (exact), `--continue`/`--inpaint`, e2e parity (audio 2.4e-4); CPU DiT (GPU local-cond ⬜) |
 | **E8** CUDA backend | ✅ E8.1–E8.5d · ⬜ E8.5e/E8.6 | scaffold, all op kernels, device-resident **DiT + decoder**, profile-guided kernels (4.73→**0.29 s** warm — **on par with / ahead of PyTorch**); last micro-opts (E8.5e) + SSD streaming ⬜ |
-| **E9** Precision & Quantization | 🟡 E9.0/E9.1 · 🟡 E9.3 | `aria_quant` (Q8/Q4 pack + dequant GEMM) + `--precision` dispatch seam wired into the DiT; **q8 usable** (3.1 % velocity, 4× smaller), q4 mechanism works but coarse. ⬜ q4 fidelity (better quant), E9.2 `aria-quantize` tool, E9.4 CUDA dequant (the GPU VRAM/speed payoff → M5) |
+| **E9** Precision & Quantization | 🟡 E9.0/E9.1 · 🟡 E9.3 · ✅ E9.4 | `aria_quant` (Q8/Q4 pack + dequant GEMM) + `--precision` seam wired into the DiT on **CPU and GPU**; q8 usable (3.1 % velocity, 4× smaller), q4 coarse; **GPU keeps weights packed in VRAM, dequant-on-use** (fp16 1.73 → q8 1.40 → q4 1.25 GB; lets medium fit). ⬜ q4 fidelity, E9.2 `aria-quantize` tool |
 | **E10** medium model | ⬜ | embed 1536 / depth 24 / differential DiT attn |
 | **E11** Release polish (v1.0.0) | ⬜ | API/install finalize, CLI UX, Philox RNG, docs, CI |
 | **E12** Steering (TasteSteer) | ⬜ | latent / DiT-residual / cond-space hooks + `--steer` |
@@ -117,8 +120,8 @@ is the GPU (E9.4). fp16/bf16 fall back to fp32 on CPU for now.
   speed is the **RTX 3070** (sm_86).
 - **Continue/inpaint runs on the CPU DiT** — the device DiT has no local-cond path yet (follow-up).
   Init WAV must already be at the model sample rate (44.1 kHz); no resampler yet.
-- **Quantization is CPU-only and a footprint win, not speed** (scalar dequant GEMM); q8 is
-  usable, q4 is coarse. GPU dequant kernels (the VRAM/speed payoff, E9.4) + q4 fidelity tuning
-  are pending.
+- **Quantization**: q8 usable, q4 coarse; on CPU it's a footprint win not speed (scalar dequant
+  GEMM). On GPU the weights are packed in VRAM (dequant-on-use) — the medium-fits path — but the
+  speed win needs tensor cores (verify on the RTX 3070). q4 fidelity tuning pending.
 - Not implemented: medium (E10), steering (E12), batch/server APIs (E13.1/2), SSD streaming
-  (E8.6), GPU inpaint, GPU quantization.
+  (E8.6), GPU inpaint, offline `aria-quantize` (E9.2).
