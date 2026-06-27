@@ -47,12 +47,13 @@ generation)** reached.
 | CPU 8-core (dev box) | ~9 s | AVX2 microkernel + arena |
 | CPU 20-core (RTX box) | 9.4 s | |
 | **RTX 3070 warm fp16** | **0.29 s** | dit 0.16 + decode 0.03 (GPU) + setup 0.10 — full pipeline device-resident · **1464 MB VRAM** |
-| RTX 3070 warm **q8** | 0.35 s | dit 0.20 · **1142 MB VRAM (−22 %)** — weights packed in VRAM, dequant-on-use |
-| RTX 3070 warm **q4** | 0.33 s | dit 0.20 · **984 MB VRAM (−33 %)** |
+| RTX 3070 warm **q8** | 0.36 s | dit 0.27 · **1142 MB VRAM (−22 %)** · 2.45 % velocity — weights packed in VRAM, dequant-on-use |
+| RTX 3070 warm **q4** | 0.35 s | dit 0.22 · **1080 MB VRAM (−26 %)** · 9.3 % velocity (asym + Q8 attention) |
 | GT 1030 (2 GB) | slower than CPU | correctness-only (fits via fp16; weak Pascal) |
 
-_GPU quant (q8/q4) costs ~15–20 % time for 22–33 % VRAM — tensor cores keep the GEMM fast; the
-saving is what lets the larger medium model fit. (Benchmarked on the RTX 3070, sm_86.)_
+_GPU quant (q8/q4) costs ~20 % time for a 22–26 % VRAM cut — tensor cores keep the GEMM fast; the
+saving is what lets the larger medium model fit. Tuned q4 is the smallest VRAM (below q8) at near
+q8 fidelity. (Benchmarked on the RTX 3070, sm_86.)_
 | _ref: stable-audio-tools (3070, warm)_ | _0.36 s_ | **aria is on par / ahead** (was 13× slower originally) |
 
 PyTorch CPU reference is ~5.6 s warm; aria CPU is competitive once one-time weight fault-in is
