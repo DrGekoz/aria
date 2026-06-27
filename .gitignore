@@ -1,5 +1,7 @@
 build/
 aria
+aria-quantize
+example
 *.o
 *.a
 *.wav

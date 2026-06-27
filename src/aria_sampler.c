@@ -107,7 +107,18 @@ float aria_rng_gaussian(aria_rng *r) {
 }
 
 void aria_rng_randn(aria_rng *r, float *out, int n) {
-    if (r->mode == ARIA_RNG_TORCH && n >= 16) { mt_normal_fill(r, out, n); return; }
+    if (r->mode == ARIA_RNG_TORCH) {
+        /* always the MT path so torch mode never reads uninitialized xoshiro state.
+         * n>=16 (every generation case, n=256*T) bit-matches torch.randn; n<16 is a
+         * deterministic MT block (torch uses a different scalar path there, so it is
+         * not bit-exact for n<16 -- never hit in generation). */
+        if (n >= 16) { mt_normal_fill(r, out, n); return; }
+        float tmp[16];
+        for (int i = 0; i < 16; i++) tmp[i] = mt_uniform_f(r);
+        mt_normal_fill_16(tmp);
+        for (int i = 0; i < n; i++) out[i] = tmp[i];
+        return;
+    }
     for (int i = 0; i < n; i++) out[i] = aria_rng_gaussian(r);
 }
 

@@ -45,6 +45,15 @@ int main(void) {
     ok &= check_torch("", 0, TORCH_SEED0);
     ok &= check_torch("", 42, TORCH_SEED42);
 
+    /* (3) torch mode with n<16 must be deterministic + finite (no uninitialized
+     * xoshiro read), even though it is not bit-exact to torch's small-n path. */
+    aria_rng t1, t2; aria_rng_init(&t1, 5, ARIA_RNG_TORCH); aria_rng_init(&t2, 5, ARIA_RNG_TORCH);
+    float s1[7], s2[7]; aria_rng_randn(&t1, s1, 7); aria_rng_randn(&t2, s2, 7);
+    int small_ok = 1;
+    for (int i = 0; i < 7; i++) if (s1[i] != s2[i] || !isfinite(s1[i])) small_ok = 0;
+    printf("%-4s torch-rng n<16 deterministic + finite\n", small_ok ? "ok" : "FAIL");
+    ok &= small_ok;
+
     if (!ok) { printf("test_rng FAILED\n"); return 1; }
     printf("test_rng passed\n");
     return 0;
