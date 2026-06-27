@@ -132,8 +132,8 @@ static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
     {
         int nq = diff ? 5 : 3;
         float *qkv = aria_arena_floats(ar, (size_t)S * nq * dim);
-        if (bq && !diff) aria_linear_qw(qkv, h, &bq->sa_to_qkv, NULL, S);
-        else             aria_linear(qkv, h, w->sa_to_qkv, NULL, S, dim, nq * dim);
+        if (bq) aria_linear_qw(qkv, h, &bq->sa_to_qkv, NULL, S);  /* bq sized nq*dim */
+        else    aria_linear(qkv, h, w->sa_to_qkv, NULL, S, dim, nq * dim);
         extract_heads(qh, qkv, S, H, hd, nq * dim, 0);
         extract_heads(kh, qkv, S, H, hd, nq * dim, dim);
         extract_heads(vh, qkv, S, H, hd, nq * dim, 2 * dim);
@@ -167,8 +167,8 @@ static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
     {
         int nq = diff ? 2 : 1;
         float *q = aria_arena_floats(ar, (size_t)S * nq * dim);
-        if (bq && !diff) aria_linear_qw(q, h, &bq->ca_to_q, NULL, S);
-        else             aria_linear(q, h, w->ca_to_q, NULL, S, dim, nq * dim);
+        if (bq) aria_linear_qw(q, h, &bq->ca_to_q, NULL, S);  /* bq sized nq*dim */
+        else    aria_linear(q, h, w->ca_to_q, NULL, S, dim, nq * dim);
         extract_heads(qh, q, S, H, hd, nq * dim, 0);
         aria_rmsnorm(qh, qh, w->ca_q_norm, H * S, hd, eps_qk);
         aria_attention(ao, qh, cross_k, cross_v, H, S, Sc, hd, NULL, scores);
@@ -358,13 +358,14 @@ void aria_sa3_dit_quantize(aria_sa3_dit *m, aria_dtype dt) {
      * makes Q4 usable -- ~9% DiT velocity error vs ~23% for uniform asym-Q4. The
      * Q8 path stays uniform Q8. (The GPU mirrors this in aria_cuda_dit_create.) */
     aria_dtype adt = (dt == ARIA_Q4) ? ARIA_Q8 : dt;   /* attention precision */
+    int nq = m->differential ? 5 : 3, ncq = m->differential ? 2 : 1;  /* medium: 5/2-way */
     m->bq = calloc((size_t)m->depth, sizeof(dit_block_q));
     for (int i = 0; i < m->depth; i++) {
         const aria_dit_block_w *w = &m->blocks[i];
         dit_block_q *q = &m->bq[i];
-        aria_qweight_set(&q->sa_to_qkv, w->sa_to_qkv, 3 * ed, ed, adt);
+        aria_qweight_set(&q->sa_to_qkv, w->sa_to_qkv, nq * ed, ed, adt);
         aria_qweight_set(&q->sa_to_out, w->sa_to_out, ed, ed, adt);
-        aria_qweight_set(&q->ca_to_q,   w->ca_to_q,   ed, ed, adt);
+        aria_qweight_set(&q->ca_to_q,   w->ca_to_q,   ncq * ed, ed, adt);
         aria_qweight_set(&q->ca_to_out, w->ca_to_out, ed, ed, adt);
         aria_qweight_set(&q->ff_in_w,   w->ff_in_w,   2 * inner, ed, dt);
         aria_qweight_set(&q->ff_out_w,  w->ff_out_w,  ed, inner, dt);
@@ -427,7 +428,8 @@ size_t aria_sa3_dit_weight_bytes(const aria_sa3_dit *m) {
     if (!m) return 0;
     if (!m->bq) {
         int ed = m->ed, inner = m->inner;   /* the 6 per-step GEMMs (ca_to_kv excluded) */
-        size_t per = ((size_t)3 * ed * ed + (size_t)ed * ed + (size_t)ed * ed
+        int nq = m->differential ? 5 : 3, ncq = m->differential ? 2 : 1;
+        size_t per = ((size_t)nq * ed * ed + (size_t)ed * ed + (size_t)ncq * ed * ed
                       + (size_t)ed * ed + (size_t)2 * inner * ed + (size_t)ed * inner) * sizeof(float);
         return per * m->depth;
     }
