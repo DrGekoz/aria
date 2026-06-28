@@ -48,7 +48,7 @@ differential DiT + a sliding-window/sinusoidal taae decoder, both device-residen
 
 | backend | time | notes |
 |---|---|---|
-| CPU 8-core (dev box) | ~8 s | AVX2 microkernel + arena + SIMD RMSNorm (DiT 7.36→6.58 s); GEMM-bound beyond this |
+| CPU 8-core (dev box) | ~5 s | packed outer-product GEMM (490–540 GFLOP/s, ~2× the old dot-product) + SIMD RMSNorm + arena |
 | CPU 20-core (RTX box) | 9.4 s | |
 | **RTX 3070 warm fp16** | **0.29 s** | dit 0.16 + decode 0.03 (GPU) + setup 0.10 — full pipeline device-resident · **1464 MB VRAM** |
 | RTX 3070 warm **q8** | 0.36 s | dit 0.27 · **1142 MB VRAM (−22 %)** · 2.45 % velocity — weights packed in VRAM, dequant-on-use |
