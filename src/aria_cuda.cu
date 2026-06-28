@@ -438,14 +438,27 @@ static __half *da_alloc_half(darena *a, size_t nh) {
 static size_t da_save(darena *a) { return a->used; }
 static void da_restore(darena *a, size_t m) { a->used = m; }
 
-/* multi-head SDPA, all heads batched, on fp16 TENSOR CORES (scale 1/sqrt(D)).
- * q/k/v (fp32) are converted to fp16 in arena scratch; QK^T runs fp16->fp32 scores,
- * softmax in fp32, then fp16 AV. ~2-4x the fp32 cublasSgemmStridedBatched it replaced
- * (which used no tensor cores). scores holds [H, Nq, Nk]; out is fp32. */
+/* multi-head SDPA, all heads batched (scale 1/sqrt(D)). scores holds [H,Nq,Nk].
+ * fp16=1: q/k/v converted to fp16 in arena scratch and the QK^T/AV run on tensor
+ * cores (fp16->fp32 scores, fp32 softmax, fp16 AV) -- ~2-4x the fp32 sgemm path, used
+ * for the DiT (the dominant attention). fp16=0: the original fp32 cublasSgemm path,
+ * kept for the cheap small-music decoder chunks where fp16 would only cost accuracy. */
 static void attn_dev(cublasHandle_t cb, darena *ar, float *out, const float *q, const float *k,
-                     const float *v, int H, int Nq, int Nk, int D, float *scores) {
+                     const float *v, int H, int Nq, int Nk, int D, float *scores, int fp16) {
     const float scale = 1.0f / sqrtf((float)D), one = 1.0f, zero = 0.0f;
-    size_t nq = (size_t)H * Nq * D, nk = (size_t)H * Nk * D, ns = (size_t)H * Nq * Nk;
+    size_t ns = (size_t)H * Nq * Nk;
+    if (!fp16) {
+        cublasSgemmStridedBatched(cb, CUBLAS_OP_T, CUBLAS_OP_N, Nk, Nq, D,
+            &one, k, D, (long long)Nk * D, q, D, (long long)Nq * D,
+            &zero, scores, Nk, (long long)Nq * Nk, H);
+        k_scale<<<nblocks(ns), THREADS>>>(scores, scores, scale, H * Nq * Nk);
+        k_softmax<<<H * Nq, RED_TH>>>(scores, H * Nq, Nk, NULL);
+        cublasSgemmStridedBatched(cb, CUBLAS_OP_N, CUBLAS_OP_N, D, Nq, Nk,
+            &one, v, D, (long long)Nk * D, scores, Nk, (long long)Nq * Nk,
+            &zero, out, D, (long long)Nq * D, H);
+        return;
+    }
+    size_t nq = (size_t)H * Nq * D, nk = (size_t)H * Nk * D;
     size_t mark = da_save(ar);
     __half *qh = da_alloc_half(ar, nq), *kh = da_alloc_half(ar, nk);
     __half *vh = da_alloc_half(ar, nk), *sh = da_alloc_half(ar, ns);
@@ -605,7 +618,7 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     k_rmsnorm<<<H * S, RED_TH>>>(kh, kh, w->sa_k_norm, H * S, hd, 1e-6f, 0);
     k_rope<<<nblocks((size_t)H * S), THREADS>>>(qh, h->rope_cos, h->rope_sin, H, S, hd, rot);
     k_rope<<<nblocks((size_t)H * S), THREADS>>>(kh, h->rope_cos, h->rope_sin, H, S, hd, rot);
-    attn_dev(h->cublas, ar, ao, qh, kh, vh, H, S, S, hd, scores);
+    attn_dev(h->cublas, ar, ao, qh, kh, vh, H, S, S, hd, scores, 1);
     if (diff) {
         k_extract_heads<<<nHShd, THREADS>>>(qdh, qkv, S, H, hd, nq * dim, 3 * dim);
         k_extract_heads<<<nHShd, THREADS>>>(kdh, qkv, S, H, hd, nq * dim, 4 * dim);
@@ -613,7 +626,7 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
         k_rmsnorm<<<H * S, RED_TH>>>(kdh, kdh, w->sa_k_norm, H * S, hd, 1e-6f, 0);
         k_rope<<<nblocks((size_t)H * S), THREADS>>>(qdh, h->rope_cos, h->rope_sin, H, S, hd, rot);
         k_rope<<<nblocks((size_t)H * S), THREADS>>>(kdh, h->rope_cos, h->rope_sin, H, S, hd, rot);
-        attn_dev(h->cublas, ar, aod, qdh, kdh, vh, H, S, S, hd, scores);
+        attn_dev(h->cublas, ar, aod, qdh, kdh, vh, H, S, S, hd, scores, 1);
         k_sub<<<nblocks(nHSd), THREADS>>>(ao, aod, nHSd);
     }
     k_merge_heads<<<nHShd, THREADS>>>(merged, ao, S, H, hd);
@@ -629,11 +642,11 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     gemm_dqw(h, q, hh, &w->ca_to_q, NULL, S);
     k_extract_heads<<<nHShd, THREADS>>>(qh, q, S, H, hd, ncq * dim, 0);
     k_rmsnorm<<<H * S, RED_TH>>>(qh, qh, w->ca_q_norm, H * S, hd, 1e-6f, 0);
-    attn_dev(h->cublas, ar, ao, qh, h->cross_k[blk], h->cross_v[blk], H, S, Sc, hd, scores);
+    attn_dev(h->cublas, ar, ao, qh, h->cross_k[blk], h->cross_v[blk], H, S, Sc, hd, scores, 1);
     if (diff) {
         k_extract_heads<<<nHShd, THREADS>>>(qdh, q, S, H, hd, ncq * dim, dim);
         k_rmsnorm<<<H * S, RED_TH>>>(qdh, qdh, w->ca_q_norm, H * S, hd, 1e-6f, 0);
-        attn_dev(h->cublas, ar, aod, qdh, h->cross_kd[blk], h->cross_v[blk], H, S, Sc, hd, scores);
+        attn_dev(h->cublas, ar, aod, qdh, h->cross_kd[blk], h->cross_v[blk], H, S, Sc, hd, scores, 1);
         k_sub<<<nblocks(nHSd), THREADS>>>(ao, aod, nHSd);
     }
     k_merge_heads<<<nHShd, THREADS>>>(merged, ao, S, H, hd);
@@ -945,8 +958,8 @@ static void taae_block_dev(aria_cuda_dec *h, float *seq, int B, const dec_blk_de
     k_rope<<<nblocks(bhs), THREADS>>>(qd, h->rcos, h->rsin, B * H, S, hd, DC_ROT);
     k_rope<<<nblocks(bhs), THREADS>>>(k,  h->rcos, h->rsin, B * H, S, hd, DC_ROT);
     k_rope<<<nblocks(bhs), THREADS>>>(kd, h->rcos, h->rsin, B * H, S, hd, DC_ROT);
-    attn_dev(h->cublas, ar, ob, q,  k,  v, B * H, S, S, hd, scores);
-    attn_dev(h->cublas, ar, od, qd, kd, v, B * H, S, S, hd, scores);
+    attn_dev(h->cublas, ar, ob, q,  k,  v, B * H, S, S, hd, scores, 0);
+    attn_dev(h->cublas, ar, od, qd, kd, v, B * H, S, S, hd, scores, 0);
     k_subtract<<<nblocks((size_t)NH), THREADS>>>(ob, od, (size_t)NH);
     k_merge_heads_b<<<nblocks((size_t)NH), THREADS>>>(merged, ob, B, S, H, hd);
     gemm_f16w(h->cublas, ar, o, merged, w->to_out, NULL, N, D, D);
