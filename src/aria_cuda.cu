@@ -586,6 +586,10 @@ struct aria_cuda_dit {
     float **cross_k, **cross_v, **cross_kd;
     float **local_emb; int has_local;   /* [depth] each [S, ed]; inpaint local-additive cond */
     darena arena;
+    /* CUDA Graph: capture the per-step compute once (fixed device pointers + deterministic
+     * arena offsets), replay per denoise step -> kills per-step kernel-launch overhead. */
+    cudaGraphExec_t graph_exec; cudaGraph_t graph;
+    int graph_ready, graph_failed; void *cublas_ws;
 };
 
 /* a[i] -= b[i] (differential attention combine on the device) */
@@ -717,6 +721,12 @@ extern "C" aria_cuda_dit *aria_cuda_dit_create(const aria_sa3_dit_view *v, aria_
     h->inner = inner; h->io_ch = v->io_ch; h->n_mem = v->n_mem; h->rot = v->rot_dim;
     h->precision = precision; h->differential = v->differential;
     if (cublasCreate(&h->cublas) != CUBLAS_STATUS_SUCCESS) { free(h); return NULL; }
+    /* --default-stream per-thread makes every <<<>>> launch use the (capturable) per-thread
+     * stream; pin cuBLAS to it too so GEMMs and kernels share one stream. A fixed workspace
+     * stops cuBLAS lazily cudaMalloc-ing mid graph-capture (which would abort the capture). */
+    cublasSetStream(h->cublas, cudaStreamPerThread);
+    if (cudaMalloc(&h->cublas_ws, 4u << 20) == cudaSuccess)
+        cublasSetWorkspace(h->cublas, h->cublas_ws, 4u << 20);
     if (precision != ARIA_F32) { CK(cudaMalloc(&h->dqbuf, (size_t)2 * inner * ed * sizeof(__half))); }
     int C = v->io_ch;
     h->preprocess  = upload_f16(v->preprocess,  (size_t)C * C);
@@ -762,6 +772,11 @@ extern "C" aria_cuda_dit *aria_cuda_dit_create(const aria_sa3_dit_view *v, aria_
 /* free per-request device buffers (so set_request can be re-called per generation) */
 static void free_request(aria_cuda_dit *h) {
     if (!h->have_req) return;
+    /* the captured graph baked in this request's device pointers + (S,T) shape -> drop it
+     * so the next request re-captures against its fresh arena/buffers. */
+    if (h->graph_ready) cudaGraphExecDestroy(h->graph_exec);
+    if (h->graph) cudaGraphDestroy(h->graph);
+    h->graph = NULL; h->graph_ready = 0; h->graph_failed = 0;
     cudaFree(h->dx); cudaFree(h->dv); cudaFree(h->dgcond);
     cudaFree(h->rope_cos); cudaFree(h->rope_sin); cudaFree(h->arena.base);
     if (h->cross_k) for (int b = 0; b < h->depth; b++) cudaFree(h->cross_k[b]);
@@ -841,10 +856,11 @@ extern "C" void aria_cuda_dit_set_request(aria_cuda_dit *h, const aria_sa3_dit_r
     h->have_req = 1;
 }
 
-extern "C" void aria_cuda_dit_step(aria_cuda_dit *h, float *v_CT, const float *x_CT, const float *gcond) {
+/* the per-step compute (reads h->dx + h->dgcond, writes h->dv). Pure async work on the
+ * per-thread stream + a deterministic arena, so it can be CUDA-graph captured and replayed.
+ * The D2D memory-token copy is async (a sync copy would abort a stream capture). */
+static void dit_step_compute(aria_cuda_dit *h) {
     int C = h->io_ch, ed = h->ed, Mt = h->n_mem, S = h->S, T = h->T;
-    cudaMemcpy(h->dx, x_CT, (size_t)C * T * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(h->dgcond, gcond, (size_t)6 * ed * sizeof(float), cudaMemcpyHostToDevice);
     darena *ar = &h->arena; size_t mark = da_save(ar);
 
     float *xtc = da_alloc(ar, (size_t)T * C);
@@ -854,7 +870,7 @@ extern "C" void aria_cuda_dit_step(aria_cuda_dit *h, float *v_CT, const float *x
     k_add<<<nblocks((size_t)T * C), THREADS>>>(xtc, xtc, pre, (size_t)T * C);
 
     float *seq = da_alloc(ar, (size_t)S * ed);
-    cudaMemcpy(seq, h->memory_tokens, (size_t)Mt * ed * sizeof(float), cudaMemcpyDeviceToDevice);
+    cudaMemcpyAsync(seq, h->memory_tokens, (size_t)Mt * ed * sizeof(float), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
     gemm_f16w(h->cublas, &h->arena, seq + (size_t)Mt * ed, xtc, h->project_in, NULL, T, C, ed);
 
     for (int b = 0; b < h->depth; b++) dit_block_dev(h, seq, b);
@@ -867,12 +883,47 @@ extern "C" void aria_cuda_dit_step(aria_cuda_dit *h, float *v_CT, const float *x
     k_transpose<<<nblocks((size_t)T * C), THREADS>>>(h->dv, outtc, T, C);  /* [T,C]->[C,T] */
 
     da_restore(ar, mark);
-    cudaMemcpy(v_CT, h->dv, (size_t)C * T * sizeof(float), cudaMemcpyDeviceToHost);
+}
+
+extern "C" void aria_cuda_dit_step(aria_cuda_dit *h, float *v_CT, const float *x_CT, const float *gcond) {
+    int C = h->io_ch, ed = h->ed, T = h->T;
+    cudaStream_t st = cudaStreamPerThread;
+    cudaMemcpyAsync(h->dx, x_CT, (size_t)C * T * sizeof(float), cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(h->dgcond, gcond, (size_t)6 * ed * sizeof(float), cudaMemcpyHostToDevice, st);
+
+    /* one graph per (S,T) shape: capture on the first step, replay on the rest. The H2D
+     * above refreshes h->dx/h->dgcond each step; the graph reads them at fixed pointers. */
+    if (h->graph_ready) {
+        cudaGraphLaunch(h->graph_exec, st);
+    } else if (h->graph_failed) {
+        dit_step_compute(h);
+    } else {
+        cudaStreamSynchronize(st);   /* drain any set_request work before capturing */
+        cudaGraph_t g = NULL;
+        if (cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+            cudaGetLastError(); h->graph_failed = 1; dit_step_compute(h);
+        } else {
+            dit_step_compute(h);     /* recorded, not executed */
+            if (cudaStreamEndCapture(st, &g) == cudaSuccess && g &&
+                cudaGraphInstantiateWithFlags(&h->graph_exec, g, 0) == cudaSuccess) {
+                h->graph = g; h->graph_ready = 1;
+                fprintf(stderr, "[aria] DiT: CUDA graph captured (%d blocks/step replayed)\n", h->depth);
+                cudaGraphLaunch(h->graph_exec, st);   /* execute step 0 (capture didn't run it) */
+            } else {
+                cudaGetLastError(); h->graph_failed = 1;
+                if (g) cudaGraphDestroy(g);
+                dit_step_compute(h);  /* capture failed -> run inline (correctness preserved) */
+            }
+        }
+    }
+    cudaMemcpyAsync(v_CT, h->dv, (size_t)C * T * sizeof(float), cudaMemcpyDeviceToHost, st);
+    cudaStreamSynchronize(st);
 }
 
 extern "C" void aria_cuda_dit_free(aria_cuda_dit *h) {
     if (!h) return;
     if (h->cublas) cublasDestroy(h->cublas);
+    cudaFree(h->cublas_ws);
     cudaFree(h->dqbuf);
     cudaFree(h->preprocess); cudaFree(h->postprocess); cudaFree(h->project_in); cudaFree(h->project_out);
     cudaFree(h->memory_tokens);
@@ -1037,6 +1088,7 @@ extern "C" aria_cuda_dec *aria_cuda_dec_create(const aria_sa3_dec_view *v) {
     if (!aria_cuda_available()) return NULL;
     aria_cuda_dec *h = (aria_cuda_dec *)calloc(1, sizeof(aria_cuda_dec));
     if (cublasCreate(&h->cublas) != CUBLAS_STATUS_SUCCESS) { free(h); return NULL; }
+    cublasSetStream(h->cublas, cudaStreamPerThread);   /* match the per-thread kernel stream */
     h->running_std = v->running_std;
     h->proj_w     = upload_f16(v->proj_w, (size_t)DC_D * 256);
     h->proj_b     = upload_f32(v->proj_b, DC_D);
@@ -1266,6 +1318,7 @@ extern "C" aria_cuda_dec_medium *aria_cuda_dec_medium_create(const aria_sa3_dec_
     if (!aria_cuda_available()) return NULL;
     aria_cuda_dec_medium *h = (aria_cuda_dec_medium *)calloc(1, sizeof(*h));
     if (cublasCreate(&h->cublas) != CUBLAS_STATUS_SUCCESS) { free(h); return NULL; }
+    cublasSetStream(h->cublas, cudaStreamPerThread);   /* match the per-thread kernel stream */
     h->running_std = v->running_std;
     h->proj_w     = upload_f16(v->proj_w, (size_t)MD_D * 256);
     h->proj_b     = upload_f32(v->proj_b, MD_D);
