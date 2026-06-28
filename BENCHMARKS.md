@@ -24,14 +24,17 @@ for both; SAT's `max_memory_allocated` (tensors only) is shown in parentheses.
 
 | metric | aria | stable-audio-tools | winner |
 |---|---|---|---|
-| **GPU time** | 0.98 s | **0.50 s** | SAT (2×) |
-| **GPU VRAM** (process) | **3970 MB** | 5452 MB (alloc 4561) | aria (−27 %) |
+| **GPU time** | 0.67 s | **0.50 s** | SAT (1.3×) |
+| **GPU VRAM** (process) | **4306 MB** | 5452 MB (alloc 4561) | aria (−21 %) |
 | **CPU time** (5 s, 20 thr) | 17.0 s | **7.0 s** | SAT (2.4×) |
 | **CPU peak RAM** (5 s) | **7274 MB** | 18866 MB | aria (−61 %) |
 
-aria GPU breakdown — small: setup 0.10 + dit 0.16 + decode 0.03; medium: setup 0.33
-+ dit 0.42 + decode 0.23 (the medium per-request setup = host-side differential
-cross-K/V projection is the gap vs SAT's resident forward).
+aria GPU breakdown — small: setup 0.10 + dit 0.16 + decode 0.03; medium (after the
+on-device cross-K/V projection): setup **0.02** + dit 0.42 + decode 0.23. The medium
+GPU time dropped **0.98 → 0.67 s** by moving the per-request differential cross-K/V
+projection from the host onto the device (`ca_to_kv` device-resident, +340 MB VRAM).
+The remaining 0.67 vs 0.50 gap is fp32 activations (a per-GEMM fp16 conversion +
+2× elementwise traffic vs SAT's fp16-throughout) — addressed next.
 
 ## Takeaways
 
