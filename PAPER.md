@@ -185,26 +185,29 @@ prompt re-read per chunk. Two honest findings:
   O(chunk) emitted — the context/chunk ratio is a hard overhead multiplier. Real-time
   needs the **GPU** continuation path (≈10× projected; currently the local-additive
   inpaint cond is **CPU-only** — the GPU DiT must gain it) or a smaller context.
-- *Quality — the precise failure mode (alienware, i9, two configs).* Per-second RMS
-  shows the **first window is coherent music** (cfg B's first **14 s** flat at 0.17–0.22)
-  — normal SA3 generation is fine. The **continuations fade**: each inpainted tail decays
-  to near-silent (cfg B repeats `…0.07, 0.027, 0.007, 0.001` every 4 s). The cause is
-  specific: SA3 inpaint-of-the-**tail** generates an *ending/outro* (fade-out), not a
-  sustained continuation — it has seen "the end of a clip" in that position at train time.
-  So the fix is targeted, not vague: **don't regenerate the trailing region.** Candidates
-  = overlap-add (generate a fresh window, crossfade its *strong middle* over the previous
-  tail rather than emitting the fading end), regenerate a *bounded interior* region with a
-  short look-ahead of silence-to-fill, or light fine-tuning for chunk-AR (cf. Magenta RT,
-  which trains *for* it). **This is the research contribution** a paper would deliver.
+- *Quality — diagnosed and **fixed**.* The naive tail-inpaint faded: profiling a long
+  continuation (8 s seed → regenerate to 18 s) gave the regenerated region's per-second RMS
+  as `[0.0, 0.218, 0.212, 0.208, 0.196, 0.224, 0.206, 0.045, 0.006, 0.0]` — a **~1.5 s
+  silent seam, then ~6 s of strong coherent body, then a ~3 s fade-out**. SA3 inpaint-of-
+  the-**tail** generates a clip *ending* (it has only seen "end of clip" in that position),
+  but the **body is real**. So the fix is **lookahead-emit + crossfade**: each step
+  regenerates `context + skip + emit + tail` and emits only the **strong body** — skipping
+  the seam, discarding the fade — crossfaded onto the output, with the next context taken
+  from the just-emitted (strong) audio. **Result:** the fade is gone — per-second RMS now
+  **flat at ~0.22, 0/25 s near-silent** (was 0.12, 6/24 s silent). Continuous, coherent
+  streaming music with live prompt re-steering between chunks. This is the streaming
+  algorithm a paper would present (and where live *taste* steering later slots in).
 
   *Side effect:* the prototype exposed and fixed a latent heap-overflow in the existing
   `--continue`/inpaint path (the SAME encoder's latent length is `ceil(T/2)·2`, i.e. `T+1`
   for odd `T`, vs the DiT's `T`; the `256·T` buffer overflowed — ASan-confirmed, now sized
   to the encoder output).
 
-**Net:** the *infrastructure* for streaming + live prompting is feasible and built; the GPU
-makes the latency real; the *coherence* of diffusion-continuation streaming is the open
-problem and the natural place for both an algorithmic contribution and (later) live steering.
+**Net:** streaming + live prompting **works** (`aria --stream`): coherent continuous audio
+via lookahead-emit continuation, prompt swappable between chunks. The remaining gap is
+**real-time on the edge** — continuations regenerate a ~14 s window per ~4 s emit (RTF 0.5×
+i7 / ~0.7× i9, but **~10× on the 3070** once the inpaint local-cond is ported to the device
+DiT, currently CPU-only). Then live *taste* steering is a per-chunk vector add on top.
 
 ---
 
