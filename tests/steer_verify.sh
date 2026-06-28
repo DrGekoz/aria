@@ -17,7 +17,9 @@ n=math.sqrt(sum(x*x for x in d)); d=[x/n*20.0 for x in d]          # unit dir * 
 def w(p,v): open(p,'wb').write(b'ATNS'+struct.pack('<III',1,1,0)+struct.pack('<q',len(v))+struct.pack('<%df'%len(v),*v))
 w(sys.argv[1]+'/d.atns', d); w(sys.argv[1]+'/2d.atns', [2*x for x in d])
 PY
-A="env OMP_NUM_THREADS=1 $ARIA -m $M -p techno -d 4 -s 8 --seed 7 --device cpu"
+# DEVICE=cpu (default) | cuda. ARIA_NO_GRAPH keeps the unsteered baseline on the same inline
+# path the steered runs use (steering auto-disables the graph), so GATE1 is byte-clean on GPU.
+A="env OMP_NUM_THREADS=1 ARIA_NO_GRAPH=1 $ARIA -m $M -p techno -d 4 -s 8 --seed 7 --device ${DEVICE:-cpu}"
 $A -o "$T/uns.wav"  >/dev/null 2>&1
 $A --steer residual:16:"$T/d.atns":0.0:0-7  -o "$T/s0.wav"   >/dev/null 2>&1
 $A --steer residual:16:"$T/d.atns":0.2:0-7  -o "$T/sa.wav"   >/dev/null 2>&1
