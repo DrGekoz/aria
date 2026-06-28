@@ -128,6 +128,8 @@ typedef struct {
     float *const *cross_k, *const *cross_v;   /* [depth] each [H, n_cond, head_dim]; NULL if gpu-deferred */
     float *const *cross_kd;                   /* [depth] differential k_diff (post k_norm), or NULL */
     const float *cross_ed;                    /* [n_cond, ed] to_cond_embed(prompt); set when cross_k deferred */
+    float *const *local_emb;                  /* [depth] each [S, ed]; inpaint local-additive cond (mem rows 0), or NULL */
+    int has_local;                            /* continue/inpaint: add local_emb per block */
 } aria_sa3_dit_req_view;
 void aria_sa3_dit_req_get_view(const aria_sa3_dit_req *r, aria_sa3_dit_req_view *v);
 

@@ -305,10 +305,12 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     int on_gpu = 0;
 #ifdef ARIA_CUDA
     /* auto: GPU when it's worth it (sm_70+) and fits; cuda: force any device
-     * (CPU-fallback on OOM); cpu: never. Inpaint + packed-quant stay on the CPU DiT. */
+     * (CPU-fallback on OOM); cpu: never. Packed-quant stays on the CPU DiT. */
     /* medium runs its DiT on the GPU (the device DiT now has a differential path)
-     * but keeps the medium decoder on the CPU (the device decoder is small-music). */
-    int want_gpu = !p->init_audio && !p->init_audio_mem && !loaded_quant &&
+     * but keeps the medium decoder on the CPU (the device decoder is small-music).
+     * continue/inpaint also runs on the GPU: the taae encoder builds the context latent
+     * on the CPU, then the per-block local-additive cond is uploaded and added on device. */
+    int want_gpu = !loaded_quant &&
                    ((p->device == ARIA_DEVICE_CUDA && aria_cuda_available()) ||
                     (p->device == ARIA_DEVICE_AUTO && aria_cuda_recommended()));
     if (want_gpu && !st->cdit) {   /* upload + quantize weights once; reused across gens */

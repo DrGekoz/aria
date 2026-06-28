@@ -584,6 +584,7 @@ struct aria_cuda_dit {
     int T, S, n_cond, have_req;
     float *dx, *dv, *dgcond, *rope_cos, *rope_sin;
     float **cross_k, **cross_v, **cross_kd;
+    float **local_emb; int has_local;   /* [depth] each [S, ed]; inpaint local-additive cond */
     darena arena;
 };
 
@@ -680,6 +681,9 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     gemm_dqw(h, o, merged, &w->ca_to_out, NULL, S);
     k_add<<<nSd, THREADS>>>(seq, residual, o, (size_t)S * dim);
 
+    /* local-additive (inpaint) cond: seq += per-block left-padded local_emb (memory rows 0) */
+    if (h->has_local) k_add<<<nSd, THREADS>>>(seq, seq, h->local_emb[blk], (size_t)S * dim);
+
     /* feed-forward (GLU) */
     cudaMemcpy(residual, seq, (size_t)S * dim * sizeof(float), cudaMemcpyDeviceToDevice);
     k_rmsnorm_adaln<<<S, RED_TH>>>(hh, seq, w->ff_norm, scale_ff, shift_ff, S, dim, 1e-5f);
@@ -765,8 +769,10 @@ static void free_request(aria_cuda_dit *h) {
     if (h->cross_k) for (int b = 0; b < h->depth; b++) cudaFree(h->cross_k[b]);
     if (h->cross_v) for (int b = 0; b < h->depth; b++) cudaFree(h->cross_v[b]);
     if (h->cross_kd) for (int b = 0; b < h->depth; b++) cudaFree(h->cross_kd[b]);
-    free(h->cross_k); free(h->cross_v); free(h->cross_kd);
-    h->cross_k = h->cross_v = h->cross_kd = NULL; h->dx = h->dv = h->dgcond = NULL;
+    if (h->local_emb) for (int b = 0; b < h->depth; b++) cudaFree(h->local_emb[b]);
+    free(h->cross_k); free(h->cross_v); free(h->cross_kd); free(h->local_emb);
+    h->cross_k = h->cross_v = h->cross_kd = NULL; h->local_emb = NULL; h->has_local = 0;
+    h->dx = h->dv = h->dgcond = NULL;
     h->rope_cos = h->rope_sin = NULL; h->arena.base = NULL; h->have_req = 0;
 }
 
@@ -825,6 +831,14 @@ extern "C" void aria_cuda_dit_set_request(aria_cuda_dit *h, const aria_sa3_dit_r
             h->cross_v[b] = upload_f32(rv->cross_v[b], khv);
             if (h->cross_kd) h->cross_kd[b] = upload_f32(rv->cross_kd[b], khv);
         }
+    }
+    /* continue/inpaint: upload the per-block, CPU-projected local-additive cond [S, ed]
+     * (memory-token rows already zero). Added to the residual after cross-attn per block. */
+    h->has_local = rv->has_local;
+    if (rv->has_local) {
+        h->local_emb = (float **)calloc(h->depth, sizeof(float *));
+        for (int b = 0; b < h->depth; b++)
+            h->local_emb[b] = upload_f32(rv->local_emb[b], (size_t)S * ed);
     }
     h->have_req = 1;
 }
