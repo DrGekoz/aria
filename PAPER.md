@@ -203,11 +203,26 @@ prompt re-read per chunk. Two honest findings:
   for odd `T`, vs the DiT's `T`; the `256·T` buffer overflowed — ASan-confirmed, now sized
   to the encoder output).
 
-**Net:** streaming + live prompting **works** (`aria --stream`): coherent continuous audio
-via lookahead-emit continuation, prompt swappable between chunks. The remaining gap is
-**real-time on the edge** — continuations regenerate a ~14 s window per ~4 s emit (RTF 0.5×
-i7 / ~0.7× i9, but **~10× on the 3070** once the inpaint local-cond is ported to the device
-DiT, currently CPU-only). Then live *taste* steering is a per-chunk vector add on top.
+**Net:** streaming + live prompting **works** (`aria --stream`). The streaming *method*
+is three dependency-free stages addressing three distinct failure modes:
+1. **lookahead-emit** — emit the strong body of the regenerated region, skip the post-
+   context seam, discard the trailing fade (SA3 inpaint makes tails into outros);
+2. **phase-aligned crossfade** (`--stream`) — cross-correlate the seam over ±0.18 s and
+   shift before crossfading, removing drum "flam" from beat-misaligned takes;
+3. **HPSS background-hold** (`--stream --hold`) — separate each chunk (median-filter
+   HPSS, own FFT), accumulate only the **harmonic** (evolving melody) while a single
+   **percussive loop** (the drum groove) is held and tiled across the whole stream and
+   reset on a prompt change — so the rhythm is identical every bar (no flam, no drift)
+   and the foreground evolves on top. This is the user's foreground/background idea.
+
+Remaining: (a) **real-time on the edge** — continuations regenerate a ~14 s window per
+~4 s emit (RTF 0.5–0.7× CPU, **~10× on the 3070** once the inpaint local-cond is ported
+to the device DiT, currently CPU-only); (b) the held loop is a fixed repeat with un-
+seamed loop points (a beat-synchronous loop + crossfade would polish it); (c) the
+harmonic can still degrade past ~5–6 chunks (the inpaint-drift ceiling — the principled
+fix is fine-tuning SA3 for chunk-AR, cf. Magenta RT). Live *taste* steering then slots
+in as a per-chunk vector add. The proper end state is a streaming-trained model; the
+above is how far a careful post-hoc pipeline gets on a fixed-clip diffusion model.
 
 ---
 
