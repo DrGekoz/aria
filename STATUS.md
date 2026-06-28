@@ -27,8 +27,8 @@ differential DiT + a sliding-window/sinusoidal taae decoder, both device-residen
   `[256,768]` embedding (`--prompt-embed`) · unconditional (`--uncond`); `seconds_total`
   duration conditioner.
 - **Backends**
-  - **CPU:** register-blocked AVX2/FMA GEMM (175–280 GFLOP/s) + OpenMP + reusable arena
-    workspace; optional BLAS (`make blas`). Pure-C fallback always compiled in.
+  - **CPU:** packed outer-product AVX2/FMA GEMM (~460–622 GFLOP/s, near MKL) + OpenMP +
+    reusable arena workspace. Fully dependency-free (no BLAS).
   - **CUDA (`--device cuda`):** device-resident **DiT + decoder** — weights uploaded once (fp16),
     denoise loop *and* taae decode on the GPU, cuBLAS GemmEx (tensor cores) for linears, batched
     attention; T5Gemma encoder on CPU; `--device auto` picks the GPU when an sm_70+ card fits,

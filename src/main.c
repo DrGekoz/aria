@@ -18,9 +18,6 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>   /* isatty */
-#if defined(ARIA_BLAS) && defined(_OPENMP)
-#include <omp.h>
-#endif
 
 /* per-step progress, drawn on one line; only attached when stderr is a TTY */
 static void cli_progress(int step, int total, void *user) {
@@ -64,12 +61,6 @@ static int cmd_wav_roundtrip(const char *in, const char *out) {
 }
 
 int main(int argc, char **argv) {
-#if defined(ARIA_BLAS) && defined(_OPENMP)
-    /* The installed OpenBLAS uses its own pthread pool; let it own the cores and
-     * keep aria's OpenMP single-threaded to avoid oversubscription. (With the
-     * OpenMP build of OpenBLAS, both share one runtime and this isn't needed.) */
-    omp_set_num_threads(1);
-#endif
     if (argc < 2) { usage(argv[0]); return 1; }
 
     const char *model_dir = NULL;

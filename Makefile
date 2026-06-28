@@ -41,7 +41,7 @@ EXTRA_LIB_OBJS ?=
 LIB_OBJS := $(patsubst $(SRC)/%.c,$(BUILD)/%.o,$(LIB_SRCS)) $(EXTRA_LIB_OBJS)
 LIB := $(BUILD)/libaria.a
 
-.PHONY: all cpu clean test cuda test_cuda blas bench bench-sweep profile help quantize install example
+.PHONY: all cpu clean test cuda test_cuda bench bench-sweep profile help quantize install example
 all: cpu
 cpu: aria
 
@@ -70,7 +70,6 @@ help:
 	@echo "    make / make cpu    CPU build (default): build/libaria.a + ./aria"
 	@echo "    make cuda          CUDA build (CUDA_ARCH=sm_86 for RTX 3070; default sm_61."
 	@echo "                       also NVCC, CUDA_HOME, CUDA_CCBIN)"
-	@echo "    make blas          CPU build routing GEMM to a BLAS (BLAS_LIB=-lopenblas)"
 	@echo "    make quantize      offline DiT quantizer -> ./aria-quantize (E9.2)"
 	@echo "    make install       install aria + libaria.a + headers (PREFIX=/usr/local)"
 	@echo "    make example       build examples/generate.c against libaria.a"
@@ -87,7 +86,7 @@ help:
 	@echo "    make profile ARGS=\"-m <model> --uncond -d 10 -s 8 --device cuda\""
 	@echo "                       stages + memory, plus per-kernel GPU time (nsys). See PROFILING.md"
 	@echo ""
-	@echo "  Key vars: CC, CUDA_ARCH, NVCC, CUDA_HOME, ARIA_MODEL, ARGS, BLAS_LIB"
+	@echo "  Key vars: CC, CUDA_ARCH, NVCC, CUDA_HOME, ARIA_MODEL, ARGS"
 
 # GEMM microbenchmark on the dominant SA3 shapes (no model load)
 bench: $(LIB)
@@ -112,14 +111,6 @@ bench-sweep: $(LIB)
 	  $(BUILD)/bench_gemm | awk '/GFLOP/{s+=$$(NF-1);n++} END{printf "%.0f GFLOP/s avg\n", s/n}'; \
 	done; \
 	$(CC) $(CFLAGS) -I$(SRC) -c $(SRC)/aria_cpu.c -o $(BUILD)/aria_cpu.o 2>/dev/null; $(AR) rs $(BUILD)/libaria.a $(BUILD)/aria_cpu.o 2>/dev/null
-
-# Optional CPU acceleration: route GEMM to a BLAS (OpenBLAS here; on macOS use
-# LDLIBS="-framework Accelerate"). Keeps the pure-C build as the default.
-BLAS_LIB ?= -lopenblas
-blas:
-	rm -f $(BUILD)/*.o $(BUILD)/libaria.a aria   # rebuild objects (CFLAGS change); keep dumps
-	$(MAKE) all CFLAGS="$(CSTD) $(DEFS) $(WARN) $(OPT) -DARIA_BLAS" \
-	            LDFLAGS="-fopenmp -lm $(BLAS_LIB)"
 
 $(BUILD):
 	@mkdir -p $(BUILD)
