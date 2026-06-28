@@ -183,6 +183,25 @@ __global__ void k_rmsnorm(float *y, const float *x, const float *w, int rows, in
         yr[i] = xr[i] * inv * g;
     }
 }
+/* fused rmsnorm (weight w) + adaLN: y = (x * rsqrt(meansq+eps) * w) * (1+scale) + shift.
+ * Replaces a k_rmsnorm + k_adaln pair (saves one read+write pass of [S,dim] + a launch). */
+__global__ void k_rmsnorm_adaln(float *y, const float *x, const float *w,
+                                const float *scale, const float *shift, int S, int dim, float eps) {
+    int r = blockIdx.x; if (r >= S) return;
+    const float *xr = x + (size_t)r * dim; float *yr = y + (size_t)r * dim;
+    __shared__ float red[RED_TH];
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) ss += xr[i] * xr[i];
+    red[threadIdx.x] = ss; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv = rsqrtf(red[0] / dim + eps);
+    for (int i = threadIdx.x; i < dim; i += blockDim.x)
+        yr[i] = (xr[i] * inv * w[i]) * (1.0f + scale[i]) + shift[i];
+}
+
 extern "C" void aria_cuda_rmsnorm(float *y, const float *x, const float *w, int rows, int dim, float eps) {
     float *dx = d_in(x, (size_t)rows * dim), *dw = w ? d_in(w, dim) : NULL, *dy = d_new((size_t)rows * dim);
     k_rmsnorm<<<rows, RED_TH>>>(dy, dx, dw, rows, dim, eps, 0); CK(cudaGetLastError());
@@ -390,17 +409,14 @@ __global__ void k_transpose(float *dst, const float *src, int A, int B) {
     int a = (int)(idx / B), b = (int)(idx % B);
     dst[(size_t)b * A + a] = src[idx];
 }
-__global__ void k_adaln(float *y, const float *scale, const float *shift, int S, int dim) {
+/* fused gate + residual add: out = residual + o * sigmoid(1 - gate[col]).
+ * Replaces a k_gate + k_add pair (saves one read+write pass of [S,dim] + a launch). */
+__global__ void k_gate_add(float *out, const float *residual, const float *o,
+                           const float *gate, int S, int dim) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (size_t)S * dim) return;
     int i = (int)(idx % dim);
-    y[idx] = y[idx] * (1.0f + scale[i]) + shift[i];
-}
-__global__ void k_gate(float *y, const float *gate, int S, int dim) {
-    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (size_t)S * dim) return;
-    int i = (int)(idx % dim);
-    y[idx] *= 1.0f / (1.0f + expf(-(1.0f - gate[i])));
+    out[idx] = residual[idx] + o[idx] * (1.0f / (1.0f + expf(-(1.0f - gate[i]))));
 }
 __global__ void k_extract_heads(float *dst, const float *src, int S, int H, int hd, int stride, int off) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;   /* (h*S+s)*hd+d */
@@ -606,8 +622,7 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
 
     /* self-attention (differential medium: out = attn(q,k,v) - attn(qd,kd,v)) */
     cudaMemcpy(residual, seq, (size_t)S * dim * sizeof(float), cudaMemcpyDeviceToDevice);
-    k_rmsnorm<<<S, RED_TH>>>(hh, seq, w->pre_norm, S, dim, 1e-5f, 0);
-    k_adaln<<<nSd, THREADS>>>(hh, scale_self, shift_self, S, dim);
+    k_rmsnorm_adaln<<<S, RED_TH>>>(hh, seq, w->pre_norm, scale_self, shift_self, S, dim, 1e-5f);
     int nq = diff ? 5 : 3;
     float *qkv = da_alloc(ar, (size_t)S * nq * dim);
     gemm_dqw(h, qkv, hh, &w->sa_to_qkv, NULL, S);
@@ -631,8 +646,7 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     }
     k_merge_heads<<<nHShd, THREADS>>>(merged, ao, S, H, hd);
     gemm_dqw(h, o, merged, &w->sa_to_out, NULL, S);
-    k_gate<<<nSd, THREADS>>>(o, gate_self, S, dim);
-    k_add<<<nSd, THREADS>>>(seq, residual, o, (size_t)S * dim);
+    k_gate_add<<<nSd, THREADS>>>(seq, residual, o, gate_self, S, dim);
 
     /* cross-attention (cached K/V; differential: q_diff + cross_kd) */
     cudaMemcpy(residual, seq, (size_t)S * dim * sizeof(float), cudaMemcpyDeviceToDevice);
@@ -655,14 +669,12 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
 
     /* feed-forward (GLU) */
     cudaMemcpy(residual, seq, (size_t)S * dim * sizeof(float), cudaMemcpyDeviceToDevice);
-    k_rmsnorm<<<S, RED_TH>>>(hh, seq, w->ff_norm, S, dim, 1e-5f, 0);
-    k_adaln<<<nSd, THREADS>>>(hh, scale_ff, shift_ff, S, dim);
+    k_rmsnorm_adaln<<<S, RED_TH>>>(hh, seq, w->ff_norm, scale_ff, shift_ff, S, dim, 1e-5f);
     float *proj = da_alloc(ar, (size_t)S * 2 * inner), *gated = da_alloc(ar, (size_t)S * inner);
     gemm_dqw(h, proj, hh, &w->ff_in_w, w->ff_in_b, S);
     k_ff_silugate<<<nblocks((size_t)S * inner), THREADS>>>(gated, proj, S, inner);
     gemm_dqw(h, o, gated, &w->ff_out_w, w->ff_out_b, S);
-    k_gate<<<nSd, THREADS>>>(o, gate_ff, S, dim);
-    k_add<<<nSd, THREADS>>>(seq, residual, o, (size_t)S * dim);
+    k_gate_add<<<nSd, THREADS>>>(seq, residual, o, gate_ff, S, dim);
 
     da_restore(ar, mark);
 }
