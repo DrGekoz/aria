@@ -147,6 +147,17 @@ static void stream_append_aligned(aria_audio *outp, int64_t *written, int64_t ca
     *written += rest;
 }
 
+/* add the looped percussive `held` (held_len frames) into `dst`[n] starting at output
+ * position `pos` (modulo tiling) — the held drum groove, steady across chunks. */
+static void stream_add_tiled(float *dst, int64_t n, int ch, int64_t pos,
+                             const float *held, int64_t held_len) {
+    if (held_len <= 0) return;
+    for (int64_t j = 0; j < n; j++) {
+        int64_t k = (pos + j) % held_len;
+        for (int c = 0; c < ch; c++) dst[j * ch + c] += held[k * ch + c];
+    }
+}
+
 /* Streaming / interactive generation: keep the model resident and emit `emit_s`-second
  * segments by sliding-window continuation over a `context_s` rolling context. The naive
  * tail-inpaint fades (SA3 makes the regenerated end an outro), so each continuation
@@ -155,13 +166,14 @@ static void stream_append_aligned(aria_audio *outp, int64_t *written, int64_t ca
  * continuation) — crossfaded onto the output. Each step re-reads the prompt (live
  * re-steering on a TTY). `emit_s` is the --chunk value. */
 static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float context_s,
-                      int n_chunks, const char *out_path) {
+                      int n_chunks, int hold, const char *out_path) {
     int sr = aria_sample_rate(ctx), ch = aria_audio_channels(ctx);
     const float skip_s = 1.5f, tail_s = 3.0f, xfade_s = 0.25f;   /* seam / fade / crossfade */
     int64_t ctx_fr = (int64_t)(context_s * sr), xf_fr = (int64_t)(xfade_s * sr);
     int64_t maxlag = (int64_t)(0.18f * sr);   /* phase-align search range (~< one beat) */
     int interactive = isatty(fileno(stdin));
     char promptbuf[1024];
+    float *held = NULL; int64_t held_len = 0; const char *held_prompt = NULL;  /* --hold drum loop */
 
     int64_t cap = (int64_t)((context_s + emit_s) * sr) + (int64_t)n_chunks * ((int64_t)(emit_s * sr) + maxlag) + sr;
     aria_audio *outp = aria_audio_alloc(sr, ch, cap);
@@ -201,6 +213,21 @@ static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float con
         int64_t slice_len = emit_len + (i == 0 ? 0 : maxlag);
         if (emit_start + slice_len > win->num_frames) slice_len = win->num_frames - emit_start;
         aria_audio *emit = stream_slice(win, emit_start, slice_len);
+        if (hold) {
+            /* split the emit; `outp` accumulates only the HARMONIC, the drum groove is a
+             * held loop tiled later -> drums stay perfectly steady across chunks. */
+            int64_t en = emit->num_frames;
+            float *H = malloc((size_t)en * ch * sizeof(float)), *P = malloc((size_t)en * ch * sizeof(float));
+            aria_hpss_separate(emit->data, en, ch, H, P);
+            if (!held || p->prompt != held_prompt) {   /* establish/reset the loop on chunk 0 or prompt change */
+                free(held); held_len = en; held = malloc((size_t)held_len * ch * sizeof(float));
+                memcpy(held, P, (size_t)held_len * ch * sizeof(float));
+                held_prompt = p->prompt;
+                fprintf(stderr, "[stream] drum loop set (%.1fs)\n", held_len / (double)sr);
+            }
+            memcpy(emit->data, H, (size_t)en * ch * sizeof(float));   /* emit -> harmonic only */
+            free(H); free(P);
+        }
         stream_append_aligned(outp, &written, cap, emit, (i == 0) ? 0 : xf_fr, (i == 0) ? 0 : maxlag);
         aria_audio_free(emit);
 
@@ -209,9 +236,12 @@ static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float con
                 i + 1, n_chunks, es, win_s, dt, dt > 0 ? es / dt : 0.0, p->prompt ? p->prompt : "");
 
         aria_audio_free(context);
-        context = stream_slice(outp, written - ctx_fr, ctx_fr);   /* strong, just-emitted tail */
+        context = stream_slice(outp, written - ctx_fr, ctx_fr);   /* just-emitted tail */
+        if (hold) stream_add_tiled(context->data, ctx_fr, ch, written - ctx_fr, held, held_len);
         aria_audio_free(win);
     }
+    if (hold) stream_add_tiled(outp->data, written, ch, 0, held, held_len);   /* mix the steady drums in */
+    free(held);
     outp->num_frames = written;
     int wrc = aria_wav_write(out_path, outp, 32);
     fprintf(stderr, "[stream] wrote %s (%.1fs total)\n", out_path, written / (double)sr);
@@ -239,7 +269,7 @@ int main(int argc, char **argv) {
     aria_dtype precision = ARIA_F32;
     const char *load_quant = NULL;
     int rng_torch = 0;
-    int do_stream = 0, stream_chunks = 8;
+    int do_stream = 0, stream_chunks = 8, stream_hold = 0;
     float stream_chunk = 2.0f, stream_context = 6.0f;
 
     for (int i = 1; i < argc; i++) {
@@ -303,6 +333,8 @@ int main(int argc, char **argv) {
             stream_context = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--chunks") == 0 && i + 1 < argc) {
             stream_chunks = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--hold") == 0) {
+            stream_hold = 1;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]); return 0;
         } else {
@@ -326,7 +358,7 @@ int main(int argc, char **argv) {
         p.prompt = prompt; p.steps = steps; p.seed = seed;
         p.precision = precision; p.device = ARIA_DEVICE_CPU;  /* continuation is CPU-only */
         p.rng_torch = rng_torch;
-        rc = cmd_stream(ctx, &p, stream_chunk, stream_context, stream_chunks, out_path);
+        rc = cmd_stream(ctx, &p, stream_chunk, stream_context, stream_chunks, stream_hold, out_path);
     } else if (do_list) {
         aria_list_tensors(ctx, list_prefix);
     } else if (do_generate) {
