@@ -298,6 +298,29 @@ __global__ void k_rope(float *x, const float *c, const float *s, int H, int N, i
         row[i + rh] = b * cc[i] + a * ss[i];
     }
 }
+
+/* fused extract-head + per-head rmsnorm(weight w) + RoPE -> head-major out[h,s,:hd].
+ * Replaces a k_extract_heads + k_rmsnorm + k_rope chain (saves two [H,S,hd] HBM
+ * round-trips + two launches per q/k). One block per (h,s) row, hd threads (hd<=64).
+ * rcos==NULL skips RoPE (cross-attn q). */
+__global__ void k_extract_normrope(float *out, const float *src, const float *w,
+                                   const float *rcos, const float *rsin,
+                                   int S, int H, int hd, int stride, int off, int rot, float eps) {
+    int hs = blockIdx.x; if (hs >= H * S) return;
+    int s = hs % S, h = hs / S, d = threadIdx.x;
+    const float *sp = src + (size_t)s * stride + off + (size_t)h * hd;
+    __shared__ float red[64], vec[64];
+    float x = sp[d];
+    red[d] = x * x; __syncthreads();
+    for (int st = hd / 2; st > 0; st >>= 1) { if (d < st) red[d] += red[d + st]; __syncthreads(); }
+    vec[d] = x * rsqrtf(red[0] / hd + eps) * w[d];
+    __syncthreads();
+    int rh = rot / 2; float res;
+    if (rcos == NULL || d >= rot)  res = vec[d];
+    else if (d < rh) res = vec[d] * rcos[(size_t)s * rh + d]      - vec[d + rh] * rsin[(size_t)s * rh + d];
+    else { int i = d - rh; res = vec[d] * rcos[(size_t)s * rh + i] + vec[i] * rsin[(size_t)s * rh + i]; }
+    out[(size_t)hs * hd + d] = res;
+}
 extern "C" void aria_cuda_rope_apply(float *x, const float *cos_t, const float *sin_t,
                                      int H, int N, int D, int rot_dim) {
     int rh = rot_dim / 2;
@@ -626,21 +649,13 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     int nq = diff ? 5 : 3;
     float *qkv = da_alloc(ar, (size_t)S * nq * dim);
     gemm_dqw(h, qkv, hh, &w->sa_to_qkv, NULL, S);
-    k_extract_heads<<<nHShd, THREADS>>>(qh, qkv, S, H, hd, nq * dim, 0);
-    k_extract_heads<<<nHShd, THREADS>>>(kh, qkv, S, H, hd, nq * dim, dim);
+    k_extract_normrope<<<H * S, hd>>>(qh, qkv, w->sa_q_norm, h->rope_cos, h->rope_sin, S, H, hd, nq * dim, 0, rot, 1e-6f);
+    k_extract_normrope<<<H * S, hd>>>(kh, qkv, w->sa_k_norm, h->rope_cos, h->rope_sin, S, H, hd, nq * dim, dim, rot, 1e-6f);
     k_extract_heads<<<nHShd, THREADS>>>(vh, qkv, S, H, hd, nq * dim, 2 * dim);
-    k_rmsnorm<<<H * S, RED_TH>>>(qh, qh, w->sa_q_norm, H * S, hd, 1e-6f, 0);
-    k_rmsnorm<<<H * S, RED_TH>>>(kh, kh, w->sa_k_norm, H * S, hd, 1e-6f, 0);
-    k_rope<<<nblocks((size_t)H * S), THREADS>>>(qh, h->rope_cos, h->rope_sin, H, S, hd, rot);
-    k_rope<<<nblocks((size_t)H * S), THREADS>>>(kh, h->rope_cos, h->rope_sin, H, S, hd, rot);
     attn_dev(h->cublas, ar, ao, qh, kh, vh, H, S, S, hd, scores, 1);
     if (diff) {
-        k_extract_heads<<<nHShd, THREADS>>>(qdh, qkv, S, H, hd, nq * dim, 3 * dim);
-        k_extract_heads<<<nHShd, THREADS>>>(kdh, qkv, S, H, hd, nq * dim, 4 * dim);
-        k_rmsnorm<<<H * S, RED_TH>>>(qdh, qdh, w->sa_q_norm, H * S, hd, 1e-6f, 0);
-        k_rmsnorm<<<H * S, RED_TH>>>(kdh, kdh, w->sa_k_norm, H * S, hd, 1e-6f, 0);
-        k_rope<<<nblocks((size_t)H * S), THREADS>>>(qdh, h->rope_cos, h->rope_sin, H, S, hd, rot);
-        k_rope<<<nblocks((size_t)H * S), THREADS>>>(kdh, h->rope_cos, h->rope_sin, H, S, hd, rot);
+        k_extract_normrope<<<H * S, hd>>>(qdh, qkv, w->sa_q_norm, h->rope_cos, h->rope_sin, S, H, hd, nq * dim, 3 * dim, rot, 1e-6f);
+        k_extract_normrope<<<H * S, hd>>>(kdh, qkv, w->sa_k_norm, h->rope_cos, h->rope_sin, S, H, hd, nq * dim, 4 * dim, rot, 1e-6f);
         attn_dev(h->cublas, ar, aod, qdh, kdh, vh, H, S, S, hd, scores, 1);
         k_sub<<<nblocks(nHSd), THREADS>>>(ao, aod, nHSd);
     }
@@ -654,12 +669,10 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     int ncq = diff ? 2 : 1;
     float *q = da_alloc(ar, (size_t)S * ncq * dim);
     gemm_dqw(h, q, hh, &w->ca_to_q, NULL, S);
-    k_extract_heads<<<nHShd, THREADS>>>(qh, q, S, H, hd, ncq * dim, 0);
-    k_rmsnorm<<<H * S, RED_TH>>>(qh, qh, w->ca_q_norm, H * S, hd, 1e-6f, 0);
+    k_extract_normrope<<<H * S, hd>>>(qh, q, w->ca_q_norm, NULL, NULL, S, H, hd, ncq * dim, 0, rot, 1e-6f);
     attn_dev(h->cublas, ar, ao, qh, h->cross_k[blk], h->cross_v[blk], H, S, Sc, hd, scores, 1);
     if (diff) {
-        k_extract_heads<<<nHShd, THREADS>>>(qdh, q, S, H, hd, ncq * dim, dim);
-        k_rmsnorm<<<H * S, RED_TH>>>(qdh, qdh, w->ca_q_norm, H * S, hd, 1e-6f, 0);
+        k_extract_normrope<<<H * S, hd>>>(qdh, q, w->ca_q_norm, NULL, NULL, S, H, hd, ncq * dim, dim, rot, 1e-6f);
         attn_dev(h->cublas, ar, aod, qdh, h->cross_kd[blk], h->cross_v[blk], H, S, Sc, hd, scores, 1);
         k_sub<<<nblocks(nHSd), THREADS>>>(ao, aod, nHSd);
     }
