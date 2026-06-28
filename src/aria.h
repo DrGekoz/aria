@@ -50,9 +50,12 @@ typedef struct {
     void *progress_user;
     int   rng_torch;                /* 1 = PyTorch-matched noise (MT19937) for exact
                                      * torch.randn reproduction; 0 = xoshiro (default) */
+    const aria_audio *init_audio_mem; /* in-memory continue/inpaint context (overrides
+                                       * init_audio file); not freed by the runtime.
+                                       * Used by the streaming loop to avoid temp WAVs. */
 } aria_gen_params;
 
-#define ARIA_GEN_PARAMS_DEFAULT { NULL, NULL, 15.0f, 8, 1.0f, 0, ARIA_DEVICE_AUTO, ARIA_F32, NULL, NULL, 0.0f, 0.0f, 0, NULL, NULL, 0 }
+#define ARIA_GEN_PARAMS_DEFAULT { NULL, NULL, 15.0f, 8, 1.0f, 0, ARIA_DEVICE_AUTO, ARIA_F32, NULL, NULL, 0.0f, 0.0f, 0, NULL, NULL, 0, NULL }
 
 /* Load a model from a directory containing model_config.json + model.safetensors.
  * Returns NULL on error (see aria_last_error()). */

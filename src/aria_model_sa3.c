@@ -163,13 +163,16 @@ static void sa3_denoise(void *c, const float *x, float t, float *v, int n) {
 static float *sa3_build_inpaint_local(aria_ctx *ctx, sa3_state *st,
                                       const aria_gen_params *p, int T) {
     int audio_len = T * 4096;
-    aria_audio *a = aria_wav_read(p->init_audio);
+    /* in-memory context (streaming) takes precedence over the WAV path; not owned here */
+    int owns_a = (p->init_audio_mem == NULL);
+    aria_audio *a = owns_a ? aria_wav_read(p->init_audio) : (aria_audio *)p->init_audio_mem;
     if (!a) { aria_set_error("inpaint: cannot read %s", p->init_audio); return NULL; }
     if (a->sample_rate != st->sample_rate) {
         aria_set_error("inpaint: %s is %d Hz but the model is %d Hz "
                        "(resampling is not supported yet; resample to %d Hz first)",
-                       p->init_audio, a->sample_rate, st->sample_rate, st->sample_rate);
-        aria_audio_free(a); return NULL;
+                       p->init_audio ? p->init_audio : "(memory)", a->sample_rate, st->sample_rate, st->sample_rate);
+        if (owns_a) aria_audio_free(a);
+        return NULL;
     }
     int clip = (int)(a->num_frames < audio_len ? a->num_frames : audio_len);
     float *audio = malloc((size_t)2 * audio_len * sizeof(float));   /* channel-major */
@@ -179,11 +182,15 @@ static float *sa3_build_inpaint_local(aria_ctx *ctx, sa3_state *st,
             audio[(size_t)c * audio_len + t] =
                 (t < clip) ? a->data[(size_t)t * a->channels + sc] : 0.0f;
     }
-    aria_audio_free(a);
+    if (owns_a) aria_audio_free(a);
 
     if (!st->enc_taae) st->enc_taae = aria_sa3_enc_load(ctx->sf);
     if (!st->enc_taae) { aria_set_error("inpaint: taae encoder load failed"); free(audio); return NULL; }
-    float *latent = malloc((size_t)256 * T * sizeof(float));
+    /* the SAME encoder rounds T_patch up to a multiple of 32 -> its latent length is
+     * ceil(T/2)*2 (= T for even T, T+1 for odd T), which can exceed the DiT's T; size the
+     * buffer to the encoder's actual output so the write fits, then use the first T. */
+    int T_enc = aria_sa3_latent_len(aria_sa3_patch_len(audio_len));
+    float *latent = malloc((size_t)256 * (T_enc > T ? T_enc : T) * sizeof(float));
     aria_sa3_enc_forward(st->enc_taae, latent, audio, audio_len);
     free(audio);
 
@@ -292,7 +299,7 @@ static int sa3_generate(aria_ctx *ctx, void *state,
      * (CPU-fallback on OOM); cpu: never. Inpaint + packed-quant stay on the CPU DiT. */
     /* medium runs its DiT on the GPU (the device DiT now has a differential path)
      * but keeps the medium decoder on the CPU (the device decoder is small-music). */
-    int want_gpu = !p->init_audio && !loaded_quant &&
+    int want_gpu = !p->init_audio && !p->init_audio_mem && !loaded_quant &&
                    ((p->device == ARIA_DEVICE_CUDA && aria_cuda_available()) ||
                     (p->device == ARIA_DEVICE_AUTO && aria_cuda_recommended()));
     if (want_gpu && !st->cdit) {   /* upload + quantize weights once; reused across gens */
@@ -323,7 +330,7 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     double t0 = sa3_now();
     aria_sa3_dit_req *req = aria_sa3_dit_req_begin(st->dit, T, cross, n_cond, sec_emb, on_gpu);
     /* continue / inpaint: build + attach the local-additive conditioning (E7). */
-    if (p->init_audio) {
+    if (p->init_audio || p->init_audio_mem) {
         float *local_TC = sa3_build_inpaint_local(ctx, st, p, T);
         if (!local_TC) { aria_sa3_dit_req_end(req); free(cross); free(x); free(sched); return -1; }
         aria_sa3_dit_req_set_local(req, local_TC, T, 257);  /* projected once, then owned by req */

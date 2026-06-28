@@ -17,7 +17,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>   /* isatty */
+#include <unistd.h>      /* isatty */
+#include <sys/select.h>  /* non-blocking stdin for live --stream prompting */
 
 /* per-step progress, drawn on one line; only attached when stderr is a TTY */
 static void cli_progress(int step, int total, void *user) {
@@ -60,6 +61,86 @@ static int cmd_wav_roundtrip(const char *in, const char *out) {
     return 0;
 }
 
+/* read a new prompt from stdin if a line is waiting (non-blocking); 1 if updated */
+static int stream_poll_prompt(char *buf, size_t cap) {
+    fd_set fds; FD_ZERO(&fds); FD_SET(0, &fds);
+    struct timeval tv = {0, 0};
+    if (select(1, &fds, NULL, NULL, &tv) > 0 && FD_ISSET(0, &fds) && fgets(buf, (int)cap, stdin)) {
+        size_t n = strlen(buf);
+        while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = 0;
+        return n > 0;
+    }
+    return 0;
+}
+
+/* interleaved frames [start, start+len) of `a` -> new aria_audio */
+static aria_audio *stream_slice(const aria_audio *a, int64_t start, int64_t len) {
+    if (start < 0) start = 0;
+    if (start + len > a->num_frames) len = a->num_frames - start;
+    if (len < 0) len = 0;
+    aria_audio *o = aria_audio_alloc(a->sample_rate, a->channels, len);
+    if (o && len) memcpy(o->data, a->data + start * a->channels, (size_t)len * a->channels * sizeof(float));
+    return o;
+}
+
+/* Streaming / interactive generation: keep the model resident and generate `chunk_s`-second
+ * segments by sliding-window inpaint-continuation over a `context_s` rolling context. Each
+ * step re-reads the prompt (live re-steering on a TTY). Verifies feasibility + per-chunk RTF. */
+static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float chunk_s, float context_s,
+                      int n_chunks, const char *out_path) {
+    int sr = aria_sample_rate(ctx), ch = aria_audio_channels(ctx);
+    int64_t chunk_fr = (int64_t)(chunk_s * sr), ctx_fr = (int64_t)(context_s * sr);
+    int interactive = isatty(fileno(stdin));
+    char promptbuf[1024];
+
+    int64_t total_fr = (int64_t)((context_s + chunk_s) * sr) + (int64_t)(n_chunks - 1) * chunk_fr;
+    aria_audio *outp = aria_audio_alloc(sr, ch, total_fr);
+    if (!outp) { fprintf(stderr, "stream: OOM\n"); return 1; }
+    int64_t written = 0;
+    aria_audio *context = NULL;
+
+    fprintf(stderr, "[stream] chunk=%.1fs context=%.1fs steps=%d (CPU continuation)%s\n",
+            chunk_s, context_s, p->steps, interactive ? " — type a new prompt + Enter to re-steer" : "");
+
+    for (int i = 0; i < n_chunks; i++) {
+        if (interactive && stream_poll_prompt(promptbuf, sizeof promptbuf)) {
+            p->prompt = promptbuf;
+            fprintf(stderr, "[stream] prompt -> \"%s\"\n", promptbuf);
+        }
+        p->seconds_total = context_s + chunk_s;
+        p->init_audio_mem = (i == 0) ? NULL : context;   /* first window is plain text->audio */
+        p->inpaint_continue = (i == 0) ? 0 : 1;
+
+        aria_audio *win = NULL;
+        struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+        int rc = aria_generate(ctx, p, &win);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        if (rc != 0 || !win) { fprintf(stderr, "stream: generate failed: %s\n", aria_last_error()); aria_audio_free(outp); aria_audio_free(context); return 1; }
+        double dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+
+        /* emit the NEW audio: the whole first window, else just the regenerated tail */
+        int64_t emit_start = (i == 0) ? 0 : ctx_fr;
+        int64_t emit_len = (i == 0) ? win->num_frames : chunk_fr;
+        if (emit_start + emit_len > win->num_frames) emit_len = win->num_frames - emit_start;
+        if (written + emit_len > total_fr) emit_len = total_fr - written;
+        if (emit_len > 0) memcpy(outp->data + written * ch, win->data + emit_start * ch, (size_t)emit_len * ch * sizeof(float));
+        written += emit_len;
+
+        double emit_s = emit_len / (double)sr;
+        fprintf(stderr, "[stream] chunk %d/%d: emit %.1fs in %.2fs (RTF %.1fx)  \"%s\"\n",
+                i + 1, n_chunks, emit_s, dt, dt > 0 ? emit_s / dt : 0.0, p->prompt ? p->prompt : "");
+
+        aria_audio_free(context);
+        context = stream_slice(win, win->num_frames - ctx_fr, ctx_fr);
+        aria_audio_free(win);
+    }
+    outp->num_frames = written;
+    int wrc = aria_wav_write(out_path, outp, 32);
+    fprintf(stderr, "[stream] wrote %s (%.1fs total)\n", out_path, written / (double)sr);
+    aria_audio_free(outp); aria_audio_free(context);
+    return wrc;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { usage(argv[0]); return 1; }
 
@@ -80,6 +161,8 @@ int main(int argc, char **argv) {
     aria_dtype precision = ARIA_F32;
     const char *load_quant = NULL;
     int rng_torch = 0;
+    int do_stream = 0, stream_chunks = 8;
+    float stream_chunk = 2.0f, stream_context = 6.0f;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--wav-roundtrip") == 0 && i + 2 < argc) {
@@ -132,6 +215,14 @@ int main(int argc, char **argv) {
             if (strcmp(m, "torch") == 0) rng_torch = 1;
             else if (strcmp(m, "xoshiro") == 0) rng_torch = 0;
             else { fprintf(stderr, "unknown --rng %s (use xoshiro|torch)\n", m); return 1; }
+        } else if (strcmp(argv[i], "--stream") == 0) {
+            do_stream = 1;
+        } else if (strcmp(argv[i], "--chunk") == 0 && i + 1 < argc) {
+            stream_chunk = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--context") == 0 && i + 1 < argc) {
+            stream_context = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--chunks") == 0 && i + 1 < argc) {
+            stream_chunks = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]); return 0;
         } else {
@@ -150,7 +241,13 @@ int main(int argc, char **argv) {
            aria_audio_channels(ctx), aria_num_tensors(ctx));
 
     int rc = 0;
-    if (do_list) {
+    if (do_stream) {
+        aria_gen_params p = ARIA_GEN_PARAMS_DEFAULT;
+        p.prompt = prompt; p.steps = steps; p.seed = seed;
+        p.precision = precision; p.device = ARIA_DEVICE_CPU;  /* continuation is CPU-only */
+        p.rng_torch = rng_torch;
+        rc = cmd_stream(ctx, &p, stream_chunk, stream_context, stream_chunks, out_path);
+    } else if (do_list) {
         aria_list_tensors(ctx, list_prefix);
     } else if (do_generate) {
         aria_gen_params p = ARIA_GEN_PARAMS_DEFAULT;
