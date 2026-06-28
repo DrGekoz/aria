@@ -12,6 +12,7 @@
 
 #include "aria.h"
 #include "aria_wav.h"
+#include "aria_hpss.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -59,6 +60,27 @@ static int cmd_wav_roundtrip(const char *in, const char *out) {
     if (rc != 0) { fprintf(stderr, "failed to write %s\n", out); aria_audio_free(a); return 1; }
     printf("wrote: %s (float32)\n", out);
     aria_audio_free(a);
+    return 0;
+}
+
+/* --hpss-test <in.wav>: separate -> harmonic.wav + percussive.wav, report split. */
+static int cmd_hpss_test(const char *in) {
+    aria_audio *a = aria_wav_read(in);
+    if (!a) { fprintf(stderr, "hpss: cannot read %s\n", in); return 1; }
+    int64_t nf = a->num_frames; int ch = a->channels;
+    float *h = malloc((size_t)nf * ch * sizeof(float)), *p = malloc((size_t)nf * ch * sizeof(float));
+    aria_hpss_separate(a->data, nf, ch, h, p);
+    double res = 0, eh = 0, ep = 0, ei = 0; int64_t M = nf * ch;
+    for (int64_t i = 0; i < M; i++) {
+        double r = a->data[i] - (h[i] + p[i]);
+        res += r * r; eh += (double)h[i] * h[i]; ep += (double)p[i] * p[i]; ei += (double)a->data[i] * a->data[i];
+    }
+    fprintf(stderr, "hpss: residual-rms=%.2e  harmonic=%.0f%%  percussive=%.0f%% (of input energy)\n",
+            sqrt(res / M), 100 * eh / (ei + 1e-9), 100 * ep / (ei + 1e-9));
+    aria_audio ho = { a->sample_rate, ch, nf, h }, po = { a->sample_rate, ch, nf, p };
+    aria_wav_write("harmonic.wav", &ho, 32); aria_wav_write("percussive.wav", &po, 32);
+    fprintf(stderr, "hpss: wrote harmonic.wav + percussive.wav\n");
+    free(h); free(p); aria_audio_free(a);
     return 0;
 }
 
@@ -221,7 +243,9 @@ int main(int argc, char **argv) {
     float stream_chunk = 2.0f, stream_context = 6.0f;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--wav-roundtrip") == 0 && i + 2 < argc) {
+        if (strcmp(argv[i], "--hpss-test") == 0 && i + 1 < argc) {
+            return cmd_hpss_test(argv[i + 1]);
+        } else if (strcmp(argv[i], "--wav-roundtrip") == 0 && i + 2 < argc) {
             return cmd_wav_roundtrip(argv[i + 1], argv[i + 2]);
         } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
             model_dir = argv[++i];

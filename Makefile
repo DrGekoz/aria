@@ -121,8 +121,8 @@ $(BUILD)/%.o: $(SRC)/%.c | $(BUILD)
 $(LIB): $(LIB_OBJS)
 	$(AR) rcs $@ $^
 
-aria: $(BUILD)/main.o $(LIB)
-	$(CC) $(CFLAGS) -I$(SRC) $< -L$(BUILD) -laria $(LDFLAGS) -o $@
+aria: $(BUILD)/main.o $(BUILD)/aria_hpss.o $(LIB)
+	$(CC) $(CFLAGS) -I$(SRC) $(BUILD)/main.o $(BUILD)/aria_hpss.o -L$(BUILD) -laria $(LDFLAGS) -o $@
 
 # ---- tests ----
 TESTS := test_ops test_wav test_config test_sampler test_arena test_quant test_rng
