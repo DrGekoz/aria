@@ -122,16 +122,24 @@ size_t taae_block_arena_bytes(void) {
 #include <math.h>
 
 size_t taae_med_block_floats(int N, int dim, int inner) {
-    /* h+res(2) + qkv(5) + q,k,v,qd,kd,ob,od(7) + merged,o(2) = 16*N*dim, + N*N + 3*N*inner */
-    return (size_t)16 * N * dim + (size_t)N * N + (size_t)3 * N * inner + 4096;
+    /* peak = attention phase: h+res+o(3) + qkv(5) + q,k,v,qd,kd,ob,od(7) + merged(1)
+     * = 16*N*dim + N*N (scores). The FF (3*N*dim + 3*N*inner) is freed-and-reused, and
+     * 3*N*inner < 13*N*dim for the medium decoder, so this bound covers it. */
+    (void)inner;
+    return (size_t)16 * N * dim + (size_t)N * N + 4096;
 }
 
 void taae_med_block_forward(float *xc, int N, int dim, int H, int hd, int inner,
                             const taae_block_w *w, const float *rcos, const float *rsin,
                             const float *mask, int sinusoidal, aria_arena *ar) {
     size_t mark = aria_arena_save(ar);
+    /* h/res/o persist; the attention scratch is freed before the FF (never live
+     * together) so the arena peak is the attention phase, not the sum -- saves
+     * ~3*N*inner (~100 MB on a 10 s medium clip). */
     float *h   = aria_arena_floats(ar, (size_t)N * dim);
     float *res = aria_arena_floats(ar, (size_t)N * dim);
+    float *o   = aria_arena_floats(ar, (size_t)N * dim);
+    size_t amark = aria_arena_save(ar);
     float *qkv = aria_arena_floats(ar, (size_t)N * 5 * dim);
     float *q  = aria_arena_floats(ar, (size_t)H * N * hd);
     float *k  = aria_arena_floats(ar, (size_t)H * N * hd);
@@ -141,9 +149,7 @@ void taae_med_block_forward(float *xc, int N, int dim, int H, int hd, int inner,
     float *ob = aria_arena_floats(ar, (size_t)H * N * hd);
     float *od = aria_arena_floats(ar, (size_t)H * N * hd);
     float *merged = aria_arena_floats(ar, (size_t)N * dim);
-    float *o = aria_arena_floats(ar, (size_t)N * dim);
     float *scores = aria_arena_floats(ar, (size_t)N * N);
-    float *ffs = aria_arena_floats(ar, (size_t)N * 3 * inner);
 
     /* self-attention (differential): out = attn(q,k,v) - attn(qd,kd,v), banded mask */
     memcpy(res, xc, (size_t)N * dim * sizeof(float));
@@ -168,8 +174,10 @@ void taae_med_block_forward(float *xc, int N, int dim, int H, int hd, int inner,
     merge_heads(merged, ob, N, H, hd);
     aria_linear(o, merged, w->to_out, NULL, N, dim, dim);
     for (size_t i = 0; i < (size_t)N * dim; i++) xc[i] = res[i] + o[i];
+    aria_arena_restore(ar, amark);   /* free qkv/q/k/v/qd/kd/ob/od/merged/scores before the FF */
 
     /* feed-forward (GLU): out = value * act(gate), act = SiLU or sin(pi*x) */
+    float *ffs = aria_arena_floats(ar, (size_t)N * 3 * inner);
     memcpy(res, xc, (size_t)N * dim * sizeof(float));
     aria_dynamic_tanh(h, xc, w->ff_alpha, w->ff_gamma, w->ff_beta, N, dim);
     aria_linear(ffs, h, w->ff_in_w, w->ff_in_b, N, dim, 2 * inner);  /* [N, 2*inner] */
