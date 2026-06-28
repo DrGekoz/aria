@@ -168,17 +168,27 @@ static inline void ukern_6x16(float *y, int N, const float *Ap, const float *Bp,
         }
     }
 }
+/* persistent per-thread pack buffers: grown as needed, never per-call malloc'd
+ * (the DiT issues ~1150 GEMMs/gen; per-call mmap of the A-pack was ~6% of the DiT).
+ * Thread-local is safe whether aria_linear is the caller-thread's (DiT) or called
+ * concurrently from a decoder OpenMP region -- each thread owns its buffers. */
+static float *grow_tls(float **buf, size_t *cap, size_t need) {
+    if (need > *cap) { free(*buf); *buf = (float *)malloc(need * sizeof(float)); *cap = *buf ? need : 0; }
+    return *buf;
+}
 static void aria_linear_packed(float *y, const float *x, const float *W, const float *b,
                                int M, int K, int N) {
+    static __thread float *Abuf = NULL; static __thread size_t Acap = 0;
     int np_m = (M + PMR - 1) / PMR, np_n = (N + PNR - 1) / PNR;
-    float *Apack = (float *)malloc((size_t)np_m * PMR * K * sizeof(float));
-    if (!Apack) return;
-    for (int p = 0; p < np_m; p++) pack_a_panel(Apack + (size_t)p * PMR * K, x, p * PMR, M, K);
+    float *Ap = grow_tls(&Abuf, &Acap, (size_t)np_m * PMR * K);
+    if (!Ap) return;
+    for (int p = 0; p < np_m; p++) pack_a_panel(Ap + (size_t)p * PMR * K, x, p * PMR, M, K);
     #ifdef _OPENMP
     #pragma omp parallel
     #endif
     {
-        float *Bp = (float *)malloc((size_t)PNR * K * sizeof(float));
+        static __thread float *Bbuf = NULL; static __thread size_t Bcap = 0;
+        float *Bp = grow_tls(&Bbuf, &Bcap, (size_t)PNR * K);
         if (Bp) {
             #ifdef _OPENMP
             #pragma omp for schedule(dynamic)
@@ -187,12 +197,10 @@ static void aria_linear_packed(float *y, const float *x, const float *W, const f
                 int n0 = pn * PNR;
                 pack_b_panel(Bp, W, n0, N, K);
                 for (int pm = 0; pm < np_m; pm++)
-                    ukern_6x16(y, N, Apack + (size_t)pm * PMR * K, Bp, K, b, pm * PMR, n0, M);
+                    ukern_6x16(y, N, Ap + (size_t)pm * PMR * K, Bp, K, b, pm * PMR, n0, M);
             }
-            free(Bp);
         }
     }
-    free(Apack);
 }
 #endif
 
