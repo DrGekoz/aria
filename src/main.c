@@ -43,7 +43,7 @@ static void usage(const char *prog) {
         "  %s -m <dir> -p \"prompt\" -d <total> --continue <in.wav> -o out.wav   (extend a clip)\n"
         "  %s -m <dir> -p \"prompt\" --inpaint <in.wav> --from <s> --to <s> -o out.wav  (regenerate a region)\n"
         "  %s -m <dir> --stream -p \"prompt\" [--hold] [--chunk 4] [--context 6] [--chunks N] -o out.wav\n"
-        "                                                              (continuous generation; CPU)\n"
+        "                                                              (continuous generation)\n"
         "    live play + re-steer:  %s -m <dir> --stream -o - -p \"prompt\" \\\n"
         "                             | play -t raw -r <sr> -e float -b 32 -c <ch> -\n"
         "                           (type a new prompt + Enter at any time to re-steer)\n"
@@ -51,7 +51,7 @@ static void usage(const char *prog) {
         "    --precision fp32|q8|q4 selects the CPU DiT weight precision (q8/q4 force the CPU path)\n"
         "    --load-quant <file.aria> loads a pre-quantized DiT from aria-quantize (CPU)\n"
         "    --rng xoshiro (default) | torch  (torch = PyTorch-matched noise for reproduction)\n"
-        "    --continue/--inpaint/--stream run on the CPU DiT; init WAV must match the model sample rate\n"
+        "    --continue/--inpaint/--stream run the DiT on GPU (auto) or CPU; init WAV must match the model sample rate\n"
         "    --stream --hold holds a steady drum loop (HPSS) while the melody evolves; -o - = stdout\n"
         "  Progress is drawn per denoise step when stderr is a terminal.\n",
         prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
@@ -244,8 +244,9 @@ static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float con
     int64_t written = 0;
     aria_audio *context = NULL;
 
-    fprintf(stderr, "[stream] emit=%.1fs context=%.1fs (skip %.1f / tail %.1f / xfade %.2f) steps=%d (CPU)%s\n",
-            emit_s, context_s, skip_s, tail_s, xfade_s, p->steps,
+    const char *devname = p->device == ARIA_DEVICE_CPU ? "CPU" : p->device == ARIA_DEVICE_CUDA ? "CUDA" : "auto";
+    fprintf(stderr, "[stream] emit=%.1fs context=%.1fs (skip %.1f / tail %.1f / xfade %.2f) steps=%d (%s)%s\n",
+            emit_s, context_s, skip_s, tail_s, xfade_s, p->steps, devname,
             interactive ? " — type a prompt + Enter to re-steer" : "");
 
     for (int i = 0; i < n_chunks; i++) {
@@ -436,7 +437,7 @@ int main(int argc, char **argv) {
     if (do_stream) {
         aria_gen_params p = ARIA_GEN_PARAMS_DEFAULT;
         p.prompt = prompt; p.steps = steps; p.seed = seed;
-        p.precision = precision; p.device = ARIA_DEVICE_CPU;  /* continuation is CPU-only */
+        p.precision = precision; p.device = device;  /* GPU continuation now supported (sm_70+) */
         p.rng_torch = rng_torch;
         rc = cmd_stream(ctx, &p, stream_chunk, stream_context, stream_chunks, stream_hold, out_path);
     } else if (do_list) {
