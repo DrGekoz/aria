@@ -17,7 +17,7 @@ for both; SAT's `max_memory_allocated` (tensors only) is shown in parentheses.
 |---|---|---|---|
 | **GPU time** | **0.19 s** | 0.34 s | aria (1.8×) |
 | **GPU VRAM** (process) | **1548 MB** | 2770 MB (alloc 1161) | aria (−44 %) |
-| **CPU time** (20 threads) | 4.0 s | **2.8 s** | SAT (1.4×) |
+| **CPU time** (20 threads) | 3.6 s | **2.8 s** | SAT (1.3×) |
 | **CPU peak RAM** | **2089 MB** | 5421 MB | aria (−61 %) |
 
 ## medium (GPU 10 s, CPU 5 s, 8 steps)
@@ -26,7 +26,7 @@ for both; SAT's `max_memory_allocated` (tensors only) is shown in parentheses.
 |---|---|---|---|
 | **GPU time** | 0.54 s | **0.50 s** | ≈ parity (1.08×) |
 | **GPU VRAM** (process) | **4314 MB** | 5452 MB (alloc 4561) | aria (−21 %) |
-| **CPU time** (5 s, 20 thr) | 8.6 s | **7.0 s** | SAT (1.2×) |
+| **CPU time** (5 s, 20 thr) | 8.1 s | **7.0 s** | SAT (1.15×) |
 | **CPU peak RAM** (5 s) | **7204 MB** | 18866 MB | aria (−62 %) |
 
 aria GPU breakdown — small: setup 0.02 + dit ~0.14 + decode 0.02; medium: setup
@@ -51,10 +51,11 @@ returns. aria's DiT/decoder GEMMs are already fp16 tensor cores.
   the 8 GB card (transient fp32 copy); aria runs medium GPU in 3.97 GB with headroom.
 - **GPU speed:** aria **wins small-music (1.8×)** and reaches **≈ parity on medium**
   (0.54 vs 0.50 s) after the three GPU optimizations above.
-- **CPU speed:** within **1.2–1.4× of PyTorch/MKL** after the **packed outer-product
-  GEMM** (was 2.4× behind). aria's hand-rolled AVX2 GEMM now runs ~490–540 GFLOP/s on
-  the big DiT shapes (was 175–280); the residual gap is MKL's edge on the GEMM + aria's
-  fp32 non-GEMM kernels. small-music CPU 6.7 → 4.0 s, medium 17 → 8.6 s.
+- **CPU speed:** within **1.15–1.3× of PyTorch/MKL** after the **packed outer-product
+  GEMM + K-blocking** (was 2.4× behind). aria's hand-rolled AVX2 GEMM now runs
+  **~460–622 GFLOP/s** on the big DiT shapes (was 175–280; MKL is ~600–700); the
+  residual gap is MKL's last edge + aria's fp32 non-GEMM kernels. small-music CPU
+  6.7 → 3.6 s, medium 17 → 8.1 s.
 - **CPU/host memory:** aria uses **~60 % less RAM** everywhere (mmap'd weights, no
   framework). Medium on CPU: aria 7.2 GB vs PyTorch 18.9 GB.
 
