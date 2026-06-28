@@ -30,31 +30,168 @@ static void cli_progress(int step, int total, void *user) {
     fflush(stderr);
 }
 
-static void usage(const char *prog) {
-    fprintf(stderr,
-        "aria - audio diffusion inference runtime\n\n"
-        "Usage:\n"
-        "  %s -m <model_dir> --info\n"
-        "  %s -m <model_dir> --list-tensors [prefix]\n"
-        "  %s --wav-roundtrip <in.wav> <out.wav>\n"
-        "  %s -m <dir> -p \"prompt\" -d <seconds> -s <steps> --seed <n> [--device auto|cpu|cuda] -o out.wav\n"
-        "  %s -m <dir> --uncond -d <seconds> -o out.wav\n"
-        "  %s -m <dir> --prompt-embed <prompt.atns> -d <seconds> -o out.wav\n"
-        "  %s -m <dir> -p \"prompt\" -d <total> --continue <in.wav> -o out.wav   (extend a clip)\n"
-        "  %s -m <dir> -p \"prompt\" --inpaint <in.wav> --from <s> --to <s> -o out.wav  (regenerate a region)\n"
-        "  %s -m <dir> --stream -p \"prompt\" [--hold] [--chunk 4] [--context 6] [--chunks N] -o out.wav\n"
-        "                                                              (continuous generation)\n"
-        "    live play + re-steer:  %s -m <dir> --stream -o - -p \"prompt\" \\\n"
-        "                             | play -t raw -r <sr> -e float -b 32 -c <ch> -\n"
-        "                           (type a new prompt + Enter at any time to re-steer)\n"
-        "    --device auto (default) runs the DiT device-resident on the GPU when one fits, else CPU\n"
-        "    --precision fp32|q8|q4 selects the CPU DiT weight precision (q8/q4 force the CPU path)\n"
-        "    --load-quant <file.aria> loads a pre-quantized DiT from aria-quantize (CPU)\n"
-        "    --rng xoshiro (default) | torch  (torch = PyTorch-matched noise for reproduction)\n"
-        "    --continue/--inpaint/--stream run the DiT on GPU (auto) or CPU; init WAV must match the model sample rate\n"
-        "    --stream --hold holds a steady drum loop (HPSS) while the melody evolves; -o - = stdout\n"
-        "  Progress is drawn per denoise step when stderr is a terminal.\n",
-        prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
+/* ---- unified table-driven CLI (argp-like, no external deps) ---------------------
+ * OPTS is the single source of truth: it drives both parsing and --help, so they
+ * cannot drift. cli_parse fills a cli_config; main() dispatches off its fields. */
+typedef struct {
+    const char *model_dir, *prompt, *prompt_embed, *out_path, *list_prefix;
+    const char *init_audio, *load_quant, *util_a, *util_b;
+    float seconds, inpaint_from, inpaint_to, stream_chunk, stream_context;
+    int steps, bench, stream_chunks;
+    long long seed;
+    aria_device device;
+    aria_dtype precision;
+    int do_info, do_list, do_generate, do_stream, inpaint_continue, stream_hold, rng_torch;
+    int util;                               /* 0 none / 1 wav-roundtrip / 2 hpss-test */
+} cli_config;
+
+static cli_config cli_defaults(void) {
+    cli_config c = {0};
+    c.out_path = "out.wav"; c.seconds = 15.0f; c.steps = 8; c.bench = 1;
+    c.seed = -1; c.device = ARIA_DEVICE_AUTO; c.precision = ARIA_F32;
+    c.stream_chunk = 2.0f; c.stream_context = 6.0f; c.stream_chunks = 8;
+    return c;
+}
+
+enum {   /* keys: short flags use their ASCII char; long-only options use ids past 256 */
+    K_MODEL='m', K_PROMPT='p', K_DUR='d', K_STEPS='s', K_OUT='o', K_HELP='h',
+    K_SEED=256, K_DEVICE, K_BENCH, K_UNCOND, K_PEMB, K_INFO, K_LIST,
+    K_INPAINT, K_CONTINUE, K_FROM, K_TO, K_PREC, K_LOADQ, K_RNG,
+    K_STREAM, K_CHUNK, K_CTX, K_CHUNKS, K_HOLD, K_WAVRT, K_HPSS,
+};
+typedef enum { A_NONE, A_ONE, A_TWO, A_OPT } argkind;  /* flag / 1 arg / 2 args / optional 1 arg */
+typedef struct {
+    int key; const char *lng; char shrt; argkind arg;
+    const char *meta, *group, *help;
+} opt_spec;
+
+static const opt_spec OPTS[] = {
+    {K_MODEL,    "model",        'm', A_ONE,  "<dir>",      "core",     "model directory (required, except for utilities)"},
+    {K_OUT,      "out",          'o', A_ONE,  "<file>",     "core",     "output WAV ('-' = raw f32 to stdout, for --stream)"},
+    {K_HELP,     "help",         'h', A_NONE, NULL,         "core",     "show this help and exit"},
+
+    {K_PROMPT,   "prompt",       'p', A_ONE,  "<text>",     "generate", "text prompt -> audio"},
+    {K_PEMB,     "prompt-embed",  0,  A_ONE,  "<file>",     "generate", "precomputed prompt embedding (.atns)"},
+    {K_UNCOND,   "uncond",        0,  A_NONE, NULL,         "generate", "unconditional generation"},
+    {K_DUR,      "",             'd', A_ONE,  "<sec>",      "generate", "duration in seconds (default 15)"},
+    {K_STEPS,    "",             's', A_ONE,  "<n>",        "generate", "denoise steps (default 8)"},
+    {K_SEED,     "seed",          0,  A_ONE,  "<n>",        "generate", "RNG seed (default random)"},
+    {K_DEVICE,   "device",        0,  A_ONE,  "<dev>",      "generate", "cpu | cuda | auto (default auto)"},
+    {K_PREC,     "precision",     0,  A_ONE,  "<p>",        "generate", "fp32 | fp16 | bf16 | q8 | q4 (q8/q4 force CPU)"},
+    {K_LOADQ,    "load-quant",    0,  A_ONE,  "<file>",     "generate", "load a pre-quantized .aria DiT overlay"},
+    {K_RNG,      "rng",           0,  A_ONE,  "<mode>",     "generate", "xoshiro (default) | torch (parity)"},
+    {K_BENCH,    "bench",         0,  A_ONE,  "<n>",        "generate", "generate N times resident, report warm-min"},
+
+    {K_CONTINUE, "continue",      0,  A_ONE,  "<in.wav>",   "edit",     "extend a clip (GPU or CPU)"},
+    {K_INPAINT,  "inpaint",       0,  A_ONE,  "<in.wav>",   "edit",     "regenerate a region of a clip"},
+    {K_FROM,     "from",          0,  A_ONE,  "<sec>",      "edit",     "inpaint region start"},
+    {K_TO,       "to",            0,  A_ONE,  "<sec>",      "edit",     "inpaint region end"},
+
+    {K_STREAM,   "stream",        0,  A_NONE, NULL,         "stream",   "continuous sliding-window generation"},
+    {K_CHUNK,    "chunk",         0,  A_ONE,  "<sec>",      "stream",   "seconds emitted per chunk (default 2)"},
+    {K_CTX,      "context",       0,  A_ONE,  "<sec>",      "stream",   "rolling context seconds (default 6)"},
+    {K_CHUNKS,   "chunks",        0,  A_ONE,  "<n>",        "stream",   "number of chunks (default 8)"},
+    {K_HOLD,     "hold",          0,  A_NONE, NULL,         "stream",   "hold a steady HPSS drum loop"},
+
+    {K_INFO,     "info",          0,  A_NONE, NULL,         "inspect",  "print model info and exit"},
+    {K_LIST,     "list-tensors",  0,  A_OPT,  "[prefix]",   "inspect",  "list tensors (optional name prefix)"},
+
+    {K_WAVRT,    "wav-roundtrip", 0,  A_TWO,  "<in> <out>", "util",     "decode + re-encode a WAV (no model)"},
+    {K_HPSS,     "hpss-test",     0,  A_ONE,  "<in.wav>",   "util",     "write harmonic.wav + percussive.wav (no model)"},
+    {0}
+};
+
+/* apply one matched option to the config; returns 0 ok, 1 error (message printed). */
+static int cli_apply(int key, char **a, cli_config *c) {
+    switch (key) {
+    case K_MODEL:  c->model_dir = a[0]; break;
+    case K_OUT:    c->out_path = a[0]; break;
+    case K_PROMPT: c->prompt = a[0]; c->do_generate = 1; break;
+    case K_PEMB:   c->prompt_embed = a[0]; c->do_generate = 1; break;
+    case K_UNCOND: c->do_generate = 1; break;
+    case K_DUR:    c->seconds = (float)atof(a[0]); break;
+    case K_STEPS:  c->steps = atoi(a[0]); break;
+    case K_SEED:   c->seed = atoll(a[0]); break;
+    case K_BENCH:  c->bench = atoi(a[0]); if (c->bench < 1) c->bench = 1; break;
+    case K_DEVICE:
+        if (!strcmp(a[0], "cpu")) c->device = ARIA_DEVICE_CPU;
+        else if (!strcmp(a[0], "cuda") || !strcmp(a[0], "gpu")) c->device = ARIA_DEVICE_CUDA;
+        else c->device = ARIA_DEVICE_AUTO;
+        break;
+    case K_PREC:
+        if (aria_dtype_parse(a[0], &c->precision) != 0) {
+            fprintf(stderr, "unknown --precision %s (use fp32|fp16|bf16|q8|q4)\n", a[0]); return 1;
+        }
+        break;
+    case K_LOADQ:  c->load_quant = a[0]; break;
+    case K_RNG:
+        if (!strcmp(a[0], "torch")) c->rng_torch = 1;
+        else if (!strcmp(a[0], "xoshiro")) c->rng_torch = 0;
+        else { fprintf(stderr, "unknown --rng %s (use xoshiro|torch)\n", a[0]); return 1; }
+        break;
+    case K_CONTINUE: c->init_audio = a[0]; c->inpaint_continue = 1; c->do_generate = 1; break;
+    case K_INPAINT:  c->init_audio = a[0]; c->do_generate = 1; break;
+    case K_FROM:   c->inpaint_from = (float)atof(a[0]); break;
+    case K_TO:     c->inpaint_to = (float)atof(a[0]); break;
+    case K_STREAM: c->do_stream = 1; break;
+    case K_CHUNK:  c->stream_chunk = (float)atof(a[0]); break;
+    case K_CTX:    c->stream_context = (float)atof(a[0]); break;
+    case K_CHUNKS: c->stream_chunks = atoi(a[0]); break;
+    case K_HOLD:   c->stream_hold = 1; break;
+    case K_INFO:   c->do_info = 1; break;
+    case K_LIST:   c->do_list = 1; if (a[0]) c->list_prefix = a[0]; break;
+    case K_WAVRT:  c->util = 1; c->util_a = a[0]; c->util_b = a[1]; break;
+    case K_HPSS:   c->util = 2; c->util_a = a[0]; break;
+    default: return 1;
+    }
+    return 0;
+}
+
+static void cli_help(const char *prog) {
+    fprintf(stderr, "aria - audio diffusion inference runtime\n\nUsage: %s [options]\n", prog);
+    static const char *groups[] = {"core","generate","edit","stream","inspect","util"};
+    static const char *titles[] = {"Core","Generation","Continue / inpaint","Streaming","Inspect","Utilities (no model)"};
+    for (size_t g = 0; g < sizeof(groups)/sizeof(*groups); g++) {
+        fprintf(stderr, "\n%s:\n", titles[g]);
+        for (const opt_spec *o = OPTS; o->key; o++) {
+            if (strcmp(o->group, groups[g])) continue;
+            char left[56]; int n = 0;
+            if (o->shrt) n += snprintf(left+n, sizeof left-n, "-%c", o->shrt);
+            if (o->shrt && o->lng && o->lng[0]) n += snprintf(left+n, sizeof left-n, ", ");
+            if (o->lng && o->lng[0]) n += snprintf(left+n, sizeof left-n, "--%s", o->lng);
+            if (o->meta) snprintf(left+n, sizeof left-n, " %s", o->meta);
+            fprintf(stderr, "  %-26s %s\n", left, o->help);
+        }
+    }
+    fprintf(stderr, "\nLive play + re-steer (type a new prompt + Enter any time):\n"
+                    "  %s -m <dir> --stream -o - -p \"...\" | play -t raw -r <sr> -e float -b 32 -c <ch> -\n", prog);
+}
+
+/* parse argv into cfg; returns 0 ok, 1 error, or -1 when --help was shown. */
+static int cli_parse(int argc, char **argv, cli_config *c) {
+    *c = cli_defaults();
+    for (int i = 1; i < argc; i++) {
+        const char *tok = argv[i];
+        const opt_spec *o = NULL;
+        if (tok[0] == '-' && tok[1] == '-') {
+            for (const opt_spec *s = OPTS; s->key; s++)
+                if (s->lng && s->lng[0] && !strcmp(tok + 2, s->lng)) { o = s; break; }
+        } else if (tok[0] == '-' && tok[1] && !tok[2]) {
+            for (const opt_spec *s = OPTS; s->key; s++)
+                if (s->shrt == tok[1]) { o = s; break; }
+        }
+        if (!o) { fprintf(stderr, "unknown option: %s\n", tok); cli_help(argv[0]); return 1; }
+        if (o->key == K_HELP) { cli_help(argv[0]); return -1; }
+        char *args[2] = {NULL, NULL};
+        int need = (o->arg == A_ONE) ? 1 : (o->arg == A_TWO) ? 2 : 0;
+        for (int k = 0; k < need; k++) {
+            if (i + 1 >= argc) { fprintf(stderr, "option %s needs %d argument(s)\n", tok, need); return 1; }
+            args[k] = argv[++i];
+        }
+        if (o->arg == A_OPT && i + 1 < argc && argv[i + 1][0] != '-') args[0] = argv[++i];
+        if (cli_apply(o->key, args, c)) return 1;
+    }
+    return 0;
 }
 
 static int cmd_wav_roundtrip(const char *in, const char *out) {
@@ -331,135 +468,53 @@ static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float con
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) { usage(argv[0]); return 1; }
+    if (argc < 2) { cli_help(argv[0]); return 1; }
 
-    const char *model_dir = NULL;
-    const char *prompt = NULL;
-    const char *prompt_embed = NULL;
-    const char *out_path = "out.wav";
-    const char *list_prefix = NULL;
-    int do_info = 0, do_list = 0, do_generate = 0;
-    float seconds = 15.0f;
-    int steps = 8;
-    long long seed = -1;
-    aria_device device = ARIA_DEVICE_AUTO;
-    int bench = 1;   /* --bench N: generate N times (model resident) for warm timing */
-    const char *init_audio = NULL;          /* continue / inpaint source WAV */
-    float inpaint_from = 0.0f, inpaint_to = 0.0f;
-    int inpaint_continue = 0;
-    aria_dtype precision = ARIA_F32;
-    const char *load_quant = NULL;
-    int rng_torch = 0;
-    int do_stream = 0, stream_chunks = 8, stream_hold = 0;
-    float stream_chunk = 2.0f, stream_context = 6.0f;
+    cli_config cfg;
+    int pr = cli_parse(argc, argv, &cfg);
+    if (pr < 0) return 0;   /* --help shown */
+    if (pr > 0) return 1;   /* parse error (message already printed) */
 
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--hpss-test") == 0 && i + 1 < argc) {
-            return cmd_hpss_test(argv[i + 1]);
-        } else if (strcmp(argv[i], "--wav-roundtrip") == 0 && i + 2 < argc) {
-            return cmd_wav_roundtrip(argv[i + 1], argv[i + 2]);
-        } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
-            model_dir = argv[++i];
-        } else if (strcmp(argv[i], "--info") == 0) {
-            do_info = 1;
-        } else if (strcmp(argv[i], "--list-tensors") == 0) {
-            do_list = 1;
-            if (i + 1 < argc && argv[i + 1][0] != '-') list_prefix = argv[++i];
-        } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
-            prompt = argv[++i]; do_generate = 1;
-        } else if (strcmp(argv[i], "--prompt-embed") == 0 && i + 1 < argc) {
-            prompt_embed = argv[++i]; do_generate = 1;
-        } else if (strcmp(argv[i], "--uncond") == 0) {
-            do_generate = 1;
-        } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
-            seed = atoll(argv[++i]);
-        } else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
-            seconds = (float)atof(argv[++i]);
-        } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
-            steps = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
-            out_path = argv[++i];
-        } else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
-            const char *d = argv[++i];
-            if (strcmp(d, "cpu") == 0) device = ARIA_DEVICE_CPU;
-            else if (strcmp(d, "cuda") == 0 || strcmp(d, "gpu") == 0) device = ARIA_DEVICE_CUDA;
-            else device = ARIA_DEVICE_AUTO;
-        } else if (strcmp(argv[i], "--bench") == 0 && i + 1 < argc) {
-            bench = atoi(argv[++i]); if (bench < 1) bench = 1;
-        } else if (strcmp(argv[i], "--inpaint") == 0 && i + 1 < argc) {
-            init_audio = argv[++i]; do_generate = 1;
-        } else if (strcmp(argv[i], "--continue") == 0 && i + 1 < argc) {
-            init_audio = argv[++i]; inpaint_continue = 1; do_generate = 1;
-        } else if (strcmp(argv[i], "--from") == 0 && i + 1 < argc) {
-            inpaint_from = (float)atof(argv[++i]);
-        } else if (strcmp(argv[i], "--to") == 0 && i + 1 < argc) {
-            inpaint_to = (float)atof(argv[++i]);
-        } else if (strcmp(argv[i], "--precision") == 0 && i + 1 < argc) {
-            if (aria_dtype_parse(argv[++i], &precision) != 0) {
-                fprintf(stderr, "unknown --precision %s (use fp32|fp16|bf16|q8|q4)\n", argv[i]);
-                return 1;
-            }
-        } else if (strcmp(argv[i], "--load-quant") == 0 && i + 1 < argc) {
-            load_quant = argv[++i];
-        } else if (strcmp(argv[i], "--rng") == 0 && i + 1 < argc) {
-            const char *m = argv[++i];
-            if (strcmp(m, "torch") == 0) rng_torch = 1;
-            else if (strcmp(m, "xoshiro") == 0) rng_torch = 0;
-            else { fprintf(stderr, "unknown --rng %s (use xoshiro|torch)\n", m); return 1; }
-        } else if (strcmp(argv[i], "--stream") == 0) {
-            do_stream = 1;
-        } else if (strcmp(argv[i], "--chunk") == 0 && i + 1 < argc) {
-            stream_chunk = (float)atof(argv[++i]);
-        } else if (strcmp(argv[i], "--context") == 0 && i + 1 < argc) {
-            stream_context = (float)atof(argv[++i]);
-        } else if (strcmp(argv[i], "--chunks") == 0 && i + 1 < argc) {
-            stream_chunks = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--hold") == 0) {
-            stream_hold = 1;
-        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            usage(argv[0]); return 0;
-        } else {
-            fprintf(stderr, "unknown/incomplete arg: %s\n", argv[i]);
-            usage(argv[0]); return 1;
-        }
-    }
+    /* standalone utilities run without loading a model */
+    if (cfg.util == 1) return cmd_wav_roundtrip(cfg.util_a, cfg.util_b);
+    if (cfg.util == 2) return cmd_hpss_test(cfg.util_a);
 
-    if (!model_dir) { usage(argv[0]); return 1; }
+    if (!cfg.model_dir) { cli_help(argv[0]); return 1; }
 
-    aria_ctx *ctx = aria_load(model_dir);
+    aria_ctx *ctx = aria_load(cfg.model_dir);
     if (!ctx) { fprintf(stderr, "load error: %s\n", aria_last_error()); return 1; }
 
     fprintf(stderr, "model: %s | type=%s | sr=%d ch=%d | tensors=%d\n",
-            model_dir, aria_model_type(ctx), aria_sample_rate(ctx),
+            cfg.model_dir, aria_model_type(ctx), aria_sample_rate(ctx),
             aria_audio_channels(ctx), aria_num_tensors(ctx));
 
     int rc = 0;
-    if (do_stream) {
+    if (cfg.do_stream) {
         aria_gen_params p = ARIA_GEN_PARAMS_DEFAULT;
-        p.prompt = prompt; p.steps = steps; p.seed = seed;
-        p.precision = precision; p.device = device;  /* GPU continuation now supported (sm_70+) */
-        p.rng_torch = rng_torch;
-        rc = cmd_stream(ctx, &p, stream_chunk, stream_context, stream_chunks, stream_hold, out_path);
-    } else if (do_list) {
-        aria_list_tensors(ctx, list_prefix);
-    } else if (do_generate) {
+        p.prompt = cfg.prompt; p.steps = cfg.steps; p.seed = cfg.seed;
+        p.precision = cfg.precision; p.device = cfg.device;  /* GPU continuation supported (sm_70+) */
+        p.rng_torch = cfg.rng_torch;
+        rc = cmd_stream(ctx, &p, cfg.stream_chunk, cfg.stream_context, cfg.stream_chunks, cfg.stream_hold, cfg.out_path);
+    } else if (cfg.do_list) {
+        aria_list_tensors(ctx, cfg.list_prefix);
+    } else if (cfg.do_generate) {
         aria_gen_params p = ARIA_GEN_PARAMS_DEFAULT;
-        p.prompt = prompt;
-        p.prompt_embed_path = prompt_embed;
-        p.seconds_total = seconds;
-        p.steps = steps;
-        p.seed = seed;
-        p.device = device;
-        p.precision = precision;
-        p.load_quant = load_quant;
-        p.init_audio = init_audio;
-        p.inpaint_from_s = inpaint_from;
-        p.inpaint_to_s = inpaint_to;
-        p.inpaint_continue = inpaint_continue;
-        p.rng_torch = rng_torch;
+        p.prompt = cfg.prompt;
+        p.prompt_embed_path = cfg.prompt_embed;
+        p.seconds_total = cfg.seconds;
+        p.steps = cfg.steps;
+        p.seed = cfg.seed;
+        p.device = cfg.device;
+        p.precision = cfg.precision;
+        p.load_quant = cfg.load_quant;
+        p.init_audio = cfg.init_audio;
+        p.inpaint_from_s = cfg.inpaint_from;
+        p.inpaint_to_s = cfg.inpaint_to;
+        p.inpaint_continue = cfg.inpaint_continue;
+        p.rng_torch = cfg.rng_torch;
         if (isatty(fileno(stderr))) p.progress = cli_progress;  /* live progress on a terminal */
         double best = 1e9;
-        for (int b = 0; b < bench && rc == 0; b++) {
+        for (int b = 0; b < cfg.bench && rc == 0; b++) {
             aria_audio *audio = NULL;
             struct timespec t0, t1;
             clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -468,16 +523,16 @@ int main(int argc, char **argv) {
             double gen_s = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
             if (rc != 0 || !audio) { fprintf(stderr, "generate error: %s\n", aria_last_error()); rc = 1; break; }
             if (gen_s < best) best = gen_s;
-            if (bench > 1) fprintf(stderr, "  [bench %d/%d] %.2fs\n", b + 1, bench, gen_s);
-            if (b == bench - 1) {
-                aria_wav_write(out_path, audio, 32);
+            if (cfg.bench > 1) fprintf(stderr, "  [bench %d/%d] %.2fs\n", b + 1, cfg.bench, gen_s);
+            if (b == cfg.bench - 1) {
+                aria_wav_write(cfg.out_path, audio, 32);
                 printf("wrote %s (%.2fs audio, generated in %.2fs%s)\n",
-                       out_path, (double)audio->num_frames / audio->sample_rate, best,
-                       bench > 1 ? " warm-min" : "");
+                       cfg.out_path, (double)audio->num_frames / audio->sample_rate, best,
+                       cfg.bench > 1 ? " warm-min" : "");
             }
             aria_audio_free(audio);
         }
-    } else if (do_info) {
+    } else if (cfg.do_info) {
         /* header already printed */
     }
 
