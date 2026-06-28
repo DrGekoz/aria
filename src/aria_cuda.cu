@@ -1109,26 +1109,45 @@ extern "C" void aria_cuda_dec_free(aria_cuda_dec *h) {
 #define MD_DEPTH 12
 #define MD_WIN   17
 
-/* banded softmax: row r (head h, query i = r % Nq) keeps only keys j with
- * |j-i| <= W; outside the band is masked out. fp32 block-per-row reduction. */
-__global__ void k_softmax_band(float *x, int rows, int cols, int Nq, int W) {
-    int r = blockIdx.x; if (r >= rows) return;
-    int qi = r % Nq;
-    float *xr = x + (size_t)r * cols;
-    __shared__ float red[RED_TH];
-    float mx = -INFINITY;
-    for (int j = threadIdx.x; j < cols; j += blockDim.x) {
-        int dd = j - qi; float v = (dd >= -W && dd <= W) ? xr[j] : -INFINITY; xr[j] = v; mx = fmaxf(mx, v);
+/* Fused sliding-window attention: one warp per query (h,i) computes only the
+ * [i-W, i+W] band (<= 2W+1 keys) -- QK via shuffle-reduce, softmax over the band in
+ * shared, then AV. O(N*(2W+1)) instead of the full O(N^2)-then-mask, and no N*N score
+ * buffer. Exact vs the masked-softmax version (masked keys contributed 0 anyway).
+ * D must be a multiple of 32 (decoder hd=64 -> 2 dims/lane). */
+__global__ void k_attn_band(float *out, const float *q, const float *k, const float *v,
+                            int H, int N, int D, float scale, int W) {
+    __shared__ float ssc[2 * MD_WIN + 1];
+    int idx = blockIdx.x; if (idx >= H * N) return;
+    int h = idx / N, i = idx % N, lane = threadIdx.x, dpl = D / 32;
+    const float *qh = q + (size_t)idx * D;
+    float qr[8];
+    for (int c = 0; c < dpl; c++) qr[c] = qh[lane + c * 32];
+    int lo = i - W < 0 ? 0 : i - W, hi = i + W >= N ? N - 1 : i + W, wb = hi - lo + 1;
+    for (int j = 0; j < wb; j++) {
+        const float *kk = k + ((size_t)h * N + (lo + j)) * D;
+        float p = 0.0f;
+        for (int c = 0; c < dpl; c++) p += qr[c] * kk[lane + c * 32];
+        for (int o = 16; o > 0; o >>= 1) p += __shfl_down_sync(0xffffffffu, p, o);
+        if (lane == 0) ssc[j] = p * scale;
     }
-    red[threadIdx.x] = mx; __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]); __syncthreads(); }
-    mx = red[0]; __syncthreads();
-    float sum = 0.0f;
-    for (int j = threadIdx.x; j < cols; j += blockDim.x) { float e = expf(xr[j] - mx); xr[j] = e; sum += e; }
-    red[threadIdx.x] = sum; __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s]; __syncthreads(); }
-    float inv = red[0] > 0.0f ? 1.0f / red[0] : 0.0f;
-    for (int j = threadIdx.x; j < cols; j += blockDim.x) xr[j] *= inv;
+    __syncwarp();
+    if (lane == 0) {                       /* softmax over the band (<= 35 keys) */
+        float mx = -INFINITY;
+        for (int j = 0; j < wb; j++) mx = fmaxf(mx, ssc[j]);
+        float sum = 0.0f;
+        for (int j = 0; j < wb; j++) { ssc[j] = expf(ssc[j] - mx); sum += ssc[j]; }
+        float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+        for (int j = 0; j < wb; j++) ssc[j] *= inv;
+    }
+    __syncwarp();
+    float orr[8];
+    for (int c = 0; c < dpl; c++) orr[c] = 0.0f;
+    for (int j = 0; j < wb; j++) {
+        const float *vv = v + ((size_t)h * N + (lo + j)) * D;
+        for (int c = 0; c < dpl; c++) orr[c] += ssc[j] * vv[lane + c * 32];
+    }
+    float *oo = out + (size_t)idx * D;
+    for (int c = 0; c < dpl; c++) oo[lane + c * 32] = orr[c];
 }
 
 /* sinusoidal GLU gate: out = sin(pi*gate) * value */
@@ -1140,16 +1159,10 @@ __global__ void k_ff_singate(float *out, const float *proj, int S, int inner) {
     out[idx] = sinf(3.14159265359f * pr[inner + i]) * pr[i];
 }
 
-/* batched self-attention with the sliding-window band mask (Nq=Nk=N) */
-static void attn_dev_band(cublasHandle_t cb, float *out, const float *q, const float *k, const float *v,
-                          int H, int N, int D, float *scores, int W) {
-    const float scale = 1.0f / sqrtf((float)D), one = 1.0f, zero = 0.0f;
-    cublasSgemmStridedBatched(cb, CUBLAS_OP_T, CUBLAS_OP_N, N, N, D,
-        &one, k, D, (long long)N * D, q, D, (long long)N * D, &zero, scores, N, (long long)N * N, H);
-    k_scale<<<nblocks((size_t)H * N * N), THREADS>>>(scores, scores, scale, H * N * N);
-    k_softmax_band<<<H * N, RED_TH>>>(scores, H * N, N, N, W);
-    cublasSgemmStridedBatched(cb, CUBLAS_OP_N, CUBLAS_OP_N, D, N, N,
-        &one, v, D, (long long)N * D, scores, N, (long long)N * N, &zero, out, D, (long long)N * D, H);
+/* sliding-window self-attention (Nq=Nk=N), fused band kernel: one warp per query */
+static void attn_dev_band(float *out, const float *q, const float *k, const float *v,
+                          int H, int N, int D, int W) {
+    k_attn_band<<<H * N, 32>>>(out, q, k, v, H, N, D, 1.0f / sqrtf((float)D), W);
 }
 
 struct aria_cuda_dec_medium {
@@ -1170,7 +1183,6 @@ static void med_block_dev(aria_cuda_dec_medium *h, float *seq, int N, const floa
     float *qd = da_alloc(ar, NH), *kd = da_alloc(ar, NH);
     float *ob = da_alloc(ar, NH), *od = da_alloc(ar, NH);
     float *merged = da_alloc(ar, (size_t)N * D), *o = da_alloc(ar, (size_t)N * D);
-    float *scores = da_alloc(ar, (size_t)H * N * N);
 
     cudaMemcpy(res, seq, (size_t)N * D * sizeof(float), cudaMemcpyDeviceToDevice);
     k_dyt<<<nblocks((size_t)N * D), THREADS>>>(hh, seq, w->pre_alpha, w->pre_gamma, w->pre_beta, (size_t)N * D, D);
@@ -1190,8 +1202,8 @@ static void med_block_dev(aria_cuda_dec_medium *h, float *seq, int N, const floa
     k_rope<<<nblocks(hn), THREADS>>>(qd, rcos, rsin, H, N, hd, MD_ROT);
     k_rope<<<nblocks(hn), THREADS>>>(k,  rcos, rsin, H, N, hd, MD_ROT);
     k_rope<<<nblocks(hn), THREADS>>>(kd, rcos, rsin, H, N, hd, MD_ROT);
-    attn_dev_band(h->cublas, ob, q,  k,  v, H, N, hd, scores, MD_WIN);
-    attn_dev_band(h->cublas, od, qd, kd, v, H, N, hd, scores, MD_WIN);
+    attn_dev_band(ob, q,  k,  v, H, N, hd, MD_WIN);
+    attn_dev_band(od, qd, kd, v, H, N, hd, MD_WIN);
     k_subtract<<<nblocks(NH), THREADS>>>(ob, od, NH);
     k_merge_heads<<<nblocks(NH), THREADS>>>(merged, ob, N, H, hd);
     gemm_f16w(h->cublas, ar, o, merged, w->to_out, NULL, N, D, D);
@@ -1249,7 +1261,8 @@ extern "C" void aria_cuda_dec_medium_forward(aria_cuda_dec_medium *h, float *aud
     float *rcos = upload_f32(cs, (size_t)N * rh), *rsin = upload_f32(sn, (size_t)N * rh);
     free(cs); free(sn);
 
-    size_t blockpk = (size_t)16 * N * D + (size_t)MD_H * N * N + (size_t)3 * N * MD_INNER;
+    /* no N*N score buffer anymore -- the fused band attention computes only ±W */
+    size_t blockpk = (size_t)16 * N * D + (size_t)3 * N * MD_INNER;
     size_t cap = ((size_t)N * D + blockpk + (size_t)D * Lt + (size_t)MD_OUT * Lt
                   + (size_t)T * 256 + (size_t)T * D + (size_t)2 * Lt * 256 + (1u << 20)) * sizeof(float);
     darena ar; cudaMalloc(&ar.base, cap); ar.cap = cap; ar.used = 0;
