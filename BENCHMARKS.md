@@ -105,6 +105,25 @@ only ~9 %). Remaining long-tail headroom: the per-attention fp16 conversions (ha
 `k_extract_normrope` emit fp16 so `attn_dev` skips them) and CUDA Graphs for the ~14 k
 per-gen launches.
 
+## Streaming / continuation on GPU (small-music, 8 steps, RTX 3070)
+
+Continue/inpaint used to be gated to the CPU DiT (the local-additive inpaint cond was
+CPU-only). Porting it to the device DiT (reuse the CPU-projected per-block `local_emb`,
+upload it, add after cross-attn via the existing `k_add`) makes `--continue`/`--inpaint`/
+`--stream` run on the GPU. The taae context encoder stays on the CPU.
+
+- **Parity:** GPU vs CPU continuation, same seed → regen region **corr = 1.0000, rel_rmse
+  0.45 %** (pure fp16 DiT noise; the local-cond is uploaded + added in f32, so bit-identical).
+  CPU and GPU `--stream` outputs are identical to 2 decimals per second.
+- **Speed:** an 18 s continuation **6.92 → 2.54 s (2.7×)**. Streaming per-chunk (4 s emit,
+  14.5 s window): CPU **RTF ~0.6×** → GPU **RTF ~4×** (chunk ~1.0 s). Crosses real-time with
+  ~3× headroom → smooth live playback (`--stream -o - | play …`, writer thread overlaps gen).
+- **Decay ceiling (device-independent):** for prompts whose chunk-0 emit reaches SA3's
+  natural outro fade (e.g. "ambient pads", "funk groove"), the chained continuations inherit
+  the fade and drift to silence past ~9 s. Steady-energy prompts ("melodic techno") hold.
+  This is the inpaint-envelope-drift limit of the post-hoc method, not the GPU — CPU and GPU
+  decay identically. See PAPER.md (beat-sync loop / streaming-trained model).
+
 ## Takeaways
 
 - **GPU memory:** aria's footprint is consistently smaller (−27 to −47 %) — a bump
