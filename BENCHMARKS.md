@@ -4,7 +4,7 @@ aria (this runtime) vs **stable-audio-tools** (the PyTorch reference), same mach
 same model weights, same workload: **uncond, 8-step pingpong, DiT + autoencoder
 decode** (no text encoder — isolates the core diffusion runtime). Both measure
 **warm** generation with the model resident (aria = min of 3, SAT = mean of 3;
-medium CPU = single run). Hardware: **Alienware — RTX 3070 (8 GB, sm_86) + 20-core CPU.**
+medium CPU = single run). Hardware: **Alienware — RTX 3070 (8 GB, sm_86) + i9-10900KF (20 threads).**
 
 GPU: aria runs fp16 weights / fp32 compute (cuBLAS tensor cores); SAT runs fp16
 (`.half()`). VRAM is the **actual process footprint** (`cudaMemGetInfo` for aria,
@@ -43,6 +43,34 @@ medium **0.98 → 0.54 s** (≈ SAT parity) and small-music **0.29 → 0.19 s** 
 What's left (medium 0.54 vs 0.50) is fp32 elementwise + launch overhead — diminishing
 returns. aria's DiT/decoder GEMMs are already fp16 tensor cores.
 
+## Long audio — 60 s reference (medium, 8 steps)
+
+The motivating workload is a **60 s** clip. Below is aria-vs-SAT at 10 s and 60 s so
+the *scaling* is visible (medium, uncond, warm; Alienware RTX 3070 + i9-10900KF).
+
+| backend | aria 10 s | aria 60 s | aria 10→60 | SAT 10 s | SAT 60 s | SAT 10→60 | @ 60 s |
+|---|---|---|---|---|---|---|---|
+| **CPU** (20 thr) | 11.5 s | **57.9 s** | 5.0× | 11.3 s | **108.4 s** | 9.6× | **aria 1.87× faster** |
+| **GPU** (fp16) | 0.52 s | **2.22 s** | 4.3× | 0.49 s | **1.32 s** | 2.7× | SAT 1.68× faster |
+
+aria 60 s stage split — GPU: dit 1.45 + decode 0.78 s; CPU: dit 36.7 + decode 21.0 s.
+GPU VRAM at 60 s: aria **4514 MB** vs SAT 6720 MB.
+
+**The decoder fix (CPU + GPU).** The medium decoder's ±17 sliding-window attention
+ran as a full N×N score matrix + mask, where the transformer sequence `N = T×17`
+(10,982 tokens at 60 s) — pure **O(N²)**: CPU decode measured 18.6 → 78.0 s when the
+latent length doubled (15→30 s). A banded kernel computes only the 35-key window
+(`aria_attention_band` on CPU; `k_attn_band` on GPU; both numerically exact, A/B
+audio rel 1e-5). CPU decode at 60 s ~300 → 21–32 s; the win grows with duration. This
+is why **aria CPU now scales *better* than PyTorch** for long audio (SAT CPU 9.6× vs
+aria 5.0× from 10→60 s) — PyTorch's medium decoder still pays the growth aria shed.
+
+**The remaining gap — GPU long-audio attention.** aria GPU is at parity at 10 s
+(0.52 vs 0.49) but **1.68× behind at 60 s**. The DiT self-attention is full O(S²)
+(S = 710 at 60 s) and aria materializes the fp16 S×S scores + a separate softmax pass
+(HBM-bound); PyTorch SDPA uses flash attention (fused, no S×S in HBM). This is aria's
+one long-audio weakness, and a flash-attention DiT kernel is the targeted fix.
+
 ## Takeaways
 
 - **GPU memory:** aria's footprint is consistently smaller (−27 to −47 %) — a bump
@@ -51,19 +79,21 @@ returns. aria's DiT/decoder GEMMs are already fp16 tensor cores.
   the 8 GB card (transient fp32 copy); aria runs medium GPU in 3.97 GB with headroom.
 - **GPU speed:** aria **wins small-music (1.8×)** and reaches **≈ parity on medium**
   (0.54 vs 0.50 s) after the three GPU optimizations above.
-- **CPU speed:** within **1.15–1.3× of PyTorch/MKL** after the **packed outer-product
-  GEMM + K-blocking** (was 2.4× behind). aria's hand-rolled AVX2 GEMM now runs
-  **~460–622 GFLOP/s** on the big DiT shapes (was 175–280; MKL is ~600–700); the
-  residual gap is MKL's last edge + aria's fp32 non-GEMM kernels. small-music CPU
-  6.7 → 3.6 s, medium 17 → 8.1 s.
+- **CPU speed:** within **1.15–1.3× of PyTorch/MKL** on short clips after the **packed
+  outer-product GEMM + K-blocking** (was 2.4× behind); aria's AVX2 GEMM runs
+  **~460–622 GFLOP/s** on the big DiT shapes (MKL is ~600–700). For **long audio aria
+  now *beats* PyTorch** — the banded decoder keeps aria near-linear while SAT's medium
+  decode grows superlinearly: at **60 s, aria CPU is 1.87× faster** (57.9 vs 108.4 s).
 - **CPU/host memory:** aria uses **~60 % less RAM** everywhere (mmap'd weights, no
   framework). Medium on CPU: aria 7.2 GB vs PyTorch 18.9 GB.
 
 **Where aria wins:** dependency-free single binary, the smallest memory footprint
-(GPU and CPU, −44 to −62 %), faster small-music GPU, and ≈-parity medium GPU. **Where
-the PyTorch stack still edges ahead:** CPU throughput (MKL, ~1.3×) and a sliver on
-medium GPU. aria's niche is exactly the plan's: run these models on budget/low-VRAM
-hardware without the framework — now also at competitive speed.
+(GPU and CPU, −44 to −62 %), faster small-music GPU, ≈-parity medium GPU, and
+**faster long-audio CPU** (1.87× at 60 s). **Where the PyTorch stack still edges
+ahead:** short-clip CPU throughput (MKL, ~1.3×) and **long-audio GPU** (1.68× at 60 s,
+flash attention — aria's next GPU optimization). aria's niche is exactly the plan's:
+run these models on budget/low-VRAM hardware without the framework — now also at
+competitive (often better) speed.
 
 ## Memory notes (no-speed-loss optimizations)
 
