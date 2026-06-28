@@ -1178,14 +1178,17 @@ static void med_block_dev(aria_cuda_dec_medium *h, float *seq, int N, const floa
     int D = MD_D, H = MD_H, hd = MD_HD;
     size_t NH = (size_t)H * N * hd;
     size_t mark = da_save(ar);
-    float *res = da_alloc(ar, (size_t)N * D), *hh = da_alloc(ar, (size_t)N * D);
-    float *q  = da_alloc(ar, NH), *k = da_alloc(ar, NH), *v = da_alloc(ar, NH);
-    float *qd = da_alloc(ar, NH), *kd = da_alloc(ar, NH);
-    float *ob = da_alloc(ar, NH), *od = da_alloc(ar, NH);
-    float *merged = da_alloc(ar, (size_t)N * D), *o = da_alloc(ar, (size_t)N * D);
+    /* res/hh/o persist across the block; the attention scratch is freed before the FF
+     * (they're never live together) so the arena peak is the attention phase, not the
+     * sum of both -- saves ~3*N*INNER (~100 MB on a 10 s medium clip). */
+    float *res = da_alloc(ar, (size_t)N * D), *hh = da_alloc(ar, (size_t)N * D), *o = da_alloc(ar, (size_t)N * D);
 
     cudaMemcpy(res, seq, (size_t)N * D * sizeof(float), cudaMemcpyDeviceToDevice);
     k_dyt<<<nblocks((size_t)N * D), THREADS>>>(hh, seq, w->pre_alpha, w->pre_gamma, w->pre_beta, (size_t)N * D, D);
+    size_t amark = da_save(ar);
+    float *q  = da_alloc(ar, NH), *k = da_alloc(ar, NH), *v = da_alloc(ar, NH);
+    float *qd = da_alloc(ar, NH), *kd = da_alloc(ar, NH);
+    float *ob = da_alloc(ar, NH), *od = da_alloc(ar, NH), *merged = da_alloc(ar, (size_t)N * D);
     float *qkv = da_alloc(ar, (size_t)N * MD_QKV);
     gemm_f16w(h->cublas, ar, qkv, hh, w->to_qkv, NULL, N, D, MD_QKV);
     k_extract_heads<<<nblocks(NH), THREADS>>>(q,  qkv, N, H, hd, MD_QKV, 0);
@@ -1208,6 +1211,7 @@ static void med_block_dev(aria_cuda_dec_medium *h, float *seq, int N, const floa
     k_merge_heads<<<nblocks(NH), THREADS>>>(merged, ob, N, H, hd);
     gemm_f16w(h->cublas, ar, o, merged, w->to_out, NULL, N, D, D);
     k_add<<<nblocks((size_t)N * D), THREADS>>>(seq, res, o, (size_t)N * D);
+    da_restore(ar, amark);   /* free q/k/v/qd/kd/ob/od/merged/qkv before the FF */
 
     cudaMemcpy(res, seq, (size_t)N * D * sizeof(float), cudaMemcpyDeviceToDevice);
     k_dyt<<<nblocks((size_t)N * D), THREADS>>>(hh, seq, w->ff_alpha, w->ff_gamma, w->ff_beta, (size_t)N * D, D);
@@ -1261,8 +1265,10 @@ extern "C" void aria_cuda_dec_medium_forward(aria_cuda_dec_medium *h, float *aud
     float *rcos = upload_f32(cs, (size_t)N * rh), *rsin = upload_f32(sn, (size_t)N * rh);
     free(cs); free(sn);
 
-    /* no N*N score buffer anymore -- the fused band attention computes only ±W */
-    size_t blockpk = (size_t)16 * N * D + (size_t)3 * N * MD_INNER;
+    /* no N*N score buffer (fused band attn), and the FF scratch no longer co-resides
+     * with the attention scratch (freed between phases) -- peak is the attention phase
+     * (16*N*D + a GEMM-scratch margin); 17*N*D bounds it and the FF (3.5*N*INNER < 17*D). */
+    size_t blockpk = (size_t)17 * N * D;
     size_t cap = ((size_t)N * D + blockpk + (size_t)D * Lt + (size_t)MD_OUT * Lt
                   + (size_t)T * 256 + (size_t)T * D + (size_t)2 * Lt * 256 + (1u << 20)) * sizeof(float);
     darena ar; cudaMalloc(&ar.base, cap); ar.cap = cap; ar.used = 0;
