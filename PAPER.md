@@ -175,6 +175,33 @@ context; per-chunk inpaint-continuation; emit chunks to a growing WAV or stdout;
 prompt changes from stdin). Verify continuous output + per-chunk latency first; live
 stdin prompting is a small addition; steering hooks slot in later.
 
+**Prototype results (implemented; `aria --stream`, small-music, i7 CPU).** The
+mechanism works end-to-end: resident model, in-memory sliding-window continuation, live
+prompt re-read per chunk. Two honest findings:
+- *Latency / the diffusion-continuation tax.* Chunk 1 (plain text→audio, 6 s) ran at
+  **RTF 1.4×**, but each continuation chunk emits 2 s while **regenerating the whole 6 s
+  window** → **RTF 0.4×** on CPU. Unlike an AR codec LM (which only generates the new
+  chunk's tokens, context as cheap attention), diffusion-continuation pays O(window) per
+  O(chunk) emitted — the context/chunk ratio is a hard overhead multiplier. Real-time
+  needs the **GPU** continuation path (≈10× projected; currently the local-additive
+  inpaint cond is **CPU-only** — the GPU DiT must gain it) or a smaller context.
+- *Quality — naive continuation is not coherent.* Per-second RMS fades and oscillates
+  (≈40 % of seconds near-silent): the short first window fades out, then continuation
+  from a near-silent context degrades. SA3 is trained for fixed clips, not streaming, so
+  out-of-the-box inpaint-continuation drifts. **Making it coherent is the research
+  contribution**, not a bug: candidate fixes = overlap-add/crossfade at chunk seams,
+  larger context, masking/scheduling tuned for continuation, or light fine-tuning for
+  streaming (cf. Magenta RT trains *for* chunk-AR). This is the crux a paper would study.
+
+  *Side effect:* the prototype exposed and fixed a latent heap-overflow in the existing
+  `--continue`/inpaint path (the SAME encoder's latent length is `ceil(T/2)·2`, i.e. `T+1`
+  for odd `T`, vs the DiT's `T`; the `256·T` buffer overflowed — ASan-confirmed, now sized
+  to the encoder output).
+
+**Net:** the *infrastructure* for streaming + live prompting is feasible and built; the GPU
+makes the latency real; the *coherence* of diffusion-continuation streaming is the open
+problem and the natural place for both an algorithmic contribution and (later) live steering.
+
 ---
 
 ## 6. Standard-engineering disclosure (for honest framing)
