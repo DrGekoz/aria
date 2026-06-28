@@ -102,8 +102,17 @@ RoPE** into one kernel (`k_extract_normrope`), plus rmsnorm+adaLN and gate+resid
 cut the **medium GPU DiT 1.45 → 1.28 s (−12 %)**, whole gen 2.22 → 2.07 s, parity
 unchanged. It's a bigger, lower-risk lever than flash (the softmax FA-2 would touch is
 only ~9 %). Remaining long-tail headroom: the per-attention fp16 conversions (have
-`k_extract_normrope` emit fp16 so `attn_dev` skips them) and CUDA Graphs for the ~14 k
-per-gen launches.
+`k_extract_normrope` emit fp16 so `attn_dev` skips them).
+
+**CUDA Graphs (landed).** The per-step DiT is now captured once and replayed (`--default-
+stream per-thread` + cuBLAS pinned to it + a fixed workspace; robust inline fallback;
+`ARIA_NO_GRAPH=1` to A/B). Output is byte-identical to the inline path (rel_rmse 0). The
+launch-overhead win is **modest at these sizes** — ~4 % warm-min on the medium DiT (s=24,
+0.96→0.92 s), within noise on small-music — because the small audio latent keeps the DiT
+compute-bound so the ~14 k launches mostly hide behind compute. The graph's clearer benefit
+is **steadier per-step latency** (less launch jitter); the win grows with steps and the
+medium differential path's kernel count. Also drops the redundant per-block residual copies
+(3 `cudaMemcpyD2D`/block) on the same path. See PAPER.md §4.
 
 ## Streaming / continuation on GPU (small-music, 8 steps, RTX 3070)
 

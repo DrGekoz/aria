@@ -109,6 +109,26 @@ uniquely suited (batch-1, fixed 8-step loop, tiny working set).
   *when* megakernels win for short-sequence diffusion (the crossover analysis is the
   contribution). The −12 % from fusing *three* glue kernels is the motivating evidence.
 
+**Implemented — CUDA Graphs (megakernel-lite), validated on the RTX 3070.** `nvcc
+--default-stream per-thread` makes every `<<<>>>` use the capturable per-thread stream; all
+three cuBLAS handles (DiT + 2 decoders) are pinned to it, with a fixed 4 MB workspace so
+cuBLAS can't lazily `cudaMalloc` mid-capture. The per-step DiT compute (`dit_step_compute`)
+is captured on step 0 and replayed via `cudaGraphLaunch` for the rest, with a robust fallback
+(run inline if capture/instantiate fails → correctness preserved). `free_request` drops the
+graph per request (the baked device pointers + (S,T) shape change); `ARIA_NO_GRAPH=1` toggles
+the path for A/B.
+- **Correct:** graph output is **byte-identical** to the inline path (rel_rmse 0.00000,
+  corr 1.00000); both differ from CPU only by the usual fp16 (2.1 % rel_rmse text→audio).
+- **Modest win at these sizes:** ~**4 %** warm-min on the **medium** DiT (s=24: 0.96→0.92 s);
+  within noise on small-music (s=8: 0.12 vs 0.13 s). The small audio latent keeps the DiT
+  GPU-compute-bound, so most of the ~14 k launches already hide behind compute — the graph
+  only trims the non-overlapped tail. The clearer secondary benefit is **lower per-step
+  latency variance** (fewer launch-jitter spikes → steadier streaming chunk times). The win
+  grows with launch density (more steps; the medium differential path's extra kernels).
+- **Takeaway (confirms §B1/§B3):** at short audio-diffusion sequences the bottleneck is
+  weight/compute, not launches. The graph is the right *low-risk* tier; the bigger lever is
+  the True-Megakernel GEMM fusion, which must beat cuBLAS to pay off (the crossover study).
+
 ---
 
 ## 5. Direction 2 — streaming / interactive generation (the one to build now)
