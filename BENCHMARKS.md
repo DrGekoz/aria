@@ -17,7 +17,7 @@ for both; SAT's `max_memory_allocated` (tensors only) is shown in parentheses.
 |---|---|---|---|
 | **GPU time** | **0.19 s** | 0.34 s | aria (1.8×) |
 | **GPU VRAM** (process) | **1548 MB** | 2770 MB (alloc 1161) | aria (−44 %) |
-| **CPU time** (20 threads) | 3.6 s | **2.8 s** | SAT (1.3×) |
+| **CPU time** (20 threads) | 3.5 s | **2.8 s** | SAT (1.25×) |
 | **CPU peak RAM** | **2089 MB** | 5421 MB | aria (−61 %) |
 
 ## medium (GPU 10 s, CPU 5 s, 8 steps)
