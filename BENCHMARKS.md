@@ -144,6 +144,26 @@ upload it, add after cross-attn via the existing `k_add`) makes `--continue`/`--
   This is the inpaint-envelope-drift limit of the post-hoc method, not the GPU — CPU and GPU
   decay identically. See PAPER.md (beat-sync loop / streaming-trained model).
 
+## Steering efficiency — aria vs sf-api (E12)
+
+Same residual steer (`delta = α·norm·unit`, layer 16) through the aria C runtime and the sf-api
+PyTorch reference (`tests/steer_compare.sh` + `aria_steer_compare.py`). Small-music, 4 s / 8
+steps, steered. aria wins on every axis:
+
+| metric | aria (C) | sf-api (PyTorch) | aria |
+|---|---|---|---|
+| **GPU** (RTX 3070) warm steered gen | **0.10 s** | 0.344 s | **3.4× faster** |
+| GPU peak VRAM | **1544 MB** | 2928 MB | 1.9× leaner |
+| host RSS | **2.8 GB** | 5.7 GB | 2.0× leaner |
+| cold start (load) | **~1.3 s** (whole run) | 9.2 s load / 13 s wall | ~7–10× faster |
+| **CPU** warm steered gen | **3.40 s** | 4.30 s | 1.2× faster |
+
+Steering is bit-exact parity-verified (`tests/steer_verify.sh`: scale-0 byte-identical,
+`steer(2α,d)≡steer(α,2d)`), CPU + GPU. aria's edge is the lean device-resident runtime (no
+framework dispatch/overhead, mmap load, fused glue) — biggest on **startup** (mmap vs PyTorch
+import+load) and **memory**, with warm GPU inference also ~3.4× ahead. The steer add itself is
+one `k_steer_add`/block; the CUDA graph is off while steering (step-window gating).
+
 ## Takeaways
 
 - **GPU memory:** aria's footprint is consistently smaller (−27 to −47 %) — a bump
