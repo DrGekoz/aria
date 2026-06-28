@@ -128,11 +128,39 @@ static void pack_a_panel(float *dst, const float *x, int m0, int M, int K) {
         else       { for (int k = 0; k < K; k++) dst[k * PMR + i] = 0.0f; }
     }
 }
-static void pack_b_panel(float *dst, const float *W, int n0, int N, int K) {
+static void pack_b_panel(float *dst, const float *W, int n0, int N, int pc, int kc, int K) {
     for (int j = 0; j < PNR; j++) {
         int n = n0 + j;
-        if (n < N) { const float *wr = W + (size_t)n * K; for (int k = 0; k < K; k++) dst[k * PNR + j] = wr[k]; }
-        else       { for (int k = 0; k < K; k++) dst[k * PNR + j] = 0.0f; }
+        if (n < N) { const float *wr = W + (size_t)n * K + pc; for (int k = 0; k < kc; k++) dst[k * PNR + j] = wr[k]; }
+        else       { for (int k = 0; k < kc; k++) dst[k * PNR + j] = 0.0f; }
+    }
+}
+/* K-blocked microkernel: accumulates a KC-slice into y (C in memory across K-blocks).
+ * full-N tile (n0+PNR<=N), edge-M guarded; bias added on the last K-block. */
+static inline void ukern_acc(float *y, int N, const float *Ap, const float *Bp, int kc,
+                             const float *bias, int m0, int n0, int M, int first, int last) {
+    __m256 c0[PMR], c1[PMR];
+    int em = m0 + PMR > M;
+    for (int i = 0; i < PMR; i++) {
+        if (first || (em && m0 + i >= M)) { c0[i] = _mm256_setzero_ps(); c1[i] = _mm256_setzero_ps(); }
+        else { float *yr = y + (size_t)(m0 + i) * N + n0; c0[i] = _mm256_loadu_ps(yr); c1[i] = _mm256_loadu_ps(yr + 8); }
+    }
+    for (int k = 0; k < kc; k++) {
+        __m256 b0 = _mm256_loadu_ps(Bp + (size_t)k * PNR), b1 = _mm256_loadu_ps(Bp + (size_t)k * PNR + 8);
+        const float *ap = Ap + (size_t)k * PMR;
+        for (int i = 0; i < PMR; i++) {
+            __m256 a = _mm256_set1_ps(ap[i]);
+            c0[i] = _mm256_fmadd_ps(a, b0, c0[i]);
+            c1[i] = _mm256_fmadd_ps(a, b1, c1[i]);
+        }
+    }
+    if (last && bias) {
+        __m256 vb0 = _mm256_loadu_ps(bias + n0), vb1 = _mm256_loadu_ps(bias + n0 + 8);
+        for (int i = 0; i < PMR; i++) { c0[i] = _mm256_add_ps(c0[i], vb0); c1[i] = _mm256_add_ps(c1[i], vb1); }
+    }
+    for (int i = 0; i < PMR && m0 + i < M; i++) {
+        float *yr = y + (size_t)(m0 + i) * N + n0;
+        _mm256_storeu_ps(yr, c0[i]); _mm256_storeu_ps(yr + 8, c1[i]);
     }
 }
 static inline void ukern_6x16(float *y, int N, const float *Ap, const float *Bp, int K,
@@ -183,24 +211,46 @@ static void aria_linear_packed(float *y, const float *x, const float *W, const f
     float *Ap = grow_tls(&Abuf, &Acap, (size_t)np_m * PMR * K);
     if (!Ap) return;
     for (int p = 0; p < np_m; p++) pack_a_panel(Ap + (size_t)p * PMR * K, x, p * PMR, M, K);
+    /* large K: block K so the NR-wide B-panel stays L1/L2-resident across the M loop
+     * (a single NR*K panel overflows L2 for K>=4096, halving throughput). C is then
+     * accumulated across K-blocks in memory. */
+    const int KC = 1024, kblk = (K > 2048), Nfull = (N / PNR) * PNR;
     #ifdef _OPENMP
     #pragma omp parallel
     #endif
     {
         static __thread float *Bbuf = NULL; static __thread size_t Bcap = 0;
-        float *Bp = grow_tls(&Bbuf, &Bcap, (size_t)PNR * K);
-        if (Bp) {
+        float *Bp = grow_tls(&Bbuf, &Bcap, (size_t)PNR * (kblk ? KC : K));
+        if (Bp && !kblk) {
             #ifdef _OPENMP
             #pragma omp for schedule(dynamic)
             #endif
             for (int pn = 0; pn < np_n; pn++) {
                 int n0 = pn * PNR;
-                pack_b_panel(Bp, W, n0, N, K);
+                pack_b_panel(Bp, W, n0, N, 0, K, K);
                 for (int pm = 0; pm < np_m; pm++)
                     ukern_6x16(y, N, Ap + (size_t)pm * PMR * K, Bp, K, b, pm * PMR, n0, M);
             }
+        } else if (Bp) {
+            #ifdef _OPENMP
+            #pragma omp for schedule(dynamic)
+            #endif
+            for (int pn = 0; pn < Nfull / PNR; pn++) {   /* full N-panels (large-K N is /16) */
+                int n0 = pn * PNR;
+                for (int pc = 0; pc < K; pc += KC) {
+                    int kc = pc + KC <= K ? KC : K - pc;
+                    pack_b_panel(Bp, W, n0, N, pc, kc, K);
+                    for (int pm = 0; pm < np_m; pm++)
+                        ukern_acc(y, N, Ap + (size_t)pm * PMR * K + pc * PMR, Bp, kc, b,
+                                  pm * PMR, n0, M, pc == 0, pc + kc >= K);
+                }
+            }
         }
     }
+    if (kblk && Nfull < N)   /* rare edge-N for K-blocked GEMMs (N not a multiple of 16) */
+        for (int m = 0; m < M; m++)
+            for (int n = Nfull; n < N; n++)
+                y[(size_t)m * N + n] = aria_dot(x + (size_t)m * K, W + (size_t)n * K, K) + (b ? b[n] : 0.0f);
 }
 #endif
 
