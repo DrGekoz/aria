@@ -185,13 +185,17 @@ prompt re-read per chunk. Two honest findings:
   O(chunk) emitted — the context/chunk ratio is a hard overhead multiplier. Real-time
   needs the **GPU** continuation path (≈10× projected; currently the local-additive
   inpaint cond is **CPU-only** — the GPU DiT must gain it) or a smaller context.
-- *Quality — naive continuation is not coherent.* Per-second RMS fades and oscillates
-  (≈40 % of seconds near-silent): the short first window fades out, then continuation
-  from a near-silent context degrades. SA3 is trained for fixed clips, not streaming, so
-  out-of-the-box inpaint-continuation drifts. **Making it coherent is the research
-  contribution**, not a bug: candidate fixes = overlap-add/crossfade at chunk seams,
-  larger context, masking/scheduling tuned for continuation, or light fine-tuning for
-  streaming (cf. Magenta RT trains *for* chunk-AR). This is the crux a paper would study.
+- *Quality — the precise failure mode (alienware, i9, two configs).* Per-second RMS
+  shows the **first window is coherent music** (cfg B's first **14 s** flat at 0.17–0.22)
+  — normal SA3 generation is fine. The **continuations fade**: each inpainted tail decays
+  to near-silent (cfg B repeats `…0.07, 0.027, 0.007, 0.001` every 4 s). The cause is
+  specific: SA3 inpaint-of-the-**tail** generates an *ending/outro* (fade-out), not a
+  sustained continuation — it has seen "the end of a clip" in that position at train time.
+  So the fix is targeted, not vague: **don't regenerate the trailing region.** Candidates
+  = overlap-add (generate a fresh window, crossfade its *strong middle* over the previous
+  tail rather than emitting the fading end), regenerate a *bounded interior* region with a
+  short look-ahead of silence-to-fill, or light fine-tuning for chunk-AR (cf. Magenta RT,
+  which trains *for* it). **This is the research contribution** a paper would deliver.
 
   *Side effect:* the prototype exposed and fixed a latent heap-overflow in the existing
   `--continue`/inpaint path (the SAME encoder's latent length is `ceil(T/2)·2`, i.e. `T+1`
