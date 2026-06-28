@@ -24,21 +24,24 @@ for both; SAT's `max_memory_allocated` (tensors only) is shown in parentheses.
 
 | metric | aria | stable-audio-tools | winner |
 |---|---|---|---|
-| **GPU time** | 0.63 s | **0.50 s** | SAT (1.3×) |
-| **GPU VRAM** (process) | **4316 MB** | 5452 MB (alloc 4561) | aria (−21 %) |
+| **GPU time** | 0.54 s | **0.50 s** | ≈ parity (1.08×) |
+| **GPU VRAM** (process) | **4314 MB** | 5452 MB (alloc 4561) | aria (−21 %) |
 | **CPU time** (5 s, 20 thr) | 17.0 s | **7.0 s** | SAT (2.4×) |
 | **CPU peak RAM** (5 s) | **7274 MB** | 18866 MB | aria (−61 %) |
 
 aria GPU breakdown — small: setup 0.02 + dit ~0.14 + decode 0.02; medium: setup
-**0.02** + dit **0.38** + decode 0.23. Two GPU optimizations landed (profile-guided):
+**0.02** + dit **0.38** + decode **0.13**. Three profile-guided GPU optimizations took
+medium **0.98 → 0.54 s** (≈ SAT parity) and small-music **0.29 → 0.19 s** (1.8× SAT):
 1. **on-device cross-K/V projection** (was a per-request host GEMM): medium setup
-   0.33 → **0.02 s**, total **0.98 → 0.67 s** (`ca_to_kv` device-resident, +340 MB).
-2. **fp16 tensor-core attention** for the DiT (the QK/AV ran as fp32 `sgemm` = 21 %
-   of GPU time, no tensor cores): **small-music 0.29 → 0.19 s** (now 1.8× SAT),
-   medium 0.67 → 0.63 s. (Small decoder stays fp32 — fp16 there cost accuracy for
-   ~0 gain.) The remaining medium gap is the **decoder's full-N² band attention**
-   (0.23 s); exploiting the ±17 window (O(N·35) not O(N²)) is the next lever and
-   would push medium past SAT.
+   0.33 → **0.02 s** (`ca_to_kv` device-resident, +340 MB).
+2. **fp16 tensor-core attention** for the DiT (the QK/AV ran as fp32 `sgemm` = 21 % of
+   GPU time, no tensor cores). Small decoder stays fp32 (fp16 there cost accuracy for
+   ~0 gain).
+3. **fused sliding-window decoder attention** — the medium decoder ran full N² (N=1836)
+   then masked to ±17; a warp-per-query kernel computes only the 35-key window
+   (O(N·35), exact), dropping decode **0.23 → 0.13 s** and a 324 MB N² score buffer.
+What's left (medium 0.54 vs 0.50) is fp32 elementwise + launch overhead — diminishing
+returns. aria's DiT/decoder GEMMs are already fp16 tensor cores.
 
 ## Takeaways
 
