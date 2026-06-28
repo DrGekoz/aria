@@ -891,6 +891,13 @@ extern "C" void aria_cuda_dit_step(aria_cuda_dit *h, float *v_CT, const float *x
     cudaMemcpyAsync(h->dx, x_CT, (size_t)C * T * sizeof(float), cudaMemcpyHostToDevice, st);
     cudaMemcpyAsync(h->dgcond, gcond, (size_t)6 * ed * sizeof(float), cudaMemcpyHostToDevice, st);
 
+    /* ARIA_NO_GRAPH=1 forces the inline path (A/B the graph without rebuilding) */
+    if (!h->graph_ready && !h->graph_failed) {
+        static int no_graph = -1;
+        if (no_graph < 0) { const char *e = getenv("ARIA_NO_GRAPH"); no_graph = e && e[0] && e[0] != '0'; }
+        if (no_graph) h->graph_failed = 1;
+    }
+
     /* one graph per (S,T) shape: capture on the first step, replay on the rest. The H2D
      * above refreshes h->dx/h->dgcond each step; the graph reads them at fixed pointers. */
     if (h->graph_ready) {
