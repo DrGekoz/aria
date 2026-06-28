@@ -41,13 +41,19 @@ static void usage(const char *prog) {
         "  %s -m <dir> --prompt-embed <prompt.atns> -d <seconds> -o out.wav\n"
         "  %s -m <dir> -p \"prompt\" -d <total> --continue <in.wav> -o out.wav   (extend a clip)\n"
         "  %s -m <dir> -p \"prompt\" --inpaint <in.wav> --from <s> --to <s> -o out.wav  (regenerate a region)\n"
+        "  %s -m <dir> --stream -p \"prompt\" [--hold] [--chunk 4] [--context 6] [--chunks N] -o out.wav\n"
+        "                                                              (continuous generation; CPU)\n"
+        "    live play + re-steer:  %s -m <dir> --stream -o - -p \"prompt\" \\\n"
+        "                             | play -t raw -r <sr> -e float -b 32 -c <ch> -\n"
+        "                           (type a new prompt + Enter at any time to re-steer)\n"
         "    --device auto (default) runs the DiT device-resident on the GPU when one fits, else CPU\n"
         "    --precision fp32|q8|q4 selects the CPU DiT weight precision (q8/q4 force the CPU path)\n"
         "    --load-quant <file.aria> loads a pre-quantized DiT from aria-quantize (CPU)\n"
         "    --rng xoshiro (default) | torch  (torch = PyTorch-matched noise for reproduction)\n"
-        "    --continue/--inpaint run on the CPU DiT; the init WAV must be at the model sample rate\n"
+        "    --continue/--inpaint/--stream run on the CPU DiT; init WAV must match the model sample rate\n"
+        "    --stream --hold holds a steady drum loop (HPSS) while the melody evolves; -o - = stdout\n"
         "  Progress is drawn per denoise step when stderr is a terminal.\n",
-        prog, prog, prog, prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 static int cmd_wav_roundtrip(const char *in, const char *out) {
@@ -158,6 +164,22 @@ static void stream_add_tiled(float *dst, int64_t n, int ch, int64_t pos,
     }
 }
 
+/* write the settled frames [*emitted, upto) of `outp` (the harmonic timeline) as raw
+ * interleaved float32 to stdout, mixing in the held drum loop on the way out. Lets
+ * `aria --stream -o - | play -t raw -r <sr> -e float -b 32 -c <ch> -` play live. */
+static void stream_flush(const aria_audio *outp, const float *held, int64_t held_len,
+                         int ch, int64_t *emitted, int64_t upto) {
+    if (upto <= *emitted) return;
+    int64_t n = upto - *emitted;
+    float *tmp = malloc((size_t)n * ch * sizeof(float));
+    memcpy(tmp, outp->data + (*emitted) * ch, (size_t)n * ch * sizeof(float));
+    stream_add_tiled(tmp, n, ch, *emitted, held, held_len);   /* no-op if held_len==0 */
+    fwrite(tmp, sizeof(float), (size_t)n * ch, stdout);
+    fflush(stdout);
+    free(tmp);
+    *emitted = upto;
+}
+
 /* Streaming / interactive generation: keep the model resident and emit `emit_s`-second
  * segments by sliding-window continuation over a `context_s` rolling context. The naive
  * tail-inpaint fades (SA3 makes the regenerated end an outro), so each continuation
@@ -174,6 +196,8 @@ static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float con
     int interactive = isatty(fileno(stdin));
     char promptbuf[1024];
     float *held = NULL; int64_t held_len = 0; const char *held_prompt = NULL;  /* --hold drum loop */
+    int to_stdout = (strcmp(out_path, "-") == 0);   /* -o - : stream raw f32 to stdout for a player */
+    int64_t emitted = 0;
 
     int64_t cap = (int64_t)((context_s + emit_s) * sr) + (int64_t)n_chunks * ((int64_t)(emit_s * sr) + maxlag) + sr;
     aria_audio *outp = aria_audio_alloc(sr, ch, cap);
@@ -239,12 +263,22 @@ static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float con
         context = stream_slice(outp, written - ctx_fr, ctx_fr);   /* just-emitted tail */
         if (hold) stream_add_tiled(context->data, ctx_fr, ch, written - ctx_fr, held, held_len);
         aria_audio_free(win);
+
+        /* live playback: emit settled audio, holding back the crossfade region (xf_fr)
+         * so the next chunk can still crossfade into it. */
+        if (to_stdout) stream_flush(outp, held, held_len, ch, &emitted, written - xf_fr);
     }
-    if (hold) stream_add_tiled(outp->data, written, ch, 0, held, held_len);   /* mix the steady drums in */
+    int wrc = 0;
+    if (to_stdout) {
+        stream_flush(outp, held, held_len, ch, &emitted, written);   /* final tail */
+        fprintf(stderr, "[stream] streamed %.1fs to stdout\n", written / (double)sr);
+    } else {
+        if (hold) stream_add_tiled(outp->data, written, ch, 0, held, held_len);   /* mix the steady drums in */
+        outp->num_frames = written;
+        wrc = aria_wav_write(out_path, outp, 32);
+        fprintf(stderr, "[stream] wrote %s (%.1fs total)\n", out_path, written / (double)sr);
+    }
     free(held);
-    outp->num_frames = written;
-    int wrc = aria_wav_write(out_path, outp, 32);
-    fprintf(stderr, "[stream] wrote %s (%.1fs total)\n", out_path, written / (double)sr);
     aria_audio_free(outp); aria_audio_free(context);
     return wrc;
 }
@@ -348,9 +382,9 @@ int main(int argc, char **argv) {
     aria_ctx *ctx = aria_load(model_dir);
     if (!ctx) { fprintf(stderr, "load error: %s\n", aria_last_error()); return 1; }
 
-    printf("model: %s | type=%s | sr=%d ch=%d | tensors=%d\n",
-           model_dir, aria_model_type(ctx), aria_sample_rate(ctx),
-           aria_audio_channels(ctx), aria_num_tensors(ctx));
+    fprintf(stderr, "model: %s | type=%s | sr=%d ch=%d | tensors=%d\n",
+            model_dir, aria_model_type(ctx), aria_sample_rate(ctx),
+            aria_audio_channels(ctx), aria_num_tensors(ctx));
 
     int rc = 0;
     if (do_stream) {

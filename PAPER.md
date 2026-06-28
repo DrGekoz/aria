@@ -224,6 +224,16 @@ fix is fine-tuning SA3 for chunk-AR, cf. Magenta RT). Live *taste* steering then
 in as a per-chunk vector add. The proper end state is a streaming-trained model; the
 above is how far a careful post-hoc pipeline gets on a fixed-clip diffusion model.
 
+**Follow-up (later) — beat-synchronous seamless drum loop.** The `--hold` loop is
+currently a fixed-length repeat (= chunk-0 emit length) tiled with naive modulo, so it
+sounds loopy and ticks at the loop point. Polish: (1) estimate tempo from the
+**onset-envelope autocorrelation** of the held *percussive* stem (half-wave-rectified
+spectral-flux → autocorrelate → first strong lag = beat period); (2) trim the held loop
+to an **integer number of bars**; (3) **crossfade the loop seam** (blend the loop tail
+into its head) so the modulo wrap is clickless; (4) optionally re-extract the loop every
+few bars so a slowly-evolving groove is allowed while staying phase-locked. Same
+machinery (the existing HPSS + a ~50-line autocorrelation tempo estimator), no new deps.
+
 ---
 
 ## 6. Standard-engineering disclosure (for honest framing)
