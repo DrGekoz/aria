@@ -140,6 +140,9 @@ void aria_sa3_dec_medium_forward(const aria_sa3_dec_medium *m, float *audio, con
     for (int t = 0; t < T; t++)
         for (int c = 0; c < 256; c++) ztc[(size_t)t * 256 + c] = latent[(size_t)c * T + t] * m->running_std;
     float *proj = malloc((size_t)T * D * sizeof(float));
+    /* gcc -O3 emits a spurious -Wmaybe-uninitialized for `ztc` here: it cannot
+     * prove the double loop above writes every element. ztc is fully initialized
+     * (t in [0,T), c in [0,256)). Left as-is rather than papering over it. */
     aria_linear(proj, ztc, m->proj_w, m->proj_b, T, 256, D);
     free(ztc);
 
