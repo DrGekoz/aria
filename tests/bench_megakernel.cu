@@ -74,17 +74,17 @@ __global__ void gemm_wmma(float *__restrict__ y, const __half *__restrict__ x,
 }
 
 static double bench(const char *tag, void (*fn)(void*), void *ctx, int M, int K, int N){
-    cudaEvent_t s,e; CK(cudaEventCreate(&s)); CK(cudaEventCreate(&e));
+    cudaEvent_t evs,eve; CK(cudaEventCreate(&evs)); CK(cudaEventCreate(&eve));
     for(int w=0;w<10;w++) fn(ctx);             /* warmup */
     CK(cudaDeviceSynchronize());
-    int reps=200; CK(cudaEventRecord(s));
+    int reps=200; CK(cudaEventRecord(evs));
     for(int r=0;r<reps;r++) fn(ctx);
-    CK(cudaEventRecord(e)); CK(cudaEventSynchronize(e));
-    float ms=0; CK(cudaEventElapsedTime(&ms,s,e)); double dt=ms/1e3/reps;
+    CK(cudaEventRecord(eve)); CK(cudaEventSynchronize(eve));
+    float ms=0; CK(cudaEventElapsedTime(&ms,evs,eve)); double dt=ms/1e3/reps;
     double gf = 2.0*M*N*K/dt/1e9;
     double gb = ((double)M*K + (double)N*K)*2.0/dt/1e9;   /* fp16 inputs read (lower bound) */
     printf("  %-10s %7.1f GFLOP/s  %6.0f us  (weights+act read ~%.0f GB/s)\n", tag, gf, dt*1e6, gb);
-    cudaEventDestroy(s); cudaEventDestroy(e);
+    cudaEventDestroy(evs); cudaEventDestroy(eve);
     return gf;
 }
 
