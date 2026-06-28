@@ -14,6 +14,13 @@
 #include <omp.h>
 #endif
 
+/* persistent per-thread scratch: grown as needed, never per-call malloc'd. Safe
+ * whether the caller is single-threaded (DiT) or each OpenMP worker owns its copy. */
+static float *grow_tls(float **buf, size_t *cap, size_t need) {
+    if (need > *cap) { free(*buf); *buf = (float *)malloc(need * sizeof(float)); *cap = *buf ? need : 0; }
+    return *buf;
+}
+
 #ifdef ARIA_BLAS
 #include <cblas.h>   /* optional: route GEMM to OpenBLAS/Accelerate/MKL */
 #endif
@@ -195,14 +202,6 @@ static inline void ukern_6x16(float *y, int N, const float *Ap, const float *Bp,
             }
         }
     }
-}
-/* persistent per-thread pack buffers: grown as needed, never per-call malloc'd
- * (the DiT issues ~1150 GEMMs/gen; per-call mmap of the A-pack was ~6% of the DiT).
- * Thread-local is safe whether aria_linear is the caller-thread's (DiT) or called
- * concurrently from a decoder OpenMP region -- each thread owns its buffers. */
-static float *grow_tls(float **buf, size_t *cap, size_t need) {
-    if (need > *cap) { free(*buf); *buf = (float *)malloc(need * sizeof(float)); *cap = *buf ? need : 0; }
-    return *buf;
 }
 static void aria_linear_packed(float *y, const float *x, const float *W, const float *b,
                                int M, int K, int N) {
@@ -487,20 +486,27 @@ void aria_rope_apply(float *x, const float *cos_t, const float *sin_t,
 void aria_attention(float *out, const float *q, const float *k, const float *v,
                     int H, int Nq, int Nk, int D, const float *mask, float *scratch) {
     float scale = 1.0f / sqrtf((float)D);
-    float *scores = scratch ? scratch : malloc((size_t)Nq * Nk * sizeof(float));
-    if (!scores) return;
+    (void)scratch;   /* parallel-over-heads: each head uses its own thread-local scores */
+    /* Parallelize over HEADS (H >= cores), so each per-head QK/softmax/AV runs serially
+     * on one thread -- the inner aria_linear/aria_matmul/softmax OpenMP regions become
+     * nested and run single-threaded. Avoids spawning an 8-thread region per tiny K=D
+     * head GEMM, and parallelizes the softmax across heads. */
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic)
+    #endif
     for (int h = 0; h < H; h++) {
+        static __thread float *sc = NULL; static __thread size_t sccap = 0;
+        float *scores = grow_tls(&sc, &sccap, (size_t)Nq * Nk);
+        if (!scores) continue;
         const float *qh = q + (size_t)h * Nq * D;
         const float *kh = k + (size_t)h * Nk * D;
         const float *vh = v + (size_t)h * Nk * D;
         float *oh = out + (size_t)h * Nq * D;
-        /* scores[i,j] = qh[i] . kh[j]  (aria_linear computes x @ W^T) */
-        aria_linear(scores, qh, kh, NULL, Nq, D, Nk);
+        aria_linear(scores, qh, kh, NULL, Nq, D, Nk);   /* scores[i,j] = qh[i] . kh[j] */
         for (size_t i = 0; i < (size_t)Nq * Nk; i++) scores[i] *= scale;
         aria_softmax_inplace(scores, Nq, Nk, mask);
         aria_matmul(oh, scores, vh, Nq, Nk, D);
     }
-    if (!scratch) free(scores);
 }
 
 void aria_conv1d(float *out, const float *in, const float *w, const float *bias,
