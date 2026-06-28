@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>        /* sqrt for the phase-aligned crossfade */
 #include <unistd.h>      /* isatty */
 #include <sys/select.h>  /* non-blocking stdin for live --stream prompting */
 
@@ -83,22 +84,44 @@ static aria_audio *stream_slice(const aria_audio *a, int64_t start, int64_t len)
     return o;
 }
 
-/* append `src` onto `outp` at *written, linearly crossfading its first `xf` frames over
- * the last `xf` already-written frames (smooths the seam between segments). */
-static void stream_append_xfade(aria_audio *outp, int64_t *written, int64_t cap,
-                                const aria_audio *src, int64_t xf) {
-    int ch = outp->channels; int64_t n = src->num_frames;
-    if (xf > *written) xf = *written;
-    if (xf > n) xf = n;
-    for (int64_t i = 0; i < xf; i++) {
-        float w = (float)(i + 1) / (float)(xf + 1);
-        int64_t o = (*written - xf + i) * ch;
-        for (int c = 0; c < ch; c++)
-            outp->data[o + c] = (1.0f - w) * outp->data[o + c] + w * src->data[i * ch + c];
+/* Append `src` onto `outp`, phase-aligning it to the existing tail before crossfading.
+ * The continuation is only beat-plausible, not sample-accurate, so a plain crossfade
+ * "flams" misaligned drum hits; here we cross-correlate `src`'s start against the output's
+ * last ~60 ms over a 0..`maxlag` search, shift `src` by the best lag, then linearly
+ * crossfade `xf` frames. maxlag=0 -> plain crossfade (used for the first segment). */
+static void stream_append_aligned(aria_audio *outp, int64_t *written, int64_t cap,
+                                  const aria_audio *src, int64_t xf, int64_t maxlag) {
+    int ch = outp->channels; int64_t n = src->num_frames, lag = 0;
+    const int64_t clen = 1764, cstride = 2;   /* ~40 ms window, every 2nd sample */
+    int64_t W = *written;
+    if (W >= clen && maxlag > 0 && n >= clen + maxlag) {
+        const float *ref = outp->data + (W - clen) * ch;   /* mono via channel sum */
+        double best = -1e30;
+        for (int64_t L = 0; L <= maxlag; L++) {
+            const float *cand = src->data + L * ch;
+            double dot = 0, ea = 0, eb = 0;
+            for (int64_t i = 0; i < clen; i += cstride) {
+                float a = ref[i * ch] + (ch > 1 ? ref[i * ch + 1] : 0.0f);
+                float b = cand[i * ch] + (ch > 1 ? cand[i * ch + 1] : 0.0f);
+                dot += (double)a * b; ea += (double)a * a; eb += (double)b * b;
+            }
+            double corr = dot / (sqrt(ea * eb) + 1e-9);
+            if (corr > best) { best = corr; lag = L; }
+        }
     }
-    int64_t rest = n - xf;
+    int64_t xfe = xf;
+    if (xfe > *written) xfe = *written;
+    if (lag + xfe > n) xfe = n - lag;
+    if (xfe < 0) xfe = 0;
+    for (int64_t i = 0; i < xfe; i++) {
+        float w = (float)(i + 1) / (float)(xfe + 1);
+        int64_t o = (*written - xfe + i) * ch;
+        for (int c = 0; c < ch; c++)
+            outp->data[o + c] = (1.0f - w) * outp->data[o + c] + w * src->data[(lag + i) * ch + c];
+    }
+    int64_t rest = n - lag - xfe;
     if (*written + rest > cap) rest = cap - *written;
-    if (rest > 0) memcpy(outp->data + (*written) * ch, src->data + xf * ch, (size_t)rest * ch * sizeof(float));
+    if (rest > 0) memcpy(outp->data + (*written) * ch, src->data + (lag + xfe) * ch, (size_t)rest * ch * sizeof(float));
     *written += rest;
 }
 
@@ -114,10 +137,11 @@ static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float con
     int sr = aria_sample_rate(ctx), ch = aria_audio_channels(ctx);
     const float skip_s = 1.5f, tail_s = 3.0f, xfade_s = 0.25f;   /* seam / fade / crossfade */
     int64_t ctx_fr = (int64_t)(context_s * sr), xf_fr = (int64_t)(xfade_s * sr);
+    int64_t maxlag = (int64_t)(0.18f * sr);   /* phase-align search range (~< one beat) */
     int interactive = isatty(fileno(stdin));
     char promptbuf[1024];
 
-    int64_t cap = (int64_t)((context_s + emit_s) * sr) + (int64_t)n_chunks * (int64_t)(emit_s * sr) + sr;
+    int64_t cap = (int64_t)((context_s + emit_s) * sr) + (int64_t)n_chunks * ((int64_t)(emit_s * sr) + maxlag) + sr;
     aria_audio *outp = aria_audio_alloc(sr, ch, cap);
     if (!outp) { fprintf(stderr, "stream: OOM\n"); return 1; }
     int64_t written = 0;
@@ -151,9 +175,11 @@ static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float con
         if (rc != 0 || !win) { fprintf(stderr, "stream: generate failed: %s\n", aria_last_error()); aria_audio_free(outp); aria_audio_free(context); return 1; }
         double dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
 
-        if (emit_start + emit_len > win->num_frames) emit_len = win->num_frames - emit_start;
-        aria_audio *emit = stream_slice(win, emit_start, emit_len);
-        stream_append_xfade(outp, &written, cap, emit, (i == 0) ? 0 : xf_fr);
+        /* extra `maxlag` frames so the phase-align search has room to shift into */
+        int64_t slice_len = emit_len + (i == 0 ? 0 : maxlag);
+        if (emit_start + slice_len > win->num_frames) slice_len = win->num_frames - emit_start;
+        aria_audio *emit = stream_slice(win, emit_start, slice_len);
+        stream_append_aligned(outp, &written, cap, emit, (i == 0) ? 0 : xf_fr, (i == 0) ? 0 : maxlag);
         aria_audio_free(emit);
 
         double es = emit_len / (double)sr;
