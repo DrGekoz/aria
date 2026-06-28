@@ -65,5 +65,23 @@ the PyTorch stack still edges ahead:** CPU throughput (MKL, ~1.3×) and a sliver
 medium GPU. aria's niche is exactly the plan's: run these models on budget/low-VRAM
 hardware without the framework — now also at competitive speed.
 
+## Memory notes (no-speed-loss optimizations)
+
+The dominant consumer is the **weights** — fp16 on the GPU, F32 (mmap, zero-copy) on
+the host — which is the speed-optimal storage, so it's off-limits without a precision
+(speed) cost. The clean wins are in waste:
+
+- **Host RAM on the GPU path: 7.26 GB → 0.44 GB steady-state** (medium). The host F32
+  weights stay mmap-resident even after the fp16 copies are on the GPU; once uploaded
+  they aren't read on the hot path, so `madvise(MADV_DONTNEED)` reclaims them (file-
+  backed → re-faults cheaply if a small per-request MLP is touched). Biggest win.
+- **Decoder arena −~90–100 MB** (GPU peak + CPU): the attention scratch and the FFN
+  scratch were held in one arena scope though never live together — freeing the former
+  before the latter drops the per-block peak from `16·N·D + 3·N·INNER` to `~17·N·D`.
+- **Tried and reverted:** Q8 on `ca_to_kv` (cross-K/V) saved 170 MB VRAM but the cross
+  projection is fidelity-sensitive (GPU-vs-CPU 0.7 % → 2.6 %) — not worth it.
+- **Hard floor:** pure-CPU RAM is weights-bound (medium ~5.4 GB F32, needed for the
+  fp32 compute that gives exact parity); reducing it means fp16 compute = slower.
+
 _Reproduce: aria `./aria -m <model> --uncond -d 10 -s 8 --device cuda|cpu --bench 3`
 (`ARIA_PROFILE=1` for the breakdown); SAT via `scripts/bench_sat.py` (uncond DiT+decode)._
