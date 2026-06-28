@@ -15,8 +15,8 @@ for both; SAT's `max_memory_allocated` (tensors only) is shown in parentheses.
 
 | metric | aria | stable-audio-tools | winner |
 |---|---|---|---|
-| **GPU time** | **0.29 s** | 0.34 s | aria (1.2×) |
-| **GPU VRAM** (process) | **1464 MB** | 2770 MB (alloc 1161) | aria (−47 %) |
+| **GPU time** | **0.19 s** | 0.34 s | aria (1.8×) |
+| **GPU VRAM** (process) | **1548 MB** | 2770 MB (alloc 1161) | aria (−44 %) |
 | **CPU time** (20 threads) | 6.7 s | **2.8 s** | SAT (2.4×) |
 | **CPU peak RAM** | **2089 MB** | 5421 MB | aria (−61 %) |
 
@@ -24,17 +24,21 @@ for both; SAT's `max_memory_allocated` (tensors only) is shown in parentheses.
 
 | metric | aria | stable-audio-tools | winner |
 |---|---|---|---|
-| **GPU time** | 0.67 s | **0.50 s** | SAT (1.3×) |
-| **GPU VRAM** (process) | **4306 MB** | 5452 MB (alloc 4561) | aria (−21 %) |
+| **GPU time** | 0.63 s | **0.50 s** | SAT (1.3×) |
+| **GPU VRAM** (process) | **4316 MB** | 5452 MB (alloc 4561) | aria (−21 %) |
 | **CPU time** (5 s, 20 thr) | 17.0 s | **7.0 s** | SAT (2.4×) |
 | **CPU peak RAM** (5 s) | **7274 MB** | 18866 MB | aria (−61 %) |
 
-aria GPU breakdown — small: setup 0.10 + dit 0.16 + decode 0.03; medium (after the
-on-device cross-K/V projection): setup **0.02** + dit 0.42 + decode 0.23. The medium
-GPU time dropped **0.98 → 0.67 s** by moving the per-request differential cross-K/V
-projection from the host onto the device (`ca_to_kv` device-resident, +340 MB VRAM).
-The remaining 0.67 vs 0.50 gap is fp32 activations (a per-GEMM fp16 conversion +
-2× elementwise traffic vs SAT's fp16-throughout) — addressed next.
+aria GPU breakdown — small: setup 0.02 + dit ~0.14 + decode 0.02; medium: setup
+**0.02** + dit **0.38** + decode 0.23. Two GPU optimizations landed (profile-guided):
+1. **on-device cross-K/V projection** (was a per-request host GEMM): medium setup
+   0.33 → **0.02 s**, total **0.98 → 0.67 s** (`ca_to_kv` device-resident, +340 MB).
+2. **fp16 tensor-core attention** for the DiT (the QK/AV ran as fp32 `sgemm` = 21 %
+   of GPU time, no tensor cores): **small-music 0.29 → 0.19 s** (now 1.8× SAT),
+   medium 0.67 → 0.63 s. (Small decoder stays fp32 — fp16 there cost accuracy for
+   ~0 gain.) The remaining medium gap is the **decoder's full-N² band attention**
+   (0.23 s); exploiting the ±17 window (O(N·35) not O(N²)) is the next lever and
+   would push medium past SAT.
 
 ## Takeaways
 
