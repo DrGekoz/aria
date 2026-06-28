@@ -17,7 +17,7 @@ for both; SAT's `max_memory_allocated` (tensors only) is shown in parentheses.
 |---|---|---|---|
 | **GPU time** | **0.19 s** | 0.34 s | aria (1.8×) |
 | **GPU VRAM** (process) | **1548 MB** | 2770 MB (alloc 1161) | aria (−44 %) |
-| **CPU time** (20 threads) | 6.7 s | **2.8 s** | SAT (2.4×) |
+| **CPU time** (20 threads) | 4.0 s | **2.8 s** | SAT (1.4×) |
 | **CPU peak RAM** | **2089 MB** | 5421 MB | aria (−61 %) |
 
 ## medium (GPU 10 s, CPU 5 s, 8 steps)
@@ -26,8 +26,8 @@ for both; SAT's `max_memory_allocated` (tensors only) is shown in parentheses.
 |---|---|---|---|
 | **GPU time** | 0.54 s | **0.50 s** | ≈ parity (1.08×) |
 | **GPU VRAM** (process) | **4314 MB** | 5452 MB (alloc 4561) | aria (−21 %) |
-| **CPU time** (5 s, 20 thr) | 17.0 s | **7.0 s** | SAT (2.4×) |
-| **CPU peak RAM** (5 s) | **7274 MB** | 18866 MB | aria (−61 %) |
+| **CPU time** (5 s, 20 thr) | 8.6 s | **7.0 s** | SAT (1.2×) |
+| **CPU peak RAM** (5 s) | **7204 MB** | 18866 MB | aria (−62 %) |
 
 aria GPU breakdown — small: setup 0.02 + dit ~0.14 + decode 0.02; medium: setup
 **0.02** + dit **0.38** + decode **0.13**. Three profile-guided GPU optimizations took
@@ -49,18 +49,20 @@ returns. aria's DiT/decoder GEMMs are already fp16 tensor cores.
   allocator with no caching-allocator slack vs PyTorch's reserved pool + CUDA context.
   Notably, **medium fp16 OOMs stable-audio-tools' naïve `.to(cuda).half()` load** on
   the 8 GB card (transient fp32 copy); aria runs medium GPU in 3.97 GB with headroom.
-- **GPU speed:** aria wins small-music (1.2×); SAT wins medium (2×) — aria's host-side
-  per-request cross-K/V projection for the differential DiT dominates medium's wall time.
-- **CPU speed:** PyTorch/MKL is **~2.4× faster** on CPU (its GEMM outruns aria's
-  hand-rolled AVX2 microkernel at 175–280 GFLOP/s). aria's CPU value is footprint, not
-  speed.
+- **GPU speed:** aria **wins small-music (1.8×)** and reaches **≈ parity on medium**
+  (0.54 vs 0.50 s) after the three GPU optimizations above.
+- **CPU speed:** within **1.2–1.4× of PyTorch/MKL** after the **packed outer-product
+  GEMM** (was 2.4× behind). aria's hand-rolled AVX2 GEMM now runs ~490–540 GFLOP/s on
+  the big DiT shapes (was 175–280); the residual gap is MKL's edge on the GEMM + aria's
+  fp32 non-GEMM kernels. small-music CPU 6.7 → 4.0 s, medium 17 → 8.6 s.
 - **CPU/host memory:** aria uses **~60 % less RAM** everywhere (mmap'd weights, no
-  framework). Medium on CPU: aria 7.3 GB vs PyTorch 18.9 GB.
+  framework). Medium on CPU: aria 7.2 GB vs PyTorch 18.9 GB.
 
 **Where aria wins:** dependency-free single binary, the smallest memory footprint
-(GPU and CPU), and competitive-to-faster small-music GPU. **Where the PyTorch stack
-wins:** raw CPU throughput (MKL) and medium GPU latency. aria's niche is exactly the
-plan's: run these models on budget/low-VRAM hardware without the framework.
+(GPU and CPU, −44 to −62 %), faster small-music GPU, and ≈-parity medium GPU. **Where
+the PyTorch stack still edges ahead:** CPU throughput (MKL, ~1.3×) and a sliver on
+medium GPU. aria's niche is exactly the plan's: run these models on budget/low-VRAM
+hardware without the framework — now also at competitive speed.
 
 _Reproduce: aria `./aria -m <model> --uncond -d 10 -s 8 --device cuda|cpu --bench 3`
 (`ARIA_PROFILE=1` for the breakdown); SAT via `scripts/bench_sat.py` (uncond DiT+decode)._
