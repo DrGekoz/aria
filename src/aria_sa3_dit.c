@@ -110,7 +110,8 @@ static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
     const float *scale_self = mod, *shift_self = mod + dim, *gate_self = mod + 2 * dim;
     const float *scale_ff = mod + 3 * dim, *shift_ff = mod + 4 * dim, *gate_ff = mod + 5 * dim;
 
-    float *residual = aria_arena_floats(ar, (size_t)S * dim);
+    /* no residual buffer: every sub-layer normalizes into h (not x), so x is preserved
+     * across the sub-layer and the residual add is in-place (x += o, see below). */
     float *h        = aria_arena_floats(ar, (size_t)S * dim);
     float *o        = aria_arena_floats(ar, (size_t)S * dim);
     float *merged   = aria_arena_floats(ar, (size_t)S * dim);
@@ -126,7 +127,6 @@ static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
     float *scores   = aria_arena_floats(ar, (size_t)S * (S > Sc ? S : Sc));
 
     /* ---------- self-attention ---------- */
-    memcpy(residual, x, (size_t)S * dim * sizeof(float));
     aria_rmsnorm(h, x, w->pre_norm, S, dim, eps_norm);
     adaln_modulate(h, scale_self, shift_self, S, dim);
     {
@@ -159,10 +159,9 @@ static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
     if (bq) aria_linear_qw(o, merged, &bq->sa_to_out, NULL, S);
     else    aria_linear(o, merged, w->sa_to_out, NULL, S, dim, dim);
     gate_sigmoid(o, gate_self, S, dim);
-    for (size_t i = 0; i < (size_t)S * dim; i++) x[i] = residual[i] + o[i];
+    for (size_t i = 0; i < (size_t)S * dim; i++) x[i] += o[i];   /* in-place residual add */
 
     /* ---------- cross-attention (cached K/V, no rope, no gate) ---------- */
-    memcpy(residual, x, (size_t)S * dim * sizeof(float));
     aria_rmsnorm(h, x, w->cross_norm, S, dim, eps_norm);
     {
         int nq = diff ? 2 : 1;
@@ -182,14 +181,13 @@ static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
     }
     if (bq) aria_linear_qw(o, merged, &bq->ca_to_out, NULL, S);
     else    aria_linear(o, merged, w->ca_to_out, NULL, S, dim, dim);
-    for (size_t i = 0; i < (size_t)S * dim; i++) x[i] = residual[i] + o[i];
+    for (size_t i = 0; i < (size_t)S * dim; i++) x[i] += o[i];   /* in-place residual add */
 
     /* ---------- local-additive (inpaint) cond: x += left-padded local_emb ---------- */
     if (local_emb)
         for (size_t i = 0; i < (size_t)S * dim; i++) x[i] += local_emb[i];
 
     /* ---------- feed-forward (GLU) ---------- */
-    memcpy(residual, x, (size_t)S * dim * sizeof(float));
     aria_rmsnorm(h, x, w->ff_norm, S, dim, eps_norm);
     adaln_modulate(h, scale_ff, shift_ff, S, dim);
     {
@@ -198,7 +196,7 @@ static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
         else    aria_ff_glu(o, h, S, dim, inner, dim, w->ff_in_w, w->ff_in_b, w->ff_out_w, w->ff_out_b, ffs);
     }
     gate_sigmoid(o, gate_ff, S, dim);
-    for (size_t i = 0; i < (size_t)S * dim; i++) x[i] = residual[i] + o[i];
+    for (size_t i = 0; i < (size_t)S * dim; i++) x[i] += o[i];   /* in-place residual add */
 
     aria_arena_restore(ar, mark);
 }

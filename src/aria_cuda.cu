@@ -634,7 +634,8 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     k_add<<<nblocks((size_t)6 * dim), THREADS>>>(mod, w->ssg, h->dgcond, 6 * dim);
     float *scale_self = mod, *shift_self = mod + dim, *gate_self = mod + 2 * dim;
     float *scale_ff = mod + 3 * dim, *shift_ff = mod + 4 * dim, *gate_ff = mod + 5 * dim;
-    float *residual = da_alloc(ar, (size_t)S * dim), *hh = da_alloc(ar, (size_t)S * dim);
+    float *hh = da_alloc(ar, (size_t)S * dim);   /* no residual buffer: seq is preserved across each
+                                                  * sub-layer (norm writes to hh), so the add is in-place */
     float *o = da_alloc(ar, (size_t)S * dim), *merged = da_alloc(ar, (size_t)S * dim);
     float *qh = da_alloc(ar, (size_t)H * S * hd), *kh = da_alloc(ar, (size_t)H * S * hd);
     float *vh = da_alloc(ar, (size_t)H * S * hd), *ao = da_alloc(ar, (size_t)H * S * hd);
@@ -645,7 +646,6 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     if (diff) { qdh = da_alloc(ar, nHSd); kdh = da_alloc(ar, nHSd); aod = da_alloc(ar, nHSd); }
 
     /* self-attention (differential medium: out = attn(q,k,v) - attn(qd,kd,v)) */
-    cudaMemcpy(residual, seq, (size_t)S * dim * sizeof(float), cudaMemcpyDeviceToDevice);
     k_rmsnorm_adaln<<<S, RED_TH>>>(hh, seq, w->pre_norm, scale_self, shift_self, S, dim, 1e-5f);
     int nq = diff ? 5 : 3;
     float *qkv = da_alloc(ar, (size_t)S * nq * dim);
@@ -662,10 +662,9 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     }
     k_merge_heads<<<nHShd, THREADS>>>(merged, ao, S, H, hd);
     gemm_dqw(h, o, merged, &w->sa_to_out, NULL, S);
-    k_gate_add<<<nSd, THREADS>>>(seq, residual, o, gate_self, S, dim);
+    k_gate_add<<<nSd, THREADS>>>(seq, seq, o, gate_self, S, dim);
 
     /* cross-attention (cached K/V; differential: q_diff + cross_kd) */
-    cudaMemcpy(residual, seq, (size_t)S * dim * sizeof(float), cudaMemcpyDeviceToDevice);
     k_rmsnorm<<<S, RED_TH>>>(hh, seq, w->cross_norm, S, dim, 1e-5f, 0);
     int ncq = diff ? 2 : 1;
     float *q = da_alloc(ar, (size_t)S * ncq * dim);
@@ -679,19 +678,18 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     }
     k_merge_heads<<<nHShd, THREADS>>>(merged, ao, S, H, hd);
     gemm_dqw(h, o, merged, &w->ca_to_out, NULL, S);
-    k_add<<<nSd, THREADS>>>(seq, residual, o, (size_t)S * dim);
+    k_add<<<nSd, THREADS>>>(seq, seq, o, (size_t)S * dim);
 
     /* local-additive (inpaint) cond: seq += per-block left-padded local_emb (memory rows 0) */
     if (h->has_local) k_add<<<nSd, THREADS>>>(seq, seq, h->local_emb[blk], (size_t)S * dim);
 
     /* feed-forward (GLU) */
-    cudaMemcpy(residual, seq, (size_t)S * dim * sizeof(float), cudaMemcpyDeviceToDevice);
     k_rmsnorm_adaln<<<S, RED_TH>>>(hh, seq, w->ff_norm, scale_ff, shift_ff, S, dim, 1e-5f);
     float *proj = da_alloc(ar, (size_t)S * 2 * inner), *gated = da_alloc(ar, (size_t)S * inner);
     gemm_dqw(h, proj, hh, &w->ff_in_w, w->ff_in_b, S);
     k_ff_silugate<<<nblocks((size_t)S * inner), THREADS>>>(gated, proj, S, inner);
     gemm_dqw(h, o, gated, &w->ff_out_w, w->ff_out_b, S);
-    k_gate_add<<<nSd, THREADS>>>(seq, residual, o, gate_ff, S, dim);
+    k_gate_add<<<nSd, THREADS>>>(seq, seq, o, gate_ff, S, dim);
 
     da_restore(ar, mark);
 }
