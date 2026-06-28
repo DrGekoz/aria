@@ -441,6 +441,13 @@ __global__ void k_gate_add(float *out, const float *residual, const float *o,
     int i = (int)(idx % dim);
     out[idx] = residual[idx] + o[idx] * (1.0f / (1.0f + expf(-(1.0f - gate[i]))));
 }
+/* E12 residual steering: seq[t,c] += scale * dir[c] for c < ddim, broadcast over all S tokens. */
+__global__ void k_steer_add(float *seq, const float *dir, float scale, int S, int dim, int ddim) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)S * dim) return;
+    int c = (int)(idx % dim);
+    if (c < ddim) seq[idx] += scale * dir[c];
+}
 __global__ void k_extract_heads(float *dst, const float *src, int S, int H, int hd, int stride, int off) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;   /* (h*S+s)*hd+d */
     if (idx >= (size_t)H * S * hd) return;
@@ -585,6 +592,8 @@ struct aria_cuda_dit {
     float *dx, *dv, *dgcond, *rope_cos, *rope_sin;
     float **cross_k, **cross_v, **cross_kd;
     float **local_emb; int has_local;   /* [depth] each [S, ed]; inpaint local-additive cond */
+    const aria_steer_set *steer;        /* E12: host steer set (borrowed); residual dirs uploaded below */
+    float **d_steer_dir; int cur_step;  /* [steer->n] device copies of each steer's [dim] direction */
     darena arena;
     /* CUDA Graph: capture the per-step compute once (fixed device pointers + deterministic
      * arena offsets), replay per denoise step -> kills per-step kernel-launch overhead. */
@@ -695,6 +704,17 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     gemm_dqw(h, o, gated, &w->ff_out_w, w->ff_out_b, S);
     k_gate_add<<<nSd, THREADS>>>(seq, seq, o, gate_ff, S, dim);
 
+    /* E12 residual steering: seq += scale*dir at the block output, gated by layer + step-window
+     * (matches dit_block_core / sf-api AdditiveInjector). The graph is disabled when steering, so
+     * dit_block_dev re-runs each step and h->cur_step is current. */
+    if (h->steer) for (int s = 0; s < h->steer->n; s++) {
+        const aria_steer *st = &h->steer->items[s];
+        if (st->site != ARIA_STEER_RESIDUAL || st->layer != blk || st->scale == 0.0f) continue;
+        if (h->cur_step < st->step_lo || h->cur_step > st->step_hi) continue;
+        if (!h->d_steer_dir[s]) continue;
+        k_steer_add<<<nSd, THREADS>>>(seq, h->d_steer_dir[s], st->scale, S, dim, st->dim);
+    }
+
     da_restore(ar, mark);
 }
 
@@ -783,8 +803,10 @@ static void free_request(aria_cuda_dit *h) {
     if (h->cross_v) for (int b = 0; b < h->depth; b++) cudaFree(h->cross_v[b]);
     if (h->cross_kd) for (int b = 0; b < h->depth; b++) cudaFree(h->cross_kd[b]);
     if (h->local_emb) for (int b = 0; b < h->depth; b++) cudaFree(h->local_emb[b]);
-    free(h->cross_k); free(h->cross_v); free(h->cross_kd); free(h->local_emb);
+    if (h->d_steer_dir && h->steer) for (int s = 0; s < h->steer->n; s++) cudaFree(h->d_steer_dir[s]);
+    free(h->cross_k); free(h->cross_v); free(h->cross_kd); free(h->local_emb); free(h->d_steer_dir);
     h->cross_k = h->cross_v = h->cross_kd = NULL; h->local_emb = NULL; h->has_local = 0;
+    h->d_steer_dir = NULL; h->steer = NULL; h->cur_step = 0;
     h->dx = h->dv = h->dgcond = NULL;
     h->rope_cos = h->rope_sin = NULL; h->arena.base = NULL; h->have_req = 0;
 }
@@ -853,8 +875,22 @@ extern "C" void aria_cuda_dit_set_request(aria_cuda_dit *h, const aria_sa3_dit_r
         for (int b = 0; b < h->depth; b++)
             h->local_emb[b] = upload_f32(rv->local_emb[b], (size_t)S * ed);
     }
+    /* E12 steering: keep the host steer set, upload each residual direction to the device, and
+     * disable the graph (step-window gating makes the per-step compute non-identical). */
+    h->steer = (rv->steer && rv->steer->n > 0) ? rv->steer : NULL;
+    if (h->steer) {
+        h->d_steer_dir = (float **)calloc(h->steer->n, sizeof(float *));
+        for (int s = 0; s < h->steer->n; s++) {
+            const aria_steer *st = &h->steer->items[s];
+            if (st->site == ARIA_STEER_RESIDUAL && st->dir && st->dim > 0)
+                h->d_steer_dir[s] = upload_f32(st->dir, (size_t)st->dim);
+        }
+        h->graph_failed = 1;
+    }
     h->have_req = 1;
 }
+
+extern "C" void aria_cuda_dit_set_step(aria_cuda_dit *h, int step) { h->cur_step = step; }
 
 /* the per-step compute (reads h->dx + h->dgcond, writes h->dv). Pure async work on the
  * per-thread stream + a deterministic arena, so it can be CUDA-graph captured and replayed.

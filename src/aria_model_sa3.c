@@ -149,8 +149,9 @@ static void sa3_denoise(void *c, const float *x, float t, float *v, int n) {
     (void)n;
     sa3_dctx *d = c;
 #ifdef ARIA_CUDA
-    if (d->cdit) {   /* steering is CPU-only in this slice (no device hook yet) */
+    if (d->cdit) {
         aria_sa3_dit_global_cond(d->dit, d->global_seconds, t, d->gcond);
+        aria_cuda_dit_set_step(d->cdit, d->step);   /* E12: residual-steer step-window gating */
         aria_cuda_dit_step(d->cdit, v, x, d->gcond);
         d->step++;
         return;
@@ -314,8 +315,7 @@ static int sa3_generate(aria_ctx *ctx, void *state,
      * but keeps the medium decoder on the CPU (the device decoder is small-music).
      * continue/inpaint also runs on the GPU: the taae encoder builds the context latent
      * on the CPU, then the per-block local-additive cond is uploaded and added on device. */
-    int has_steer = p->steer && p->steer->n > 0;   /* E12: residual hook is CPU-only this slice */
-    int want_gpu = !loaded_quant && !has_steer &&
+    int want_gpu = !loaded_quant &&
                    ((p->device == ARIA_DEVICE_CUDA && aria_cuda_available()) ||
                     (p->device == ARIA_DEVICE_AUTO && aria_cuda_recommended()));
     if (want_gpu && !st->cdit) {   /* upload + quantize weights once; reused across gens */

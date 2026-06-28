@@ -657,6 +657,7 @@ void aria_sa3_dit_req_get_view(const aria_sa3_dit_req *r, aria_sa3_dit_req_view 
     v->cross_k = r->cross_k; v->cross_v = r->cross_v; v->cross_kd = r->cross_kd;
     v->cross_ed = r->cross_ed;
     v->local_emb = r->local_emb; v->has_local = r->has_local;
+    v->steer = r->steer;
 }
 
 void aria_sa3_dit_global_cond(const aria_sa3_dit *m, const float *global_seconds, float t, float *gcond) {

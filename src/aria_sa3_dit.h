@@ -135,6 +135,7 @@ typedef struct {
     const float *cross_ed;                    /* [n_cond, ed] to_cond_embed(prompt); set when cross_k deferred */
     float *const *local_emb;                  /* [depth] each [S, ed]; inpaint local-additive cond (mem rows 0), or NULL */
     int has_local;                            /* continue/inpaint: add local_emb per block */
+    const aria_steer_set *steer;              /* E12: residual-site steering (directions uploaded per block), or NULL */
 } aria_sa3_dit_req_view;
 void aria_sa3_dit_req_get_view(const aria_sa3_dit_req *r, aria_sa3_dit_req_view *v);
 
@@ -151,6 +152,8 @@ typedef struct aria_cuda_dit aria_cuda_dit;
 aria_cuda_dit *aria_cuda_dit_create(const aria_sa3_dit_view *v, aria_dtype precision);
 void aria_cuda_dit_free(aria_cuda_dit *h);
 void aria_cuda_dit_set_request(aria_cuda_dit *h, const aria_sa3_dit_req_view *rv);
+/* E12: set the current denoise step for residual-steering step-window gating (call per step). */
+void aria_cuda_dit_set_step(aria_cuda_dit *h, int step);
 /* v_CT = velocity(x_CT, gcond); x_CT/v_CT are [io_channels, T], gcond is [6*ed]. */
 void aria_cuda_dit_step(aria_cuda_dit *h, float *v_CT, const float *x_CT, const float *gcond);
 
