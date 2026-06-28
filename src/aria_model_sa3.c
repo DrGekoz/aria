@@ -44,6 +44,7 @@ typedef struct {
     /* text path (lazily loaded on first text prompt) */
     aria_t5enc *enc;
     aria_tokenizer *tok;
+    char *cached_prompt; float *cached_emb;   /* skip re-encoding an unchanged prompt (streaming) */
     /* persistent device DiT + decoder (weights uploaded once, reused across generations) */
     aria_cuda_dit *cdit;
     aria_cuda_dec *cdec;
@@ -131,6 +132,7 @@ static void sa3_unload(void *state) {
     if (st->enc_taae) aria_sa3_enc_free(st->enc_taae);
     if (st->enc) aria_t5enc_free(st->enc);
     if (st->tok) aria_tokenizer_free(st->tok);
+    free(st->cached_prompt); free(st->cached_emb);
     free(st);   /* sec_w/sec_b are borrowed from the mmap */
     return;
 }
@@ -225,11 +227,18 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     float *prompt = calloc((size_t)N_PROMPT * ED, sizeof(float));
     aria_parity_tensor pe; int have_pe = 0;
     if (p->prompt && p->prompt[0]) {
-        if (sa3_ensure_text(ctx, st) != 0) { free(prompt); return -1; }
-        int ids[256];
-        int n_real = aria_tokenizer_encode(st->tok, p->prompt, ids, N_PROMPT);
-        if (n_real < 0) { aria_set_error("generate: tokenization failed"); free(prompt); return -1; }
-        aria_t5enc_encode(st->enc, prompt, ids, N_PROMPT, n_real);
+        if (st->cached_emb && st->cached_prompt && strcmp(p->prompt, st->cached_prompt) == 0) {
+            memcpy(prompt, st->cached_emb, (size_t)N_PROMPT * ED * sizeof(float));   /* reuse */
+        } else {
+            if (sa3_ensure_text(ctx, st) != 0) { free(prompt); return -1; }
+            int ids[256];
+            int n_real = aria_tokenizer_encode(st->tok, p->prompt, ids, N_PROMPT);
+            if (n_real < 0) { aria_set_error("generate: tokenization failed"); free(prompt); return -1; }
+            aria_t5enc_encode(st->enc, prompt, ids, N_PROMPT, n_real);
+            free(st->cached_prompt); st->cached_prompt = strdup(p->prompt);
+            if (!st->cached_emb) st->cached_emb = malloc((size_t)N_PROMPT * ED * sizeof(float));
+            if (st->cached_emb) memcpy(st->cached_emb, prompt, (size_t)N_PROMPT * ED * sizeof(float));
+        }
     } else if (p->prompt_embed_path) {
         if (aria_parity_load(p->prompt_embed_path, &pe) != 0 || pe.ndim != 2 ||
             pe.shape[0] != N_PROMPT || pe.shape[1] != ED) {

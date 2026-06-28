@@ -19,6 +19,7 @@
 #include <string.h>
 #include <time.h>
 #include <math.h>        /* sqrt for the phase-aligned crossfade */
+#include <pthread.h>     /* writer thread so generation overlaps playback (--stream -o -) */
 #include <unistd.h>      /* isatty */
 #include <sys/select.h>  /* non-blocking stdin for live --stream prompting */
 
@@ -164,19 +165,54 @@ static void stream_add_tiled(float *dst, int64_t n, int ch, int64_t pos,
     }
 }
 
-/* write the settled frames [*emitted, upto) of `outp` (the harmonic timeline) as raw
- * interleaved float32 to stdout, mixing in the held drum loop on the way out. Lets
+/* Bounded FIFO of settled audio chunks. The generator (main thread) pushes; a writer
+ * thread drains to stdout. This decouples generation from the blocking pipe write so the
+ * next chunk is generated WHILE the player drains the current one, instead of alternating
+ * gen/play. The bound throttles a faster-than-realtime producer (e.g. a future GPU path). */
+typedef struct schunk { float *data; int64_t n; struct schunk *next; } schunk;
+typedef struct {
+    schunk *head, *tail; int count, done;
+    pthread_mutex_t m; pthread_cond_t ne, nf;
+} squeue;
+#define SQ_MAX 32   /* up to ~32 settled regions buffered ahead */
+
+static void sq_push(squeue *q, float *data, int64_t n) {
+    schunk *c = malloc(sizeof *c); c->data = data; c->n = n; c->next = NULL;
+    pthread_mutex_lock(&q->m);
+    while (q->count >= SQ_MAX) pthread_cond_wait(&q->nf, &q->m);
+    if (q->tail) q->tail->next = c; else q->head = c;
+    q->tail = c; q->count++;
+    pthread_cond_signal(&q->ne);
+    pthread_mutex_unlock(&q->m);
+}
+static void *sq_writer(void *arg) {   /* drains the queue to stdout at the player's pace */
+    squeue *q = arg;
+    for (;;) {
+        pthread_mutex_lock(&q->m);
+        while (!q->head && !q->done) pthread_cond_wait(&q->ne, &q->m);
+        schunk *c = q->head;
+        if (!c) { pthread_mutex_unlock(&q->m); break; }   /* done and drained */
+        q->head = c->next; if (!q->head) q->tail = NULL; q->count--;
+        pthread_cond_signal(&q->nf);
+        pthread_mutex_unlock(&q->m);
+        fwrite(c->data, sizeof(float), (size_t)c->n, stdout);
+        fflush(stdout);
+        free(c->data); free(c);
+    }
+    return NULL;
+}
+
+/* settle the frames [*emitted, upto) of `outp` (the harmonic timeline) as raw interleaved
+ * float32, mixing in the held drum loop, and hand them to the writer thread. Lets
  * `aria --stream -o - | play -t raw -r <sr> -e float -b 32 -c <ch> -` play live. */
 static void stream_flush(const aria_audio *outp, const float *held, int64_t held_len,
-                         int ch, int64_t *emitted, int64_t upto) {
+                         int ch, int64_t *emitted, int64_t upto, squeue *q) {
     if (upto <= *emitted) return;
     int64_t n = upto - *emitted;
     float *tmp = malloc((size_t)n * ch * sizeof(float));
     memcpy(tmp, outp->data + (*emitted) * ch, (size_t)n * ch * sizeof(float));
     stream_add_tiled(tmp, n, ch, *emitted, held, held_len);   /* no-op if held_len==0 */
-    fwrite(tmp, sizeof(float), (size_t)n * ch, stdout);
-    fflush(stdout);
-    free(tmp);
+    sq_push(q, tmp, n * ch);   /* the writer thread frees tmp after writing it out */
     *emitted = upto;
 }
 
@@ -198,6 +234,9 @@ static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float con
     float *held = NULL; int64_t held_len = 0; const char *held_prompt = NULL;  /* --hold drum loop */
     int to_stdout = (strcmp(out_path, "-") == 0);   /* -o - : stream raw f32 to stdout for a player */
     int64_t emitted = 0;
+    squeue q = { .m = PTHREAD_MUTEX_INITIALIZER, .ne = PTHREAD_COND_INITIALIZER, .nf = PTHREAD_COND_INITIALIZER };
+    pthread_t writer; int have_writer = 0;
+    if (to_stdout) { pthread_create(&writer, NULL, sq_writer, &q); have_writer = 1; }
 
     int64_t cap = (int64_t)((context_s + emit_s) * sr) + (int64_t)n_chunks * ((int64_t)(emit_s * sr) + maxlag) + sr;
     aria_audio *outp = aria_audio_alloc(sr, ch, cap);
@@ -230,7 +269,11 @@ static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float con
         struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
         int rc = aria_generate(ctx, p, &win);
         clock_gettime(CLOCK_MONOTONIC, &t1);
-        if (rc != 0 || !win) { fprintf(stderr, "stream: generate failed: %s\n", aria_last_error()); aria_audio_free(outp); aria_audio_free(context); return 1; }
+        if (rc != 0 || !win) {
+            fprintf(stderr, "stream: generate failed: %s\n", aria_last_error());
+            if (have_writer) { pthread_mutex_lock(&q.m); q.done = 1; pthread_cond_signal(&q.ne); pthread_mutex_unlock(&q.m); pthread_join(writer, NULL); }
+            aria_audio_free(outp); aria_audio_free(context); return 1;
+        }
         double dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
 
         /* extra `maxlag` frames so the phase-align search has room to shift into */
@@ -264,13 +307,16 @@ static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float con
         if (hold) stream_add_tiled(context->data, ctx_fr, ch, written - ctx_fr, held, held_len);
         aria_audio_free(win);
 
-        /* live playback: emit settled audio, holding back the crossfade region (xf_fr)
-         * so the next chunk can still crossfade into it. */
-        if (to_stdout) stream_flush(outp, held, held_len, ch, &emitted, written - xf_fr);
+        /* live playback: hand settled audio to the writer thread, holding back the crossfade
+         * region (xf_fr) so the next chunk can still crossfade into it. The next chunk
+         * generates while the writer feeds the player. */
+        if (to_stdout) stream_flush(outp, held, held_len, ch, &emitted, written - xf_fr, &q);
     }
     int wrc = 0;
     if (to_stdout) {
-        stream_flush(outp, held, held_len, ch, &emitted, written);   /* final tail */
+        stream_flush(outp, held, held_len, ch, &emitted, written, &q);   /* final tail */
+        pthread_mutex_lock(&q.m); q.done = 1; pthread_cond_signal(&q.ne); pthread_mutex_unlock(&q.m);
+        pthread_join(writer, NULL); have_writer = 0;
         fprintf(stderr, "[stream] streamed %.1fs to stdout\n", written / (double)sr);
     } else {
         if (hold) stream_add_tiled(outp->data, written, ch, 0, held, held_len);   /* mix the steady drums in */
