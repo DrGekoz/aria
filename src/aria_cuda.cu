@@ -477,68 +477,6 @@ static void attn_dev(cublasHandle_t cb, darena *ar, float *out, const float *q, 
     da_restore(ar, mark);
 }
 
-/* Flash attention (non-causal), head_dim D<=64. Replaces attn_dev for the DiT
- * SELF-attention, where Nq=Nk=S grows with audio length: instead of materializing
- * the H*S*S fp32 score matrix in HBM (~48 MB/call at 60 s) and streaming it through
- * scale+softmax+fp16 passes, this fuses QK->online-softmax->AV with the S*S scores
- * never leaving registers/shared. One block per (query-tile, head); one thread per
- * query row; K/V tiled into shared. fp32 compute (matches the CPU path exactly, so
- * parity vs CPU is tighter than the fp16 cuBLAS path it replaces). */
-#define FA_BQ 64
-#define FA_BK 32
-__global__ void k_flash_attn(float *__restrict__ out, const float *__restrict__ q,
-                             const float *__restrict__ k, const float *__restrict__ v,
-                             int Nq, int Nk, int D, float scale) {
-    int h  = blockIdx.y;
-    int qi = blockIdx.x * FA_BQ + threadIdx.x;
-    const float *qb = q + (size_t)h * Nq * D;
-    const float *kb = k + (size_t)h * Nk * D;
-    const float *vb = v + (size_t)h * Nk * D;
-    float qreg[64], acc[64];
-    bool active = qi < Nq;
-    if (active) {
-        const float *qp = qb + (size_t)qi * D;
-        for (int d = 0; d < D; d++) { qreg[d] = qp[d]; acc[d] = 0.0f; }
-    }
-    float m = -INFINITY, l = 0.0f;
-    __shared__ float Ks[FA_BK][64];
-    __shared__ float Vs[FA_BK][64];
-    for (int k0 = 0; k0 < Nk; k0 += FA_BK) {
-        int bk = (Nk - k0 < FA_BK) ? (Nk - k0) : FA_BK;
-        for (int idx = threadIdx.x; idx < bk * D; idx += FA_BQ) {
-            int r = idx / D, c = idx % D;
-            Ks[r][c] = kb[(size_t)(k0 + r) * D + c];
-            Vs[r][c] = vb[(size_t)(k0 + r) * D + c];
-        }
-        __syncthreads();
-        if (active) {
-            for (int j = 0; j < bk; j++) {
-                float s = 0.0f;
-                for (int d = 0; d < D; d++) s += qreg[d] * Ks[j][d];
-                s *= scale;
-                float mnew = fmaxf(m, s);
-                float corr = __expf(m - mnew);
-                float p    = __expf(s - mnew);
-                l = l * corr + p;
-                for (int d = 0; d < D; d++) acc[d] = acc[d] * corr + p * Vs[j][d];
-                m = mnew;
-            }
-        }
-        __syncthreads();
-    }
-    if (active) {
-        float inv = l > 0.0f ? 1.0f / l : 0.0f;
-        float *op = out + ((size_t)h * Nq + qi) * D;
-        for (int d = 0; d < D; d++) op[d] = acc[d] * inv;
-    }
-}
-static void flash_attn_dev(float *out, const float *q, const float *k, const float *v,
-                           int H, int Nq, int Nk, int D) {
-    float scale = 1.0f / sqrtf((float)D);
-    dim3 grid((Nq + FA_BQ - 1) / FA_BQ, H);
-    k_flash_attn<<<grid, FA_BQ>>>(out, q, k, v, Nq, Nk, D, scale);
-}
-
 /* ---- device quantized weight (E9.4): packed in VRAM, dequant-on-use to fp16 ----
  * Q8/Q4 weights stay packed on the device (medium fits low VRAM); each GEMM
  * dequantizes its weight into a reused fp16 scratch, then runs the tensor-core
@@ -680,7 +618,7 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     k_rmsnorm<<<H * S, RED_TH>>>(kh, kh, w->sa_k_norm, H * S, hd, 1e-6f, 0);
     k_rope<<<nblocks((size_t)H * S), THREADS>>>(qh, h->rope_cos, h->rope_sin, H, S, hd, rot);
     k_rope<<<nblocks((size_t)H * S), THREADS>>>(kh, h->rope_cos, h->rope_sin, H, S, hd, rot);
-    flash_attn_dev(ao, qh, kh, vh, H, S, S, hd);
+    attn_dev(h->cublas, ar, ao, qh, kh, vh, H, S, S, hd, scores, 1);
     if (diff) {
         k_extract_heads<<<nHShd, THREADS>>>(qdh, qkv, S, H, hd, nq * dim, 3 * dim);
         k_extract_heads<<<nHShd, THREADS>>>(kdh, qkv, S, H, hd, nq * dim, 4 * dim);
@@ -688,7 +626,7 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
         k_rmsnorm<<<H * S, RED_TH>>>(kdh, kdh, w->sa_k_norm, H * S, hd, 1e-6f, 0);
         k_rope<<<nblocks((size_t)H * S), THREADS>>>(qdh, h->rope_cos, h->rope_sin, H, S, hd, rot);
         k_rope<<<nblocks((size_t)H * S), THREADS>>>(kdh, h->rope_cos, h->rope_sin, H, S, hd, rot);
-        flash_attn_dev(aod, qdh, kdh, vh, H, S, S, hd);
+        attn_dev(h->cublas, ar, aod, qdh, kdh, vh, H, S, S, hd, scores, 1);
         k_sub<<<nblocks(nHSd), THREADS>>>(ao, aod, nHSd);
     }
     k_merge_heads<<<nHShd, THREADS>>>(merged, ao, S, H, hd);
