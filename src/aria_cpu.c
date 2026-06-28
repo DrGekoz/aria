@@ -112,6 +112,88 @@ static inline void aria_microkernel(float *y, const float *x, const float *W, co
             y[(size_t)(m + i) * N + (n + j)] = s;
         }
 }
+
+/* ---- packed outer-product GEMM (BLIS-style) ----
+ * A (x) is packed once into k-major MR-panels; each NR-panel of B (W) is packed on
+ * the fly. The microkernel does pure outer products (broadcast A, fma into NR-wide B
+ * accumulators) -- no horizontal sums, fully contiguous reads -- beating the
+ * dot-product kernel's ~235 GFLOP/s ceiling on the SA3 shapes. Each output is a
+ * sequential-k accumulation (within parity tolerance of the reference). */
+#define PMR 6
+#define PNR 16
+static void pack_a_panel(float *dst, const float *x, int m0, int M, int K) {
+    for (int i = 0; i < PMR; i++) {
+        int m = m0 + i;
+        if (m < M) { const float *xr = x + (size_t)m * K; for (int k = 0; k < K; k++) dst[k * PMR + i] = xr[k]; }
+        else       { for (int k = 0; k < K; k++) dst[k * PMR + i] = 0.0f; }
+    }
+}
+static void pack_b_panel(float *dst, const float *W, int n0, int N, int K) {
+    for (int j = 0; j < PNR; j++) {
+        int n = n0 + j;
+        if (n < N) { const float *wr = W + (size_t)n * K; for (int k = 0; k < K; k++) dst[k * PNR + j] = wr[k]; }
+        else       { for (int k = 0; k < K; k++) dst[k * PNR + j] = 0.0f; }
+    }
+}
+static inline void ukern_6x16(float *y, int N, const float *Ap, const float *Bp, int K,
+                              const float *bias, int m0, int n0, int M) {
+    __m256 c0[PMR], c1[PMR];
+    for (int i = 0; i < PMR; i++) { c0[i] = _mm256_setzero_ps(); c1[i] = _mm256_setzero_ps(); }
+    for (int k = 0; k < K; k++) {
+        __m256 b0 = _mm256_loadu_ps(Bp + (size_t)k * PNR), b1 = _mm256_loadu_ps(Bp + (size_t)k * PNR + 8);
+        const float *ap = Ap + (size_t)k * PMR;
+        for (int i = 0; i < PMR; i++) {
+            __m256 a = _mm256_set1_ps(ap[i]);
+            c0[i] = _mm256_fmadd_ps(a, b0, c0[i]);
+            c1[i] = _mm256_fmadd_ps(a, b1, c1[i]);
+        }
+    }
+    if (n0 + PNR <= N && m0 + PMR <= M) {                 /* full tile: vector store */
+        __m256 vb0 = bias ? _mm256_loadu_ps(bias + n0) : _mm256_setzero_ps();
+        __m256 vb1 = bias ? _mm256_loadu_ps(bias + n0 + 8) : _mm256_setzero_ps();
+        for (int i = 0; i < PMR; i++) {
+            float *yr = y + (size_t)(m0 + i) * N + n0;
+            _mm256_storeu_ps(yr,     _mm256_add_ps(c0[i], vb0));
+            _mm256_storeu_ps(yr + 8, _mm256_add_ps(c1[i], vb1));
+        }
+    } else {                                              /* edge tile: scalar store */
+        float t0[8], t1[8];
+        for (int i = 0; i < PMR && m0 + i < M; i++) {
+            _mm256_storeu_ps(t0, c0[i]); _mm256_storeu_ps(t1, c1[i]);
+            float *yr = y + (size_t)(m0 + i) * N;
+            for (int j = 0; j < PNR; j++) {
+                int n = n0 + j;
+                if (n < N) yr[n] = (j < 8 ? t0[j] : t1[j - 8]) + (bias ? bias[n] : 0.0f);
+            }
+        }
+    }
+}
+static void aria_linear_packed(float *y, const float *x, const float *W, const float *b,
+                               int M, int K, int N) {
+    int np_m = (M + PMR - 1) / PMR, np_n = (N + PNR - 1) / PNR;
+    float *Apack = (float *)malloc((size_t)np_m * PMR * K * sizeof(float));
+    if (!Apack) return;
+    for (int p = 0; p < np_m; p++) pack_a_panel(Apack + (size_t)p * PMR * K, x, p * PMR, M, K);
+    #ifdef _OPENMP
+    #pragma omp parallel
+    #endif
+    {
+        float *Bp = (float *)malloc((size_t)PNR * K * sizeof(float));
+        if (Bp) {
+            #ifdef _OPENMP
+            #pragma omp for schedule(dynamic)
+            #endif
+            for (int pn = 0; pn < np_n; pn++) {
+                int n0 = pn * PNR;
+                pack_b_panel(Bp, W, n0, N, K);
+                for (int pm = 0; pm < np_m; pm++)
+                    ukern_6x16(y, N, Apack + (size_t)pm * PMR * K, Bp, K, b, pm * PMR, n0, M);
+            }
+            free(Bp);
+        }
+    }
+    free(Apack);
+}
 #endif
 
 void aria_linear(float *y, const float *x, const float *W, const float *b,
@@ -131,6 +213,12 @@ void aria_linear(float *y, const float *x, const float *W, const float *b,
     }
 #endif
 #ifdef ARIA_AVX2
+    /* packed outer-product GEMM amortizes A-packing over the M*N*K work; for tiny
+     * GEMMs the packing/alloc overhead isn't worth it, so use the dot-product kernel. */
+    if ((size_t)M * N * K >= (1u << 18)) {
+        aria_linear_packed(y, x, W, b, M, K, N);
+        return;
+    }
     {
         const int MR = ARIA_MR, NR = ARIA_NR;
         int Mfull = M - (M % MR);
