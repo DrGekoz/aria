@@ -88,7 +88,7 @@ int main(void) {
     aria_inpaint_local_cond(local_TC, initlat_c, mask_lat, T);
 
     /* 3. pingpong from pure noise with the live local cond + injected per-step noise */
-    aria_sa3_dit_req *req = aria_sa3_dit_req_begin(dit, T, cross.data, 257, glob.data);
+    aria_sa3_dit_req *req = aria_sa3_dit_req_begin(dit, T, cross.data, 257, glob.data, 0);
     aria_sa3_dit_req_set_local(req, local_TC, T, 257);
     dctx ctx = { dit, req };
     float *x = malloc((size_t)n * sizeof(float));

@@ -11,7 +11,7 @@
 
 static void step(const aria_sa3_dit *dit, int T, const float *cross, const float *glob,
                  const float *x, float *v, const float *local_raw, int local_dim) {
-    aria_sa3_dit_req *r = aria_sa3_dit_req_begin(dit, T, cross, 257, glob);
+    aria_sa3_dit_req *r = aria_sa3_dit_req_begin(dit, T, cross, 257, glob, 0);
     if (local_raw) aria_sa3_dit_req_set_local(r, local_raw, T, local_dim);
     aria_sa3_dit_step(dit, r, v, x, 0.5f);
     aria_sa3_dit_req_end(r);

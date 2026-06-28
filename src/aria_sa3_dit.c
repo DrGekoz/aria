@@ -481,7 +481,7 @@ struct aria_sa3_dit_req {
 
 aria_sa3_dit_req *aria_sa3_dit_req_begin(const aria_sa3_dit *m, int T,
                                          const float *cross_768, int n_cond,
-                                         const float *global_768) {
+                                         const float *global_768, int gpu) {
     int ed = m->ed, H = m->num_heads, hd = m->head_dim, dim = ed;
     int S = m->n_mem + T, rot = m->rot_dim, depth = m->depth;
     aria_sa3_dit_req *r = calloc(1, sizeof(*r));
@@ -499,8 +499,11 @@ aria_sa3_dit_req *aria_sa3_dit_req_begin(const aria_sa3_dit *m, int T,
     aria_rope_freqs(r->rope_cos, r->rope_sin, S, rot, 10000.0f);
 
     /* per-block cross-attention K/V: projected once from cross_ed (constant across
-     * all steps), head-split, with k_norm folded into the cached K. */
-    int diff = m->differential, nkv = diff ? 3 : 2;   /* to_kv = [k,v] or [k,k_diff,v] */
+     * all steps), head-split, with k_norm folded into the cached K. The GPU backend
+     * defers this (gpu=1): it projects on-device from cross_ed instead. */
+    int diff = m->differential;
+    if (!gpu) {
+    int nkv = diff ? 3 : 2;   /* to_kv = [k,v] or [k,k_diff,v] */
     r->cross_k = calloc((size_t)depth, sizeof(float *));
     r->cross_v = calloc((size_t)depth, sizeof(float *));
     r->cross_kd = diff ? calloc((size_t)depth, sizeof(float *)) : NULL;
@@ -522,6 +525,7 @@ aria_sa3_dit_req *aria_sa3_dit_req_begin(const aria_sa3_dit *m, int T,
         aria_rmsnorm(r->cross_k[b], r->cross_k[b], w->ca_k_norm, H * n_cond, hd, 1e-6f);
     }
     free(kv);
+    }  /* !gpu */
 
     /* arena holds the persistent residual stream + step input scratch + one block's
      * worth of temporaries (blocks save/restore, so only one is live at a time). */
@@ -617,7 +621,7 @@ void aria_sa3_dit_req_end(aria_sa3_dit_req *r) {
 
 void aria_sa3_dit_forward(const aria_sa3_dit *m, float *out_CT, const float *x_CT, int T,
                           float t, const float *cross_768, int n_cond, const float *global_768) {
-    aria_sa3_dit_req *r = aria_sa3_dit_req_begin(m, T, cross_768, n_cond, global_768);
+    aria_sa3_dit_req *r = aria_sa3_dit_req_begin(m, T, cross_768, n_cond, global_768, 0);
     aria_sa3_dit_step(m, r, out_CT, x_CT, t);
     aria_sa3_dit_req_end(r);
 }
@@ -635,6 +639,7 @@ void aria_sa3_dit_req_get_view(const aria_sa3_dit_req *r, aria_sa3_dit_req_view 
     v->T = r->T; v->S = r->S; v->n_cond = r->n_cond; v->depth = r->m->depth;
     v->global_seconds = r->global_seconds; v->rope_cos = r->rope_cos; v->rope_sin = r->rope_sin;
     v->cross_k = r->cross_k; v->cross_v = r->cross_v; v->cross_kd = r->cross_kd;
+    v->cross_ed = r->cross_ed;
 }
 
 void aria_sa3_dit_global_cond(const aria_sa3_dit *m, const float *global_seconds, float t, float *gcond) {

@@ -505,9 +505,9 @@ static int upload_dqw(dqw *w, const float *W, int N, int K, aria_dtype dt) {
 static void free_dqw(dqw *w) { cudaFree(w->f16); cudaFree(w->q); cudaFree(w->scale); }
 
 struct blk_dev {
-    const float *pre_norm, *cross_norm, *ff_norm, *sa_q_norm, *sa_k_norm, *ca_q_norm;
+    const float *pre_norm, *cross_norm, *ff_norm, *sa_q_norm, *sa_k_norm, *ca_q_norm, *ca_k_norm;
     const float *ssg, *ff_in_b, *ff_out_b;
-    dqw sa_to_qkv, sa_to_out, ca_to_q, ca_to_out, ff_in_w, ff_out_w;
+    dqw sa_to_qkv, sa_to_out, ca_to_q, ca_to_out, ca_to_kv, ff_in_w, ff_out_w;
 };
 
 struct aria_cuda_dit {
@@ -685,21 +685,25 @@ extern "C" aria_cuda_dit *aria_cuda_dit_create(const aria_sa3_dit_view *v, aria_
         d->sa_q_norm  = upload_f32(s->sa_q_norm, h->hd);
         d->sa_k_norm  = upload_f32(s->sa_k_norm, h->hd);
         d->ca_q_norm  = upload_f32(s->ca_q_norm, h->hd);
+        d->ca_k_norm  = upload_f32(s->ca_k_norm, h->hd);
         d->ssg        = upload_f32(s->to_scale_shift_gate, (size_t)6 * ed);
         d->ff_in_b    = upload_f32(s->ff_in_b, (size_t)2 * inner);
         d->ff_out_b   = upload_f32(s->ff_out_b, ed);
         /* Q4 mixed precision: attention projections stay Q8 (error-sensitive).
          * differential (medium): sa_to_qkv is [5*ed,ed], ca_to_q [2*ed,ed]. */
         aria_dtype adt = (precision == ARIA_Q4) ? ARIA_Q8 : precision;
-        int nq = v->differential ? 5 : 3, ncq = v->differential ? 2 : 1;
+        int nq = v->differential ? 5 : 3, ncq = v->differential ? 2 : 1, nkv = v->differential ? 3 : 2;
         int u = 1;
         u &= upload_dqw(&d->sa_to_qkv, s->sa_to_qkv, nq * ed, ed, adt);
         u &= upload_dqw(&d->sa_to_out, s->sa_to_out, ed, ed, adt);
         u &= upload_dqw(&d->ca_to_q,   s->ca_to_q,   ncq * ed, ed, adt);
         u &= upload_dqw(&d->ca_to_out, s->ca_to_out, ed, ed, adt);
+        /* cross K/V projection: device-resident, projected once per request from
+         * cross_ed (kept f16/f32, error-sensitive -- not quantized). */
+        u &= upload_dqw(&d->ca_to_kv,  s->ca_to_kv,  nkv * ed, ed, ARIA_F32);
         u &= upload_dqw(&d->ff_in_w,   s->ff_in_w,   2 * inner, ed, precision);
         u &= upload_dqw(&d->ff_out_w,  s->ff_out_w,  ed, inner, precision);
-        ok = u && d->ssg && d->pre_norm;
+        ok = u && d->ssg && d->pre_norm && d->ca_k_norm;
     }
     if (precision != ARIA_F32 && !h->dqbuf) ok = 0;
     if (!ok) { aria_cuda_dit_free(h); return NULL; }
@@ -728,22 +732,52 @@ extern "C" void aria_cuda_dit_set_request(aria_cuda_dit *h, const aria_sa3_dit_r
     cudaMalloc(&h->dgcond, (size_t)6 * ed * sizeof(float));
     h->rope_cos = upload_f32(rv->rope_cos, (size_t)S * rh);
     h->rope_sin = upload_f32(rv->rope_sin, (size_t)S * rh);
-    h->cross_k = (float **)calloc(h->depth, sizeof(float *));
-    h->cross_v = (float **)calloc(h->depth, sizeof(float *));
-    h->cross_kd = (h->differential && rv->cross_kd) ? (float **)calloc(h->depth, sizeof(float *)) : NULL;
-    for (int b = 0; b < h->depth; b++) {
-        h->cross_k[b] = upload_f32(rv->cross_k[b], (size_t)H * n_cond * hd);
-        h->cross_v[b] = upload_f32(rv->cross_v[b], (size_t)H * n_cond * hd);
-        if (h->cross_kd) h->cross_kd[b] = upload_f32(rv->cross_kd[b], (size_t)H * n_cond * hd);
-    }
     /* device arena: one block's peak + step buffers (mirrors the CPU sizing;
-     * differential needs ~32*S*ed for the extra 5-way qkv + q/k_diff + 2nd attn). */
+     * differential needs ~32*S*ed for the extra 5-way qkv + q/k_diff + 2nd attn).
+     * Allocated before the cross-K/V projection, which borrows it for GEMM scratch. */
     size_t block_floats = (size_t)6 * ed + (h->differential ? 32 : 24) * (size_t)S * ed
                           + (size_t)H * S * (S > n_cond ? S : n_cond);
     size_t step_floats = (size_t)S * ed + 8 * (size_t)T * C + 8 * (size_t)ed;
     h->arena.cap = (block_floats + step_floats + (1u << 20)) * sizeof(float);
     h->arena.used = 0;
     cudaMalloc(&h->arena.base, h->arena.cap);
+
+    int nkv = h->differential ? 3 : 2;
+    size_t khv = (size_t)H * n_cond * hd;
+    h->cross_k = (float **)calloc(h->depth, sizeof(float *));
+    h->cross_v = (float **)calloc(h->depth, sizeof(float *));
+    h->cross_kd = h->differential ? (float **)calloc(h->depth, sizeof(float *)) : NULL;
+    if (rv->cross_ed) {
+        /* project cross K/V on the device from cross_ed [n_cond, ed], once per
+         * request (was a per-request CPU GEMM + 24-block upload before). */
+        float *ced = upload_f32(rv->cross_ed, (size_t)n_cond * ed);
+        for (int b = 0; b < h->depth; b++) {
+            blk_dev *w = &h->blocks[b];
+            cudaMalloc(&h->cross_k[b], khv * sizeof(float));
+            cudaMalloc(&h->cross_v[b], khv * sizeof(float));
+            if (h->cross_kd) cudaMalloc(&h->cross_kd[b], khv * sizeof(float));
+            size_t mark = da_save(&h->arena);
+            float *kv = da_alloc(&h->arena, (size_t)n_cond * nkv * ed);     /* [n_cond, nkv*ed] */
+            gemm_dqw(h, kv, ced, &w->ca_to_kv, NULL, n_cond);
+            k_extract_heads<<<nblocks(khv), THREADS>>>(h->cross_k[b], kv, n_cond, H, hd, nkv * ed, 0);
+            if (h->cross_kd) {   /* chunk order: k, k_diff, v */
+                k_extract_heads<<<nblocks(khv), THREADS>>>(h->cross_kd[b], kv, n_cond, H, hd, nkv * ed, ed);
+                k_extract_heads<<<nblocks(khv), THREADS>>>(h->cross_v[b],  kv, n_cond, H, hd, nkv * ed, 2 * ed);
+                k_rmsnorm<<<H * n_cond, RED_TH>>>(h->cross_kd[b], h->cross_kd[b], w->ca_k_norm, H * n_cond, hd, 1e-6f, 0);
+            } else {
+                k_extract_heads<<<nblocks(khv), THREADS>>>(h->cross_v[b], kv, n_cond, H, hd, nkv * ed, ed);
+            }
+            k_rmsnorm<<<H * n_cond, RED_TH>>>(h->cross_k[b], h->cross_k[b], w->ca_k_norm, H * n_cond, hd, 1e-6f, 0);
+            da_restore(&h->arena, mark);
+        }
+        cudaFree(ced);
+    } else {
+        for (int b = 0; b < h->depth; b++) {   /* legacy: CPU-projected K/V uploaded */
+            h->cross_k[b] = upload_f32(rv->cross_k[b], khv);
+            h->cross_v[b] = upload_f32(rv->cross_v[b], khv);
+            if (h->cross_kd) h->cross_kd[b] = upload_f32(rv->cross_kd[b], khv);
+        }
+    }
     h->have_req = 1;
 }
 
@@ -786,9 +820,10 @@ extern "C" void aria_cuda_dit_free(aria_cuda_dit *h) {
         blk_dev *d = &h->blocks[b];
         cudaFree((void *)d->pre_norm); cudaFree((void *)d->cross_norm); cudaFree((void *)d->ff_norm);
         cudaFree((void *)d->sa_q_norm); cudaFree((void *)d->sa_k_norm); cudaFree((void *)d->ca_q_norm);
+        cudaFree((void *)d->ca_k_norm);
         cudaFree((void *)d->ssg); cudaFree((void *)d->ff_in_b); cudaFree((void *)d->ff_out_b);
         free_dqw(&d->sa_to_qkv); free_dqw(&d->sa_to_out); free_dqw(&d->ca_to_q);
-        free_dqw(&d->ca_to_out); free_dqw(&d->ff_in_w); free_dqw(&d->ff_out_w);
+        free_dqw(&d->ca_to_out); free_dqw(&d->ca_to_kv); free_dqw(&d->ff_in_w); free_dqw(&d->ff_out_w);
     }
     free(h->blocks);
     free_request(h);

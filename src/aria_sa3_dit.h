@@ -91,9 +91,12 @@ int aria_sa3_dit_quant_load(aria_sa3_dit *m, const char *path);
  * threads to avoid oversubscription.) */
 typedef struct aria_sa3_dit_req aria_sa3_dit_req;
 
+/* gpu=1 defers the per-block cross-K/V projection (cross_k/v/kd stay NULL, only
+ * cross_ed is computed) so the CUDA backend can project on-device; gpu=0 projects
+ * on the CPU as the f32 forward needs. */
 aria_sa3_dit_req *aria_sa3_dit_req_begin(const aria_sa3_dit *m, int T,
                                          const float *cross_768, int n_cond,
-                                         const float *global_768);
+                                         const float *global_768, int gpu);
 /* Optional local-additive (inpaint) conditioning: raw [n_local, local_dim]
  * (=[T,257] of [inpaint_mask | inpaint_masked_input]); each block projects it via
  * its to_local_embed MLP and adds it to the residual stream (left-padded past the
@@ -122,8 +125,9 @@ void aria_sa3_dit_get_view(const aria_sa3_dit *m, aria_sa3_dit_view *v);
 typedef struct {
     int T, S, n_cond, depth;
     const float *global_seconds, *rope_cos, *rope_sin;
-    float *const *cross_k, *const *cross_v;   /* [depth] each [H, n_cond, head_dim] */
+    float *const *cross_k, *const *cross_v;   /* [depth] each [H, n_cond, head_dim]; NULL if gpu-deferred */
     float *const *cross_kd;                   /* [depth] differential k_diff (post k_norm), or NULL */
+    const float *cross_ed;                    /* [n_cond, ed] to_cond_embed(prompt); set when cross_k deferred */
 } aria_sa3_dit_req_view;
 void aria_sa3_dit_req_get_view(const aria_sa3_dit_req *r, aria_sa3_dit_req_view *v);
 

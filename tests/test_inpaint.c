@@ -84,7 +84,7 @@ int main(void) {
     {
         float t = tt.data[0];
         float *v = malloc((size_t)256 * T * sizeof(float));
-        aria_sa3_dit_req *req = aria_sa3_dit_req_begin(m, T, cross.data, n_cond, glob.data);
+        aria_sa3_dit_req *req = aria_sa3_dit_req_begin(m, T, cross.data, n_cond, glob.data, 0);
         aria_sa3_dit_req_set_local(req, local_TC, T, 257);
         aria_sa3_dit_step(m, req, v, x.data, t);
         aria_sa3_dit_req_end(req);

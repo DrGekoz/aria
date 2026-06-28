@@ -320,7 +320,7 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     }
 
     double t0 = sa3_now();
-    aria_sa3_dit_req *req = aria_sa3_dit_req_begin(st->dit, T, cross, n_cond, sec_emb);
+    aria_sa3_dit_req *req = aria_sa3_dit_req_begin(st->dit, T, cross, n_cond, sec_emb, on_gpu);
     /* continue / inpaint: build + attach the local-additive conditioning (E7). */
     if (p->init_audio) {
         float *local_TC = sa3_build_inpaint_local(ctx, st, p, T);
