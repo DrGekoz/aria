@@ -83,32 +83,65 @@ static aria_audio *stream_slice(const aria_audio *a, int64_t start, int64_t len)
     return o;
 }
 
-/* Streaming / interactive generation: keep the model resident and generate `chunk_s`-second
- * segments by sliding-window inpaint-continuation over a `context_s` rolling context. Each
- * step re-reads the prompt (live re-steering on a TTY). Verifies feasibility + per-chunk RTF. */
-static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float chunk_s, float context_s,
+/* append `src` onto `outp` at *written, linearly crossfading its first `xf` frames over
+ * the last `xf` already-written frames (smooths the seam between segments). */
+static void stream_append_xfade(aria_audio *outp, int64_t *written, int64_t cap,
+                                const aria_audio *src, int64_t xf) {
+    int ch = outp->channels; int64_t n = src->num_frames;
+    if (xf > *written) xf = *written;
+    if (xf > n) xf = n;
+    for (int64_t i = 0; i < xf; i++) {
+        float w = (float)(i + 1) / (float)(xf + 1);
+        int64_t o = (*written - xf + i) * ch;
+        for (int c = 0; c < ch; c++)
+            outp->data[o + c] = (1.0f - w) * outp->data[o + c] + w * src->data[i * ch + c];
+    }
+    int64_t rest = n - xf;
+    if (*written + rest > cap) rest = cap - *written;
+    if (rest > 0) memcpy(outp->data + (*written) * ch, src->data + xf * ch, (size_t)rest * ch * sizeof(float));
+    *written += rest;
+}
+
+/* Streaming / interactive generation: keep the model resident and emit `emit_s`-second
+ * segments by sliding-window continuation over a `context_s` rolling context. The naive
+ * tail-inpaint fades (SA3 makes the regenerated end an outro), so each continuation
+ * regenerates context + skip + emit + tail and emits only the STRONG BODY — skipping the
+ * ~1.5 s post-context seam and discarding the ~3 s fade-out (profile measured on a long
+ * continuation) — crossfaded onto the output. Each step re-reads the prompt (live
+ * re-steering on a TTY). `emit_s` is the --chunk value. */
+static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float context_s,
                       int n_chunks, const char *out_path) {
     int sr = aria_sample_rate(ctx), ch = aria_audio_channels(ctx);
-    int64_t chunk_fr = (int64_t)(chunk_s * sr), ctx_fr = (int64_t)(context_s * sr);
+    const float skip_s = 1.5f, tail_s = 3.0f, xfade_s = 0.25f;   /* seam / fade / crossfade */
+    int64_t ctx_fr = (int64_t)(context_s * sr), xf_fr = (int64_t)(xfade_s * sr);
     int interactive = isatty(fileno(stdin));
     char promptbuf[1024];
 
-    int64_t total_fr = (int64_t)((context_s + chunk_s) * sr) + (int64_t)(n_chunks - 1) * chunk_fr;
-    aria_audio *outp = aria_audio_alloc(sr, ch, total_fr);
+    int64_t cap = (int64_t)((context_s + emit_s) * sr) + (int64_t)n_chunks * (int64_t)(emit_s * sr) + sr;
+    aria_audio *outp = aria_audio_alloc(sr, ch, cap);
     if (!outp) { fprintf(stderr, "stream: OOM\n"); return 1; }
     int64_t written = 0;
     aria_audio *context = NULL;
 
-    fprintf(stderr, "[stream] chunk=%.1fs context=%.1fs steps=%d (CPU continuation)%s\n",
-            chunk_s, context_s, p->steps, interactive ? " — type a new prompt + Enter to re-steer" : "");
+    fprintf(stderr, "[stream] emit=%.1fs context=%.1fs (skip %.1f / tail %.1f / xfade %.2f) steps=%d (CPU)%s\n",
+            emit_s, context_s, skip_s, tail_s, xfade_s, p->steps,
+            interactive ? " — type a prompt + Enter to re-steer" : "");
 
     for (int i = 0; i < n_chunks; i++) {
-        if (interactive && stream_poll_prompt(promptbuf, sizeof promptbuf)) {
+        /* poll stdin (TTY or pipe) for a new prompt -> live re-steering between chunks */
+        if (stream_poll_prompt(promptbuf, sizeof promptbuf)) {
             p->prompt = promptbuf;
             fprintf(stderr, "[stream] prompt -> \"%s\"\n", promptbuf);
         }
-        p->seconds_total = context_s + chunk_s;
-        p->init_audio_mem = (i == 0) ? NULL : context;   /* first window is plain text->audio */
+        /* i==0: plain text->audio, emit the strong front [0, context+emit] (drop its fade).
+         * i>0 : continuation; emit the body [context+skip, context+skip+emit]. */
+        float win_s = (i == 0) ? (context_s + emit_s + tail_s)
+                               : (context_s + skip_s + emit_s + tail_s);
+        int64_t emit_start = (i == 0) ? 0 : (int64_t)((context_s + skip_s) * sr);
+        int64_t emit_len   = (i == 0) ? (int64_t)((context_s + emit_s) * sr)
+                                      : (int64_t)(emit_s * sr);
+        p->seconds_total = win_s;
+        p->init_audio_mem = (i == 0) ? NULL : context;
         p->inpaint_continue = (i == 0) ? 0 : 1;
 
         aria_audio *win = NULL;
@@ -118,20 +151,17 @@ static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float chunk_s, float co
         if (rc != 0 || !win) { fprintf(stderr, "stream: generate failed: %s\n", aria_last_error()); aria_audio_free(outp); aria_audio_free(context); return 1; }
         double dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
 
-        /* emit the NEW audio: the whole first window, else just the regenerated tail */
-        int64_t emit_start = (i == 0) ? 0 : ctx_fr;
-        int64_t emit_len = (i == 0) ? win->num_frames : chunk_fr;
         if (emit_start + emit_len > win->num_frames) emit_len = win->num_frames - emit_start;
-        if (written + emit_len > total_fr) emit_len = total_fr - written;
-        if (emit_len > 0) memcpy(outp->data + written * ch, win->data + emit_start * ch, (size_t)emit_len * ch * sizeof(float));
-        written += emit_len;
+        aria_audio *emit = stream_slice(win, emit_start, emit_len);
+        stream_append_xfade(outp, &written, cap, emit, (i == 0) ? 0 : xf_fr);
+        aria_audio_free(emit);
 
-        double emit_s = emit_len / (double)sr;
-        fprintf(stderr, "[stream] chunk %d/%d: emit %.1fs in %.2fs (RTF %.1fx)  \"%s\"\n",
-                i + 1, n_chunks, emit_s, dt, dt > 0 ? emit_s / dt : 0.0, p->prompt ? p->prompt : "");
+        double es = emit_len / (double)sr;
+        fprintf(stderr, "[stream] chunk %d/%d: emit %.1fs (win %.1fs) in %.2fs (RTF %.1fx)  \"%s\"\n",
+                i + 1, n_chunks, es, win_s, dt, dt > 0 ? es / dt : 0.0, p->prompt ? p->prompt : "");
 
         aria_audio_free(context);
-        context = stream_slice(win, win->num_frames - ctx_fr, ctx_fr);
+        context = stream_slice(outp, written - ctx_fr, ctx_fr);   /* strong, just-emitted tail */
         aria_audio_free(win);
     }
     outp->num_frames = written;
