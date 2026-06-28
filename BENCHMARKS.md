@@ -53,18 +53,20 @@ the *scaling* is visible (uncond, warm; Alienware RTX 3070 + i9-10900KF).
 | backend | aria 10 s | aria 60 s | aria 10→60 | SAT 10 s | SAT 60 s | SAT 10→60 | @ 60 s |
 |---|---|---|---|---|---|---|---|
 | **CPU** (20 thr) | 11.2 s | **55.9 s** | 5.0× | 11.3 s | **108.4 s** | 9.6× | **aria 1.94× faster** |
-| **GPU** (fp16) | 0.52 s | **2.22 s** | 4.3× | 0.49 s | **1.32 s** | 2.7× | SAT 1.68× faster |
+| **GPU** (fp16) | 0.52 s | **2.07 s** | 4.0× | 0.49 s | **1.32 s** | 2.7× | SAT 1.57× faster |
 
 **small-music:**
 
 | backend | aria 10 s | aria 60 s | aria 10→60 | SAT 10 s | SAT 60 s | SAT 10→60 | @ 60 s |
 |---|---|---|---|---|---|---|---|
 | **CPU** (20 thr) | 3.58 s | **16.3 s** | 4.6× | 2.79 s | **11.1 s** | 4.0× | SAT 1.47× faster |
-| **GPU** (fp16) | 0.22 s | **0.74 s** | 3.4× | 0.34 s | **0.41 s** | 1.2× | SAT 1.80× faster |
+| **GPU** (fp16) | 0.22 s | **0.67 s** | 3.0× | 0.34 s | **0.41 s** | 1.2× | SAT 1.63× faster |
 
-aria 60 s stage split — medium GPU dit 1.45 + decode 0.78 s, CPU dit 35.1 + decode 20.6 s
-(CPU dit after query-blocked attention, −4% on the 20-core); small-music GPU dit 0.52 +
+aria 60 s stage split — medium GPU dit **1.28** + decode 0.78 s, CPU dit 35.1 + decode 20.6 s
+(CPU dit after query-blocked attention, −4% on the 20-core); small-music GPU dit 0.50 +
 decode 0.16 s, CPU dit 12.5 + decode 4.3 s. GPU VRAM @60 s: medium aria 4514 vs SAT 6720 MB.
+The medium GPU dit dropped **1.45 → 1.28 s (−12 %)** by fusing the elementwise long tail
+(see below); the gap to SAT closed 1.68× → 1.57×.
 
 **small-music has no banded-decoder win** (its decoder already chunks → O(N·34) linear),
 so on CPU it's pure GEMM and MKL edges aria (1.3–1.5×); the medium CPU win is specifically
@@ -91,6 +93,17 @@ regressed medium fidelity to 5.8 %. At S ≤ 710 (S² = 0.5 M) cuBLAS GemmEx + a
 softmax reduction beats a hand-rolled single-warp-per-tile flash; matching PyTorch
 needs a cuDNN-class **multi-warp/pipelined FlashAttention-2** kernel — large effort
 for an already-fast (≤ 2.2 s) path, so deferred. The cuBLAS attention stands.
+
+**What did help — fusing the long tail.** nsys (medium, GPU) shows the GEMMs are only
+~41 % of GPU time, the attention softmax ~9 %, and a **~32 % long tail** of small
+memory-bound elementwise/reshape kernels (fp16-convert, rmsnorm, RoPE, extract/merge-
+heads, adaLN/gate). Fusing the biggest of these — **extract-head + per-head qk-rmsnorm +
+RoPE** into one kernel (`k_extract_normrope`), plus rmsnorm+adaLN and gate+residual-add —
+cut the **medium GPU DiT 1.45 → 1.28 s (−12 %)**, whole gen 2.22 → 2.07 s, parity
+unchanged. It's a bigger, lower-risk lever than flash (the softmax FA-2 would touch is
+only ~9 %). Remaining long-tail headroom: the per-attention fp16 conversions (have
+`k_extract_normrope` emit fp16 so `attn_dev` skips them) and CUDA Graphs for the ~14 k
+per-gen launches.
 
 ## Takeaways
 
