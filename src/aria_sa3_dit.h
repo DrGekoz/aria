@@ -20,6 +20,7 @@
 #include "aria_safetensors.h"
 #include "aria_sa3.h"
 #include "aria_quant.h"
+#include "aria_steer.h"   /* aria_steer_set (E12 residual-site steering) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -103,6 +104,10 @@ aria_sa3_dit_req *aria_sa3_dit_req_begin(const aria_sa3_dit *m, int T,
  * memory tokens). Call after req_begin; omit for plain text->audio (no-op). */
 void aria_sa3_dit_req_set_local(aria_sa3_dit_req *req, const float *local_raw,
                                 int n_local, int local_dim);
+/* E12: attach an activation-steering set (residual site applied in the block loop) + set the
+ * current denoise step (for step-window gating). Both default to none/0; steer is borrowed. */
+void aria_sa3_dit_req_set_steer(aria_sa3_dit_req *req, const aria_steer_set *steer);
+void aria_sa3_dit_req_set_step(aria_sa3_dit_req *req, int step);
 /* one denoising step: out_CT = velocity(x_CT, t), reusing the request's caches. */
 void aria_sa3_dit_step(const aria_sa3_dit *m, aria_sa3_dit_req *req,
                        float *out_CT, const float *x_CT, float t);

@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include "aria_wav.h"
 #include "aria_quant.h"   /* aria_dtype (precision selection) */
+#include "aria_steer.h"   /* aria_steer_set (E12 activation steering) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -53,9 +54,10 @@ typedef struct {
     const aria_audio *init_audio_mem; /* in-memory continue/inpaint context (overrides
                                        * init_audio file); not freed by the runtime.
                                        * Used by the streaming loop to avoid temp WAVs. */
+    const aria_steer_set *steer;      /* optional activation steering (E12); NULL = none */
 } aria_gen_params;
 
-#define ARIA_GEN_PARAMS_DEFAULT { NULL, NULL, 15.0f, 8, 1.0f, 0, ARIA_DEVICE_AUTO, ARIA_F32, NULL, NULL, 0.0f, 0.0f, 0, NULL, NULL, 0, NULL }
+#define ARIA_GEN_PARAMS_DEFAULT { NULL, NULL, 15.0f, 8, 1.0f, 0, ARIA_DEVICE_AUTO, ARIA_F32, NULL, NULL, 0.0f, 0.0f, 0, NULL, NULL, 0, NULL, NULL }
 
 /* Load a model from a directory containing model_config.json + model.safetensors.
  * Returns NULL on error (see aria_last_error()). */

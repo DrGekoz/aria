@@ -143,18 +143,22 @@ static void sa3_unload(void *state) {
 typedef struct {
     const aria_sa3_dit *dit; aria_sa3_dit_req *req;
     aria_cuda_dit *cdit; const float *global_seconds; float *gcond;
+    int step;   /* E12: current denoise step (the pingpong calls us once per step, in order) */
 } sa3_dctx;
 static void sa3_denoise(void *c, const float *x, float t, float *v, int n) {
     (void)n;
-    const sa3_dctx *d = c;
+    sa3_dctx *d = c;
 #ifdef ARIA_CUDA
-    if (d->cdit) {
+    if (d->cdit) {   /* steering is CPU-only in this slice (no device hook yet) */
         aria_sa3_dit_global_cond(d->dit, d->global_seconds, t, d->gcond);
         aria_cuda_dit_step(d->cdit, v, x, d->gcond);
+        d->step++;
         return;
     }
 #endif
+    aria_sa3_dit_req_set_step(d->req, d->step);
     aria_sa3_dit_step(d->dit, d->req, v, x, t);
+    d->step++;
 }
 
 /* Build the local-additive inpaint conditioning for a continue/inpaint request:
@@ -310,7 +314,8 @@ static int sa3_generate(aria_ctx *ctx, void *state,
      * but keeps the medium decoder on the CPU (the device decoder is small-music).
      * continue/inpaint also runs on the GPU: the taae encoder builds the context latent
      * on the CPU, then the per-block local-additive cond is uploaded and added on device. */
-    int want_gpu = !loaded_quant &&
+    int has_steer = p->steer && p->steer->n > 0;   /* E12: residual hook is CPU-only this slice */
+    int want_gpu = !loaded_quant && !has_steer &&
                    ((p->device == ARIA_DEVICE_CUDA && aria_cuda_available()) ||
                     (p->device == ARIA_DEVICE_AUTO && aria_cuda_recommended()));
     if (want_gpu && !st->cdit) {   /* upload + quantize weights once; reused across gens */
@@ -347,7 +352,8 @@ static int sa3_generate(aria_ctx *ctx, void *state,
         aria_sa3_dit_req_set_local(req, local_TC, T, 257);  /* projected once, then owned by req */
         free(local_TC);
     }
-    sa3_dctx dc = { st->dit, req, NULL, NULL, NULL };
+    aria_sa3_dit_req_set_steer(req, p->steer);   /* E12: residual-site steering (CPU path) */
+    sa3_dctx dc = { st->dit, req, NULL, NULL, NULL, 0 };
 #ifdef ARIA_CUDA
     if (on_gpu) {
         aria_sa3_dit_req_view rv; aria_sa3_dit_req_get_view(req, &rv);

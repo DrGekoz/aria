@@ -100,7 +100,8 @@ static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
                            const float *global_cond,
                            const float *rope_cos, const float *rope_sin, int rot_dim,
                            const float *local_emb, const aria_dit_block_w *w,
-                           const dit_block_q *bq, int diff, aria_arena *ar) {
+                           const dit_block_q *bq, int diff,
+                           const aria_steer_set *steer, int layer_idx, int step, aria_arena *ar) {
     const float eps_norm = 1e-5f, eps_qk = 1e-6f;
     size_t mark = aria_arena_save(ar);
 
@@ -198,6 +199,19 @@ static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
     gate_sigmoid(o, gate_ff, S, dim);
     for (size_t i = 0; i < (size_t)S * dim; i++) x[i] += o[i];   /* in-place residual add */
 
+    /* ---------- E12 residual steering: add scale*dir to the block output, broadcast over
+     * all tokens, gated by layer + step-window (matches sa3-sf-api AdditiveInjector). The
+     * scale==0 / out-of-window paths skip entirely, so they stay bit-exact. ---------- */
+    if (steer) for (int s = 0; s < steer->n; s++) {
+        const aria_steer *st = &steer->items[s];
+        if (st->site != ARIA_STEER_RESIDUAL || st->layer != layer_idx) continue;
+        if (st->scale == 0.0f || step < st->step_lo || step > st->step_hi) continue;
+        int d = st->dim < dim ? st->dim : dim;
+        for (int t = 0; t < S; t++)
+            for (int c = 0; c < d; c++)
+                x[(size_t)t * dim + c] += st->scale * st->dir[c];
+    }
+
     aria_arena_restore(ar, mark);
 }
 
@@ -233,7 +247,7 @@ void aria_dit_block_forward(float *x, int S, int dim, int num_heads, int head_di
                   + (1u << 18)) * sizeof(float);
     aria_arena_init(&ar, cap);
     dit_block_core(x, S, dim, H, hd, inner, cross_k, cross_v, cross_kd, Sc, global_cond,
-                   rope_cos, rope_sin, rot_dim, NULL, w, NULL, differential, &ar);
+                   rope_cos, rope_sin, rot_dim, NULL, w, NULL, differential, NULL, 0, 0, &ar);
     aria_arena_free(&ar);
     free(cross_k); free(cross_v); free(cross_kd);
 }
@@ -475,6 +489,7 @@ struct aria_sa3_dit_req {
     float **cross_k, **cross_v;             /* [depth] each [H, n_cond, hd]; cross_k post k_norm */
     float **cross_kd;                       /* [depth] differential cross k_diff (post k_norm), or NULL */
     float **local_emb; int has_local;       /* [depth] each [S, ed] (left-padded) or NULL */
+    const aria_steer_set *steer; int cur_step;  /* E12: residual-site steering + current denoise step */
 };
 
 aria_sa3_dit_req *aria_sa3_dit_req_begin(const aria_sa3_dit *m, int T,
@@ -559,6 +574,9 @@ void aria_sa3_dit_req_set_local(aria_sa3_dit_req *r, const float *local_raw,
     r->has_local = 1;
 }
 
+void aria_sa3_dit_req_set_steer(aria_sa3_dit_req *r, const aria_steer_set *steer) { r->steer = steer; }
+void aria_sa3_dit_req_set_step(aria_sa3_dit_req *r, int step) { r->cur_step = step; }
+
 void aria_sa3_dit_step(const aria_sa3_dit *m, aria_sa3_dit_req *r,
                        float *out_CT, const float *x_CT, float t) {
     int C = m->io_ch, ed = m->ed, Mt = m->n_mem, S = r->S, T = r->T, rot = m->rot_dim;
@@ -589,7 +607,7 @@ void aria_sa3_dit_step(const aria_sa3_dit *m, aria_sa3_dit_req *r,
                        r->cross_k[b], r->cross_v[b], r->cross_kd ? r->cross_kd[b] : NULL, r->n_cond, gcond,
                        r->rope_cos, r->rope_sin, rot,
                        r->has_local ? r->local_emb[b] : NULL, &m->blocks[b],
-                       m->bq ? &m->bq[b] : NULL, m->differential, ar);
+                       m->bq ? &m->bq[b] : NULL, m->differential, r->steer, b, r->cur_step, ar);
 
     /* strip memory tokens, project_out [T,ed] -> [T,C] */
     float *outtc = aria_arena_floats(ar, (size_t)T * C);

@@ -13,6 +13,7 @@
 #include "aria.h"
 #include "aria_wav.h"
 #include "aria_hpss.h"
+#include "aria_parity.h"   /* .atns reader for --steer direction loading (E12.7) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,6 +44,7 @@ typedef struct {
     aria_dtype precision;
     int do_info, do_list, do_generate, do_stream, inpaint_continue, stream_hold, rng_torch;
     int util;                               /* 0 none / 1 wav-roundtrip / 2 hpss-test */
+    const char *steer_specs[16]; int n_steer;   /* E12: repeatable --steer site:layer:dir.atns:scale:lo-hi */
 } cli_config;
 
 static cli_config cli_defaults(void) {
@@ -57,7 +59,7 @@ enum {   /* keys: short flags use their ASCII char; long-only options use ids pa
     K_MODEL='m', K_PROMPT='p', K_DUR='d', K_STEPS='s', K_OUT='o', K_HELP='h',
     K_SEED=256, K_DEVICE, K_BENCH, K_UNCOND, K_PEMB, K_INFO, K_LIST,
     K_INPAINT, K_CONTINUE, K_FROM, K_TO, K_PREC, K_LOADQ, K_RNG,
-    K_STREAM, K_CHUNK, K_CTX, K_CHUNKS, K_HOLD, K_WAVRT, K_HPSS,
+    K_STREAM, K_CHUNK, K_CTX, K_CHUNKS, K_HOLD, K_WAVRT, K_HPSS, K_STEER,
 };
 typedef enum { A_NONE, A_ONE, A_TWO, A_OPT } argkind;  /* flag / 1 arg / 2 args / optional 1 arg */
 typedef struct {
@@ -80,6 +82,7 @@ static const opt_spec OPTS[] = {
     {K_PREC,     "precision",     0,  A_ONE,  "<p>",        "generate", "fp32 | fp16 | bf16 | q8 | q4 (q8/q4 force CPU)"},
     {K_LOADQ,    "load-quant",    0,  A_ONE,  "<file>",     "generate", "load a pre-quantized .aria DiT overlay"},
     {K_RNG,      "rng",           0,  A_ONE,  "<mode>",     "generate", "xoshiro (default) | torch (parity)"},
+    {K_STEER,    "steer",         0,  A_ONE,  "<spec>",     "generate", "activation steering site:layer:dir.atns:scale:lo-hi (repeatable; forces CPU)"},
     {K_BENCH,    "bench",         0,  A_ONE,  "<n>",        "generate", "generate N times resident, report warm-min"},
 
     {K_CONTINUE, "continue",      0,  A_ONE,  "<in.wav>",   "edit",     "extend a clip (GPU or CPU)"},
@@ -138,6 +141,9 @@ static int cli_apply(int key, char **a, cli_config *c) {
     case K_CTX:    c->stream_context = (float)atof(a[0]); break;
     case K_CHUNKS: c->stream_chunks = atoi(a[0]); break;
     case K_HOLD:   c->stream_hold = 1; break;
+    case K_STEER:
+        if (c->n_steer >= 16) { fprintf(stderr, "too many --steer (max 16)\n"); return 1; }
+        c->steer_specs[c->n_steer++] = a[0]; break;
     case K_INFO:   c->do_info = 1; break;
     case K_LIST:   c->do_list = 1; if (a[0]) c->list_prefix = a[0]; break;
     case K_WAVRT:  c->util = 1; c->util_a = a[0]; c->util_b = a[1]; break;
@@ -192,6 +198,45 @@ static int cli_parse(int argc, char **argv, cli_config *c) {
         if (cli_apply(o->key, args, c)) return 1;
     }
     return 0;
+}
+
+/* E12: parse the repeatable --steer specs (site:layer:dir.atns:scale:lo-hi) into a steer set,
+ * loading each .atns direction. `items` is caller storage [>=n_steer]; on success fills `set`
+ * (free each set->items[i].dir with free_steer_set after generation). Returns 0, or 1 on error. */
+static int build_steer_set(const cli_config *cfg, aria_steer *items, aria_steer_set *set) {
+    set->items = items; set->n = 0;
+    for (int i = 0; i < cfg->n_steer; i++) {
+        char buf[1024];
+        snprintf(buf, sizeof buf, "%s", cfg->steer_specs[i]);
+        char *site = strtok(buf, ":"), *layer = strtok(NULL, ":"), *path = strtok(NULL, ":");
+        char *scale = strtok(NULL, ":"), *win = strtok(NULL, ":");
+        if (!site || !layer || !path || !scale) {
+            fprintf(stderr, "bad --steer '%s' (want site:layer:dir.atns:scale:lo-hi)\n", cfg->steer_specs[i]);
+            return 1;
+        }
+        aria_steer_site s;
+        if      (!strcmp(site, "residual")) s = ARIA_STEER_RESIDUAL;
+        else if (!strcmp(site, "latent"))   s = ARIA_STEER_LATENT;
+        else if (!strcmp(site, "cond"))     s = ARIA_STEER_COND;
+        else { fprintf(stderr, "unknown --steer site '%s' (residual|latent|cond)\n", site); return 1; }
+        aria_parity_tensor t;
+        if (aria_parity_load(path, &t) != 0) { fprintf(stderr, "cannot load steer direction %s\n", path); return 1; }
+        float *d = malloc((size_t)t.numel * sizeof(float));
+        memcpy(d, t.data, (size_t)t.numel * sizeof(float));
+        aria_parity_free(&t);
+        int lo = 0, hi = 1 << 30;
+        if (win) sscanf(win, "%d-%d", &lo, &hi);
+        aria_steer *it = &items[set->n];
+        it->site = s; it->layer = atoi(layer); it->dir = d; it->dim = (int)t.numel;
+        it->scale = (float)atof(scale); it->step_lo = lo; it->step_hi = hi;
+        fprintf(stderr, "[steer] %s layer=%d dim=%d scale=%.4g steps[%d,%d] <- %s\n",
+                site, it->layer, it->dim, it->scale, lo, hi, path);
+        set->n++;
+    }
+    return 0;
+}
+static void free_steer_set(aria_steer_set *set) {
+    for (int i = 0; i < set->n; i++) free((void *)set->items[i].dir);
 }
 
 static int cmd_wav_roundtrip(const char *in, const char *out) {
@@ -512,6 +557,11 @@ int main(int argc, char **argv) {
         p.inpaint_to_s = cfg.inpaint_to;
         p.inpaint_continue = cfg.inpaint_continue;
         p.rng_torch = cfg.rng_torch;
+        aria_steer steer_items[16]; aria_steer_set steer_set = {0};   /* E12 activation steering */
+        if (cfg.n_steer > 0) {
+            if (build_steer_set(&cfg, steer_items, &steer_set) != 0) { aria_free(ctx); return 1; }
+            p.steer = &steer_set;
+        }
         if (isatty(fileno(stderr))) p.progress = cli_progress;  /* live progress on a terminal */
         double best = 1e9;
         for (int b = 0; b < cfg.bench && rc == 0; b++) {
@@ -532,6 +582,7 @@ int main(int argc, char **argv) {
             }
             aria_audio_free(audio);
         }
+        free_steer_set(&steer_set);
     } else if (cfg.do_info) {
         /* header already printed */
     }
