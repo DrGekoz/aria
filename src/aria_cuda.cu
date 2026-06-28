@@ -13,6 +13,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
+#include <mma.h>
 #include <cstdio>
 #include <cstdlib>
 
@@ -477,6 +478,107 @@ static void attn_dev(cublasHandle_t cb, darena *ar, float *out, const float *q, 
     da_restore(ar, mark);
 }
 
+/* Tensor-core flash attention (sm_70+), head_dim D==64. Replaces attn_dev for the
+ * DiT SELF-attention (Nq=Nk=S grows with audio length): fuses QK->online-softmax->AV
+ * with WMMA (fp16 tensor cores) so the H*S*S score matrix never reaches HBM. One warp
+ * per 16-query tile per head; the running output O[16][64] lives in shared and is
+ * rescaled in place across key tiles. fp16 in (tensor cores), fp32 accumulate.
+ * Compiled to a no-op below sm_70; the host dispatches attn_dev there instead. */
+#define FW 16   /* WMMA m=n=k tile */
+__global__ void k_flash_wmma(float *__restrict__ out, const __half *__restrict__ q,
+                             const __half *__restrict__ k, const __half *__restrict__ v,
+                             int Nq, int Nk, int D, float scale) {
+#if __CUDA_ARCH__ >= 700
+    using namespace nvcuda;
+    int h  = blockIdx.y;
+    int q0 = blockIdx.x * FW;
+    int lane = threadIdx.x;                 /* one warp (32 lanes) */
+    const __half *qh = q + (size_t)h * Nq * D;
+    const __half *kh = k + (size_t)h * Nk * D;
+    const __half *vh = v + (size_t)h * Nk * D;
+    __shared__ __half Qs[FW][64], Ks[FW][64], Vs[FW][64], Psh[FW][FW];
+    __shared__ float  Os[FW][64], Ssh[FW][FW], Tmp[FW][FW], mrow[FW], lrow[FW];
+
+    for (int i = lane; i < FW * 64; i += 32) {
+        int r = i / 64, c = i % 64, qi = q0 + r;
+        Qs[r][c] = (qi < Nq) ? qh[(size_t)qi * D + c] : __float2half(0.0f);
+        Os[r][c] = 0.0f;
+    }
+    if (lane < FW) { mrow[lane] = -INFINITY; lrow[lane] = 0.0f; }
+    __syncwarp();
+
+    wmma::fragment<wmma::matrix_a, FW, FW, FW, __half, wmma::row_major> qfrag[4];
+    for (int kc = 0; kc < 4; kc++) wmma::load_matrix_sync(qfrag[kc], &Qs[0][kc * FW], 64);
+
+    for (int k0 = 0; k0 < Nk; k0 += FW) {
+        for (int i = lane; i < FW * 64; i += 32) {
+            int r = i / 64, c = i % 64, ki = k0 + r;
+            Ks[r][c] = (ki < Nk) ? kh[(size_t)ki * D + c] : __float2half(0.0f);
+            Vs[r][c] = (ki < Nk) ? vh[(size_t)ki * D + c] : __float2half(0.0f);
+        }
+        __syncwarp();
+        /* S = Q @ K^T : load K col-major so a 16x16 chunk reads as K^T (k-dim x key) */
+        wmma::fragment<wmma::accumulator, FW, FW, FW, float> sfrag;
+        wmma::fill_fragment(sfrag, 0.0f);
+        for (int kc = 0; kc < 4; kc++) {
+            wmma::fragment<wmma::matrix_b, FW, FW, FW, __half, wmma::col_major> kfrag;
+            wmma::load_matrix_sync(kfrag, &Ks[0][kc * FW], 64);
+            wmma::mma_sync(sfrag, qfrag[kc], kfrag, sfrag);
+        }
+        wmma::store_matrix_sync(&Ssh[0][0], sfrag, FW, wmma::mem_row_major);
+        __syncwarp();
+        /* online softmax over this tile (lane = query row) */
+        int vk = (Nk - k0 < FW) ? (Nk - k0) : FW;
+        if (lane < FW) {
+            int r = lane;
+            float smax = -INFINITY;
+            for (int j = 0; j < vk; j++) { Ssh[r][j] *= scale; smax = fmaxf(smax, Ssh[r][j]); }
+            float mnew = fmaxf(mrow[r], smax), corr = __expf(mrow[r] - mnew), sum = 0.0f;
+            for (int j = 0; j < FW; j++) {
+                float p = (j < vk) ? __expf(Ssh[r][j] - mnew) : 0.0f;
+                Psh[r][j] = __float2half(p); sum += p;
+            }
+            lrow[r] = lrow[r] * corr + sum;
+            for (int c = 0; c < 64; c++) Os[r][c] *= corr;
+            mrow[r] = mnew;
+        }
+        __syncwarp();
+        /* O += P @ V : 4 n-tiles of 16 over D=64 */
+        wmma::fragment<wmma::matrix_a, FW, FW, FW, __half, wmma::row_major> pfrag;
+        wmma::load_matrix_sync(pfrag, &Psh[0][0], FW);
+        for (int nt = 0; nt < 4; nt++) {
+            wmma::fragment<wmma::matrix_b, FW, FW, FW, __half, wmma::row_major> vfrag;
+            wmma::load_matrix_sync(vfrag, &Vs[0][nt * FW], 64);
+            wmma::fragment<wmma::accumulator, FW, FW, FW, float> ofrag;
+            wmma::fill_fragment(ofrag, 0.0f);
+            wmma::mma_sync(ofrag, pfrag, vfrag, ofrag);
+            wmma::store_matrix_sync(&Tmp[0][0], ofrag, FW, wmma::mem_row_major);
+            __syncwarp();
+            for (int i = lane; i < FW * FW; i += 32) Os[i / FW][nt * FW + i % FW] += Tmp[i / FW][i % FW];
+            __syncwarp();
+        }
+    }
+    for (int i = lane; i < FW * 64; i += 32) {
+        int r = i / 64, c = i % 64, qi = q0 + r;
+        if (qi < Nq) { float inv = lrow[r] > 0.0f ? 1.0f / lrow[r] : 0.0f; out[((size_t)h * Nq + qi) * D + c] = Os[r][c] * inv; }
+    }
+#else
+    (void)out; (void)q; (void)k; (void)v; (void)Nq; (void)Nk; (void)D; (void)scale;
+#endif
+}
+static void flash_wmma_dev(darena *ar, float *out, const float *q, const float *k,
+                           const float *v, int H, int Nq, int Nk, int D) {
+    size_t nq = (size_t)H * Nq * D, nkv = (size_t)H * Nk * D, mark = da_save(ar);
+    __half *qh = da_alloc_half(ar, nq), *kh = da_alloc_half(ar, nkv), *vh = da_alloc_half(ar, nkv);
+    k_f32_to_f16<<<nblocks(nq), THREADS>>>(qh, q, nq);
+    k_f32_to_f16<<<nblocks(nkv), THREADS>>>(kh, k, nkv);
+    k_f32_to_f16<<<nblocks(nkv), THREADS>>>(vh, v, nkv);
+    float scale = 1.0f / sqrtf((float)D);
+    dim3 grid((Nq + FW - 1) / FW, H);
+    k_flash_wmma<<<grid, 32>>>(out, qh, kh, vh, Nq, Nk, D, scale);
+    da_restore(ar, mark);
+}
+
 /* ---- device quantized weight (E9.4): packed in VRAM, dequant-on-use to fp16 ----
  * Q8/Q4 weights stay packed on the device (medium fits low VRAM); each GEMM
  * dequantizes its weight into a reused fp16 scratch, then runs the tensor-core
@@ -535,6 +637,7 @@ struct blk_dev {
 struct aria_cuda_dit {
     int depth, ed, H, hd, inner, io_ch, n_mem, rot;
     int differential;         /* medium: differential self+cross attention */
+    int use_flash;            /* sm_70+: tensor-core flash for self-attn (else cuBLAS) */
     aria_dtype precision;     /* block GEMM weight precision (fp32->fp16 / q8 / q4) */
     __half *dqbuf;            /* dequant scratch: largest weight, reused per GEMM */
     __half *preprocess, *postprocess, *project_in, *project_out;
@@ -618,7 +721,8 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     k_rmsnorm<<<H * S, RED_TH>>>(kh, kh, w->sa_k_norm, H * S, hd, 1e-6f, 0);
     k_rope<<<nblocks((size_t)H * S), THREADS>>>(qh, h->rope_cos, h->rope_sin, H, S, hd, rot);
     k_rope<<<nblocks((size_t)H * S), THREADS>>>(kh, h->rope_cos, h->rope_sin, H, S, hd, rot);
-    attn_dev(h->cublas, ar, ao, qh, kh, vh, H, S, S, hd, scores, 1);
+    if (h->use_flash) flash_wmma_dev(ar, ao, qh, kh, vh, H, S, S, hd);
+    else              attn_dev(h->cublas, ar, ao, qh, kh, vh, H, S, S, hd, scores, 1);
     if (diff) {
         k_extract_heads<<<nHShd, THREADS>>>(qdh, qkv, S, H, hd, nq * dim, 3 * dim);
         k_extract_heads<<<nHShd, THREADS>>>(kdh, qkv, S, H, hd, nq * dim, 4 * dim);
@@ -626,7 +730,8 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
         k_rmsnorm<<<H * S, RED_TH>>>(kdh, kdh, w->sa_k_norm, H * S, hd, 1e-6f, 0);
         k_rope<<<nblocks((size_t)H * S), THREADS>>>(qdh, h->rope_cos, h->rope_sin, H, S, hd, rot);
         k_rope<<<nblocks((size_t)H * S), THREADS>>>(kdh, h->rope_cos, h->rope_sin, H, S, hd, rot);
-        attn_dev(h->cublas, ar, aod, qdh, kdh, vh, H, S, S, hd, scores, 1);
+        if (h->use_flash) flash_wmma_dev(ar, aod, qdh, kdh, vh, H, S, S, hd);
+        else              attn_dev(h->cublas, ar, aod, qdh, kdh, vh, H, S, S, hd, scores, 1);
         k_sub<<<nblocks(nHSd), THREADS>>>(ao, aod, nHSd);
     }
     k_merge_heads<<<nHShd, THREADS>>>(merged, ao, S, H, hd);
@@ -689,6 +794,7 @@ extern "C" aria_cuda_dit *aria_cuda_dit_create(const aria_sa3_dit_view *v, aria_
     h->depth = v->depth; h->ed = ed; h->H = v->num_heads; h->hd = v->head_dim;
     h->inner = inner; h->io_ch = v->io_ch; h->n_mem = v->n_mem; h->rot = v->rot_dim;
     h->precision = precision; h->differential = v->differential;
+    { cudaDeviceProp p; h->use_flash = (cudaGetDeviceProperties(&p, 0) == cudaSuccess && p.major >= 7 && v->head_dim == 64); }
     if (cublasCreate(&h->cublas) != CUBLAS_STATUS_SUCCESS) { free(h); return NULL; }
     if (precision != ARIA_F32) { CK(cudaMalloc(&h->dqbuf, (size_t)2 * inner * ed * sizeof(__half))); }
     int C = v->io_ch;
