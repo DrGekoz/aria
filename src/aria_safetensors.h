@@ -56,6 +56,11 @@ safetensors_file_t *safetensors_open(const char *path);
 /* Close and free resources. */
 void safetensors_close(safetensors_file_t *sf);
 
+/* Hint the kernel to drop the mmap's resident pages (MADV_DONTNEED). Use after the
+ * weights have been copied elsewhere (e.g. uploaded to the GPU) and won't be read on
+ * the host again -- frees the host RSS; any re-access just re-faults from the file. */
+void safetensors_advise_dontneed(const safetensors_file_t *sf);
+
 /* Find a tensor by exact name, returns NULL if not found. */
 const safetensor_t *safetensors_find(const safetensors_file_t *sf, const char *name);
 

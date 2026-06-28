@@ -48,6 +48,7 @@ typedef struct {
     aria_cuda_dit *cdit;
     aria_cuda_dec *cdec;
     aria_cuda_dec_medium *cdec_med;   /* medium GPU decoder (dim 1536, banded attention) */
+    int weights_advised;              /* madvise(DONTNEED) the host weights once (GPU path) */
 } sa3_state;
 
 /* Load the T5Gemma encoder + tokenizer on demand (text prompts only). */
@@ -366,11 +367,23 @@ static int sa3_generate(aria_ctx *ctx, void *state,
 #endif
     if (st->is_medium) aria_sa3_dec_medium_forward(st->dec_med, audio, x, T);
     else               aria_sa3_dec_forward(st->dec, audio, x, T);
+#ifdef ARIA_CUDA
+    /* once the DiT+decoder are device-resident, the host F32 weights aren't read on
+     * the hot path again -- drop them to reclaim ~the model size of host RSS. The few
+     * per-request host MLPs (to_cond/to_global/timestep) just re-fault cheaply. */
+    if ((st->cdit || st->cdec || st->cdec_med) && !st->weights_advised) {
+        safetensors_advise_dontneed(ctx->sf);
+        st->weights_advised = 1;
+    }
+#endif
     double t3 = sa3_now();
     if (profile) {
         struct rusage ru; getrusage(RUSAGE_SELF, &ru);
-        fprintf(stderr, "[aria] profile: setup=%.2fs dit=%.2fs decode=%.2fs (T=%d steps=%d) | peak RSS %.0f MB",
-                t1 - t0, t2 - t1, t3 - t2, T, steps, ru.ru_maxrss / 1024.0);
+        double cur_rss = 0;   /* current resident set (post host-weight drop on GPU) */
+        FILE *sf = fopen("/proc/self/statm", "r");
+        if (sf) { long pages = 0; if (fscanf(sf, "%*ld %ld", &pages) == 1) cur_rss = pages * 4096.0 / 1048576.0; fclose(sf); }
+        fprintf(stderr, "[aria] profile: setup=%.2fs dit=%.2fs decode=%.2fs (T=%d steps=%d) | RSS cur %.0f / peak %.0f MB",
+                t1 - t0, t2 - t1, t3 - t2, T, steps, cur_rss, ru.ru_maxrss / 1024.0);
 #ifdef ARIA_CUDA
         if (st->cdit || st->cdec || st->cdec_med) {
             size_t used = 0, total = 0; aria_cuda_meminfo(&used, &total);

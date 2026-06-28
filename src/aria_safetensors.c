@@ -230,6 +230,10 @@ safetensors_file_t *safetensors_open(const char *path) {
     return sf;
 }
 
+void safetensors_advise_dontneed(const safetensors_file_t *sf) {
+    if (sf && sf->data) madvise(sf->data, sf->file_size, MADV_DONTNEED);
+}
+
 void safetensors_close(safetensors_file_t *sf) {
     if (!sf) return;
     if (sf->data) munmap(sf->data, sf->file_size);
