@@ -152,26 +152,20 @@ void aria_sa3_dec_medium_forward(const aria_sa3_dec_medium *m, float *audio, con
     }
     free(proj);
 
-    /* rope + sliding-window band mask [N,N] (window [17,17]) */
+    /* rope; sliding-window attention (band half-width [17,17]) computed directly */
     float *rc = malloc((size_t)N * (TAAE_ROT / 2) * sizeof(float));
     float *rs = malloc((size_t)N * (TAAE_ROT / 2) * sizeof(float));
     aria_rope_freqs(rc, rs, N, TAAE_ROT, 10000.0f);
-    float *mask = malloc((size_t)N * N * sizeof(float));
-    for (int i = 0; i < N; i++)
-        for (int j = 0; j < N; j++) {
-            int d = j - i;
-            mask[(size_t)i * N + j] = (d >= -MED_WIN && d <= MED_WIN) ? 0.0f : -INFINITY;
-        }
 
     /* 4. 12 blocks over the full sequence; blocks with (depth-i) < 8 are sinusoidal */
     aria_arena ar;
     aria_arena_init(&ar, taae_med_block_floats(N, D, MED_INNER) * sizeof(float));
     for (int b = 0; b < MED_DEPTH; b++) {
         int sinusoidal = (MED_DEPTH - b) < 8;
-        taae_med_block_forward(seq, N, D, MED_H, MED_HD, MED_INNER, &m->blocks[b], rc, rs, mask, sinusoidal, &ar);
+        taae_med_block_forward(seq, N, D, MED_H, MED_HD, MED_INNER, &m->blocks[b], rc, rs, MED_WIN, sinusoidal, &ar);
     }
     aria_arena_free(&ar);
-    free(rc); free(rs); free(mask);
+    free(rc); free(rs);
 
     /* 5. last 16 of each 17-group -> feat[1536, T*16] (channel-major) */
     int Lt = T * 16;

@@ -46,19 +46,13 @@ static void run(const char *tag, int sinusoidal) {
     float *rs = malloc((size_t)N * (rot / 2) * sizeof(float));
     aria_rope_freqs(rc, rs, N, rot, 10000.0f);
 
-    /* sliding-window band mask [N,N]: 0 inside [i-17,i+17], -inf outside */
+    /* sliding-window attention, half-width 17 (query i attends to keys [i-17,i+17]) */
     const int W = 17;
-    float *mask = malloc((size_t)N * N * sizeof(float));
-    for (int i = 0; i < N; i++)
-        for (int j = 0; j < N; j++) {
-            int d = j - i;
-            mask[(size_t)i * N + j] = (d >= -W && d <= W) ? 0.0f : -INFINITY;
-        }
 
     aria_arena ar; aria_arena_init(&ar, taae_med_block_floats(N, dim, inner) * sizeof(float));
     float *out = malloc((size_t)N * dim * sizeof(float));
     memcpy(out, x, (size_t)N * dim * sizeof(float));
-    taae_med_block_forward(out, N, dim, H, hd, inner, &w, rc, rs, mask, sinusoidal, &ar);
+    taae_med_block_forward(out, N, dim, H, hd, inner, &w, rc, rs, W, sinusoidal, &ar);
     aria_arena_free(&ar);
 
     float md = aria_parity_maxabsdiff(out, r, ref.numel), maxref = 0;
@@ -67,7 +61,7 @@ static void run(const char *tag, int sinusoidal) {
     if (md > thr) { printf("FAIL med_block[%s]: maxdiff=%.3e thr=%.3e (max|ref|=%.3f)\n", tag, md, thr, maxref); fails++; }
     else printf("ok   med_block[%s]: maxdiff=%.3e (max|ref|=%.3f)\n", tag, md, maxref);
 
-    free(out); free(rc); free(rs); free(mask);
+    free(out); free(rc); free(rs);
     for (int i = 0; i < nt; i++) aria_parity_free(&T[i]);
     aria_parity_free(&X); aria_parity_free(&ref);
 }

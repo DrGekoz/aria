@@ -123,15 +123,16 @@ size_t taae_block_arena_bytes(void) {
 
 size_t taae_med_block_floats(int N, int dim, int inner) {
     /* peak = attention phase: h+res+o(3) + qkv(5) + q,k,v,qd,kd,ob,od(7) + merged(1)
-     * = 16*N*dim + N*N (scores). The FF (3*N*dim + 3*N*inner) is freed-and-reused, and
+     * = 16*N*dim. Banded attention keeps its tiny score window thread-local, so no
+     * N*N scores buffer. The FF (3*N*dim + 3*N*inner) is freed-and-reused, and
      * 3*N*inner < 13*N*dim for the medium decoder, so this bound covers it. */
     (void)inner;
-    return (size_t)16 * N * dim + (size_t)N * N + 4096;
+    return (size_t)16 * N * dim + 4096;
 }
 
 void taae_med_block_forward(float *xc, int N, int dim, int H, int hd, int inner,
                             const taae_block_w *w, const float *rcos, const float *rsin,
-                            const float *mask, int sinusoidal, aria_arena *ar) {
+                            int win, int sinusoidal, aria_arena *ar) {
     size_t mark = aria_arena_save(ar);
     /* h/res/o persist; the attention scratch is freed before the FF (never live
      * together) so the arena peak is the attention phase, not the sum -- saves
@@ -149,7 +150,6 @@ void taae_med_block_forward(float *xc, int N, int dim, int H, int hd, int inner,
     float *ob = aria_arena_floats(ar, (size_t)H * N * hd);
     float *od = aria_arena_floats(ar, (size_t)H * N * hd);
     float *merged = aria_arena_floats(ar, (size_t)N * dim);
-    float *scores = aria_arena_floats(ar, (size_t)N * N);
 
     /* self-attention (differential): out = attn(q,k,v) - attn(qd,kd,v), banded mask */
     memcpy(res, xc, (size_t)N * dim * sizeof(float));
@@ -168,8 +168,8 @@ void taae_med_block_forward(float *xc, int N, int dim, int H, int hd, int inner,
     aria_rope_apply(qd, rcos, rsin, H, N, hd, TAAE_ROT);
     aria_rope_apply(k,  rcos, rsin, H, N, hd, TAAE_ROT);
     aria_rope_apply(kd, rcos, rsin, H, N, hd, TAAE_ROT);
-    aria_attention(ob, q,  k,  v, H, N, N, hd, mask, scores);
-    aria_attention(od, qd, kd, v, H, N, N, hd, mask, scores);
+    aria_attention_band(ob, q,  k,  v, H, N, hd, win);
+    aria_attention_band(od, qd, kd, v, H, N, hd, win);
     for (size_t i = 0; i < (size_t)H * N * hd; i++) ob[i] -= od[i];
     merge_heads(merged, ob, N, H, hd);
     aria_linear(o, merged, w->to_out, NULL, N, dim, dim);

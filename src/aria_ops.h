@@ -71,6 +71,12 @@ void aria_rope_apply(float *x, const float *cos_t, const float *sin_t,
 void aria_attention(float *out, const float *q, const float *k, const float *v,
                     int H, int Nq, int Nk, int D, const float *mask, float *scratch);
 
+/* Sliding-window (banded) self-attention: query i attends to keys [i-W, i+W] only.
+ * Same result as aria_attention with a [-W,W] band mask, but O(N*(2W+1)*D) instead
+ * of O(N^2*D). q/k/v/out [H,N,D]. */
+void aria_attention_band(float *out, const float *q, const float *k, const float *v,
+                         int H, int N, int D, int W);
+
 /* ---- conv1d (stride 1, pre-folded weights) ---- */
 
 /* out[Cout,L] = conv1d(in[Cin,L]) with weight w[Cout,Cin,K], zero-padded `pad`

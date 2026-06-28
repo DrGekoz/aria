@@ -479,6 +479,51 @@ void aria_attention(float *out, const float *q, const float *k, const float *v,
     }
 }
 
+void aria_attention_band(float *out, const float *q, const float *k, const float *v,
+                         int H, int N, int D, int W) {
+    /* sliding-window self-attention: query i attends only to keys [i-W, i+W].
+     * Identical result to aria_attention with a [-W,W] additive band mask, but
+     * O(N*(2W+1)*D) instead of O(N^2*D) -- the band is ~3% of the full matrix at
+     * the medium decoder's sequence lengths. Parallel over heads (H >= cores). */
+    float scale = 1.0f / sqrtf((float)D);
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic)
+    #endif
+    for (int h = 0; h < H; h++) {
+        static __thread float *sc = NULL; static __thread size_t sccap = 0;
+        float *scores = grow_tls(&sc, &sccap, (size_t)(2 * W + 1));
+        if (!scores) continue;
+        const float *qh = q + (size_t)h * N * D;
+        const float *kh = k + (size_t)h * N * D;
+        const float *vh = v + (size_t)h * N * D;
+        float *oh = out + (size_t)h * N * D;
+        for (int i = 0; i < N; i++) {
+            int lo = i - W < 0 ? 0 : i - W;
+            int hi = i + W >= N ? N - 1 : i + W;
+            const float *qi = qh + (size_t)i * D;
+            float maxv = -INFINITY;
+            for (int j = lo; j <= hi; j++) {
+                const float *kj = kh + (size_t)j * D;
+                float s = 0.0f;
+                for (int d = 0; d < D; d++) s += qi[d] * kj[d];
+                s *= scale;
+                scores[j - lo] = s;
+                if (s > maxv) maxv = s;
+            }
+            float sum = 0.0f;
+            for (int j = lo; j <= hi; j++) { float e = expf(scores[j - lo] - maxv); scores[j - lo] = e; sum += e; }
+            float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+            float *oi = oh + (size_t)i * D;
+            for (int d = 0; d < D; d++) oi[d] = 0.0f;
+            for (int j = lo; j <= hi; j++) {
+                float wgt = scores[j - lo] * inv;
+                const float *vj = vh + (size_t)j * D;
+                for (int d = 0; d < D; d++) oi[d] += wgt * vj[d];
+            }
+        }
+    }
+}
+
 void aria_conv1d(float *out, const float *in, const float *w, const float *bias,
                  int Cin, int Cout, int K, int pad, int L) {
     #ifdef _OPENMP
