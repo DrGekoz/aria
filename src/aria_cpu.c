@@ -460,22 +460,31 @@ void aria_attention(float *out, const float *q, const float *k, const float *v,
     /* Parallelize over HEADS (H >= cores), so each per-head QK/softmax/AV runs serially
      * on one thread -- the inner aria_linear/aria_matmul/softmax OpenMP regions become
      * nested and run single-threaded. Avoids spawning an 8-thread region per tiny K=D
-     * head GEMM, and parallelizes the softmax across heads. */
+     * head GEMM, and parallelizes the softmax across heads.
+     * Within a head, process queries in BQ-row blocks so the [BQ,Nk] score tile stays
+     * L2-resident through QK->softmax->AV instead of streaming a full [Nq,Nk] matrix
+     * (2 MB/head at Nq=Nk=710) through DRAM three times. Rows are independent, so the
+     * output is identical to the single-shot path. */
+    const int BQ = 64;
     #ifdef _OPENMP
     #pragma omp parallel for schedule(dynamic)
     #endif
     for (int h = 0; h < H; h++) {
         static __thread float *sc = NULL; static __thread size_t sccap = 0;
-        float *scores = grow_tls(&sc, &sccap, (size_t)Nq * Nk);
+        int bqcap = Nq < BQ ? Nq : BQ;
+        float *scores = grow_tls(&sc, &sccap, (size_t)bqcap * Nk);
         if (!scores) continue;
         const float *qh = q + (size_t)h * Nq * D;
         const float *kh = k + (size_t)h * Nk * D;
         const float *vh = v + (size_t)h * Nk * D;
         float *oh = out + (size_t)h * Nq * D;
-        aria_linear(scores, qh, kh, NULL, Nq, D, Nk);   /* scores[i,j] = qh[i] . kh[j] */
-        for (size_t i = 0; i < (size_t)Nq * Nk; i++) scores[i] *= scale;
-        aria_softmax_inplace(scores, Nq, Nk, mask);
-        aria_matmul(oh, scores, vh, Nq, Nk, D);
+        for (int qb = 0; qb < Nq; qb += BQ) {
+            int bq = (Nq - qb < BQ) ? (Nq - qb) : BQ;
+            aria_linear(scores, qh + (size_t)qb * D, kh, NULL, bq, D, Nk);  /* [bq,Nk] = qh . kh^T */
+            for (size_t i = 0; i < (size_t)bq * Nk; i++) scores[i] *= scale;
+            aria_softmax_inplace(scores, bq, Nk, mask ? mask + (size_t)qb * Nk : NULL);
+            aria_matmul(oh + (size_t)qb * D, scores, vh, bq, Nk, D);
+        }
     }
 }
 
