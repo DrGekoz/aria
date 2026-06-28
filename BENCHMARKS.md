@@ -114,6 +114,17 @@ is **steadier per-step latency** (less launch jitter); the win grows with steps 
 medium differential path's kernel count. Also drops the redundant per-block residual copies
 (3 `cudaMemcpyD2D`/block) on the same path. See PAPER.md §4.
 
+**True Megakernel feasibility (measured, not adopted).** `tests/bench_megakernel.cu` benches a
+from-scratch WMMA tensor-core GEMM vs cuBLAS `GemmEx` at the DiT FFN/qkv shapes (3070, sm_86).
+The WMMA kernel is **bit-identical** to cuBLAS but **0.12–0.56×** its speed, and cuBLAS runs
+these GEMMs at **18–31 TFLOP/s** (≈50–78 % of the ~40 TFLOP/s fp16-tensor peak) at only
+**49–138 GB/s** (≪ 448 GB/s HBM) — i.e. **compute-bound, not memory-bound**, so a megakernel's
+HBM-traffic savings buy nothing on the GEMMs. Crossover model: per-block weights 33.6/75.5 MB
+(small/medium) stream regardless; activation share 35 %→69 % of HBM traffic over S=172→710;
+ideal free-GEMM fusion ceiling 1.18×→1.53× (crossover S≈315/473), much of it already L2-resident.
+Verdict: a 3–8× GEMM penalty vs a ≤1.53× ceiling on compute-bound kernels → **not worth it**;
+cuBLAS+graph+glue-fusion is at/near the roofline. The crossover analysis is the paper result.
+
 ## Streaming / continuation on GPU (small-music, 8 steps, RTX 3070)
 
 Continue/inpaint used to be gated to the CPU DiT (the local-additive inpaint cond was

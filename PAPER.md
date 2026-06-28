@@ -129,6 +129,35 @@ the path for A/B.
   weight/compute, not launches. The graph is the right *low-risk* tier; the bigger lever is
   the True-Megakernel GEMM fusion, which must beat cuBLAS to pay off (the crossover study).
 
+**Measured — True Megakernel verdict: NOT worth building (the crossover analysis is the
+contribution).** Implemented a from-scratch WMMA (m16n16k16, fp16-in/fp32-acc) tiled tensor-
+core GEMM and benchmarked it against cuBLAS `GemmEx` at the DiT FFN/qkv shapes on the 3070
+(`tests/bench_megakernel.cu`). Three findings settle it:
+1. **cuBLAS is compute-bound near the tensor-core roofline, NOT memory-bound.** It runs the
+   FFN GEMMs at **18–31 TFLOP/s** (≈50–78 % of the 3070's ~40 TFLOP/s fp16-tensor peak) while
+   moving only **49–138 GB/s** — far under the 448 GB/s HBM peak. A megakernel's *only* lever
+   is cutting HBM traffic, which gives **zero speedup on a compute-bound kernel**. The GEMMs
+   that dominate the block are exactly that.
+2. **A hand-rolled tensor-core GEMM can't beat (or match) cuBLAS here.** The WMMA kernel is
+   **bit-identical** to cuBLAS (max |Δ|=0) but **0.12–0.56×** its speed (3–8× slower; naive,
+   latency-bound — no `cp.async` double-buffering, swizzled shared layouts, or split-K).
+   cuBLAS is near peak, so there is no headroom *above* it; matching it means re-deriving
+   CUTLASS — at which point the "from-scratch megakernel" novelty is gone.
+3. **Even a *free* GEMM caps the fusion win low.** The analytical crossover (RTX 3070, 448 GB/s,
+   6 MB L2): per-block weights **33.6 MB (small) / 75.5 MB (medium)** stream from HBM regardless
+   (don't fit on-chip); the only fusable traffic is the activation round-trip. Activation share
+   = **35 %** of HBM traffic at S=172 (≈10 s) rising to **69 %** at S=710 (≈60 s); ideal (free-
+   GEMM) speedup **1.18×** (10 s) → **1.53×** (60 s), crossover S≈315 (small)/473 (medium). And
+   much of that activation traffic is already **L2-resident** (the [S,2·inner] intermediate fits
+   6 MB L2 at these S), so the real ceiling is lower still.
+
+→ **Net:** a 3–8× GEMM penalty (or a CUTLASS-scale effort just to break even) versus a ≤1.53×
+fusion ceiling that audio's short sequences barely reach, on kernels that aren't even memory-
+bound. The True Megakernel **loses** for short-sequence audio diffusion; **cuBLAS + CUDA Graphs
++ the glue fusions is at/near the roofline**. This negative/crossover result — *when* would a
+diffusion megakernel pay off (only once S pushes activations past weights AND a kernel matches
+cuBLAS) — is itself the paper's systems contribution, and it justifies the engineering choice.
+
 ---
 
 ## 5. Direction 2 — streaming / interactive generation (the one to build now)
