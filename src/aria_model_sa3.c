@@ -381,7 +381,7 @@ static int sa3_generate(aria_ctx *ctx, void *state,
         struct rusage ru; getrusage(RUSAGE_SELF, &ru);
         double cur_rss = 0;   /* current resident set (post host-weight drop on GPU) */
         FILE *sf = fopen("/proc/self/statm", "r");
-        if (sf) { long pages = 0; if (fscanf(sf, "%*ld %ld", &pages) == 1) cur_rss = pages * 4096.0 / 1048576.0; fclose(sf); }
+        if (sf) { long sz = 0, res = 0; if (fscanf(sf, "%ld %ld", &sz, &res) == 2) cur_rss = res * 4096.0 / 1048576.0; fclose(sf); }
         fprintf(stderr, "[aria] profile: setup=%.2fs dit=%.2fs decode=%.2fs (T=%d steps=%d) | RSS cur %.0f / peak %.0f MB",
                 t1 - t0, t2 - t1, t3 - t2, T, steps, cur_rss, ru.ru_maxrss / 1024.0);
 #ifdef ARIA_CUDA

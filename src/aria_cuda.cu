@@ -680,14 +680,8 @@ extern "C" aria_cuda_dit *aria_cuda_dit_create(const aria_sa3_dit_view *v, aria_
     size_t attn_per = v->differential ? 9 : 6;
     size_t attn_elem = (size_t)v->depth * attn_per * (size_t)ed * ed;
     size_t ffn_elem  = (size_t)v->depth * 3 * (size_t)inner * ed;
-    /* ca_to_kv is always Q8 (1 B/elem): projected once per request, not per step, so
-     * Q8 halves it vs fp16 (340->170 MB on medium) at negligible speed cost. */
-    size_t kv_elem = (size_t)v->depth * (v->differential ? 3 : 2) * (size_t)ed * ed;
-    size_t wbytes = ((precision == ARIA_F32) ? (attn_elem + ffn_elem) * 2 : (attn_elem + ffn_elem)) + kv_elem;
-    /* dequant scratch: ca_to_kv (always) + the FFN when fully quantized (bigger). */
-    size_t dqsz = (size_t)(v->differential ? 3 : 2) * ed * ed;
-    if (precision != ARIA_F32 && (size_t)2 * inner * ed > dqsz) dqsz = (size_t)2 * inner * ed;
-    size_t need = wbytes + dqsz * sizeof(__half) + (64u << 20);
+    size_t wbytes = (precision == ARIA_F32) ? (attn_elem + ffn_elem) * 2 : (attn_elem + ffn_elem);
+    size_t need = wbytes + (precision != ARIA_F32 ? (size_t)2 * inner * ed * sizeof(__half) : 0) + (64u << 20);
     size_t freeb = 0, totb = 0; cudaMemGetInfo(&freeb, &totb);
     if (freeb < need) { fprintf(stderr, "aria_cuda_dit: need ~%zu MiB, only %zu free\n", need >> 20, freeb >> 20); return NULL; }
 
@@ -696,7 +690,7 @@ extern "C" aria_cuda_dit *aria_cuda_dit_create(const aria_sa3_dit_view *v, aria_
     h->inner = inner; h->io_ch = v->io_ch; h->n_mem = v->n_mem; h->rot = v->rot_dim;
     h->precision = precision; h->differential = v->differential;
     if (cublasCreate(&h->cublas) != CUBLAS_STATUS_SUCCESS) { free(h); return NULL; }
-    CK(cudaMalloc(&h->dqbuf, dqsz * sizeof(__half)));   /* needed for the Q8 ca_to_kv dequant too */
+    if (precision != ARIA_F32) { CK(cudaMalloc(&h->dqbuf, (size_t)2 * inner * ed * sizeof(__half))); }
     int C = v->io_ch;
     h->preprocess  = upload_f16(v->preprocess,  (size_t)C * C);
     h->postprocess = upload_f16(v->postprocess, (size_t)C * C);
@@ -728,12 +722,12 @@ extern "C" aria_cuda_dit *aria_cuda_dit_create(const aria_sa3_dit_view *v, aria_
         u &= upload_dqw(&d->ca_to_out, s->ca_to_out, ed, ed, adt);
         /* cross K/V projection: device-resident, projected once per request from
          * cross_ed (kept f16/f32, error-sensitive -- not quantized). */
-        u &= upload_dqw(&d->ca_to_kv,  s->ca_to_kv,  nkv * ed, ed, ARIA_Q8);   /* once/request -> Q8 */
+        u &= upload_dqw(&d->ca_to_kv,  s->ca_to_kv,  nkv * ed, ed, ARIA_F32);   /* cross-K/V is fidelity-sensitive: keep fp16 */
         u &= upload_dqw(&d->ff_in_w,   s->ff_in_w,   2 * inner, ed, precision);
         u &= upload_dqw(&d->ff_out_w,  s->ff_out_w,  ed, inner, precision);
         ok = u && d->ssg && d->pre_norm && d->ca_k_norm;
     }
-    if (!h->dqbuf) ok = 0;   /* always needed now (Q8 ca_to_kv dequant) */
+    if (precision != ARIA_F32 && !h->dqbuf) ok = 0;
     if (!ok) { aria_cuda_dit_free(h); return NULL; }
     return h;
 }
