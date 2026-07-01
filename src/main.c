@@ -82,7 +82,7 @@ static const opt_spec OPTS[] = {
     {K_PREC,     "precision",     0,  A_ONE,  "<p>",        "generate", "fp32 | fp16 | bf16 | q8 | q4 (q8/q4 force CPU)"},
     {K_LOADQ,    "load-quant",    0,  A_ONE,  "<file>",     "generate", "load a pre-quantized .aria DiT overlay"},
     {K_RNG,      "rng",           0,  A_ONE,  "<mode>",     "generate", "xoshiro (default) | torch (parity)"},
-    {K_STEER,    "steer",         0,  A_ONE,  "<spec>",     "generate", "activation steering site:layer:dir.atns:scale:lo-hi (repeatable; forces CPU)"},
+    {K_STEER,    "steer",         0,  A_ONE,  "<spec>",     "generate", "steer site:layer:dir.atns:scale:lo-hi[:add|project] (repeatable; CPU+GPU)"},
     {K_BENCH,    "bench",         0,  A_ONE,  "<n>",        "generate", "generate N times resident, report warm-min"},
 
     {K_CONTINUE, "continue",      0,  A_ONE,  "<in.wav>",   "edit",     "extend a clip (GPU or CPU)"},
@@ -209,9 +209,9 @@ static int build_steer_set(const cli_config *cfg, aria_steer *items, aria_steer_
         char buf[1024];
         snprintf(buf, sizeof buf, "%s", cfg->steer_specs[i]);
         char *site = strtok(buf, ":"), *layer = strtok(NULL, ":"), *path = strtok(NULL, ":");
-        char *scale = strtok(NULL, ":"), *win = strtok(NULL, ":");
+        char *scale = strtok(NULL, ":"), *win = strtok(NULL, ":"), *op = strtok(NULL, ":");
         if (!site || !layer || !path || !scale) {
-            fprintf(stderr, "bad --steer '%s' (want site:layer:dir.atns:scale:lo-hi)\n", cfg->steer_specs[i]);
+            fprintf(stderr, "bad --steer '%s' (want site:layer:dir.atns:scale:lo-hi[:add|project])\n", cfg->steer_specs[i]);
             return 1;
         }
         aria_steer_site s;
@@ -219,6 +219,11 @@ static int build_steer_set(const cli_config *cfg, aria_steer *items, aria_steer_
         else if (!strcmp(site, "latent"))   s = ARIA_STEER_LATENT;
         else if (!strcmp(site, "cond"))     s = ARIA_STEER_COND;
         else { fprintf(stderr, "unknown --steer site '%s' (residual|latent|cond)\n", site); return 1; }
+        aria_steer_op o = ARIA_STEER_ADD;
+        if (op) {
+            if      (!strcmp(op, "project") || !strcmp(op, "ablate")) o = ARIA_STEER_PROJECT;
+            else if (strcmp(op, "add")) { fprintf(stderr, "unknown --steer op '%s' (add|project)\n", op); return 1; }
+        }
         aria_parity_tensor t;
         if (aria_parity_load(path, &t) != 0) { fprintf(stderr, "cannot load steer direction %s\n", path); return 1; }
         float *d = malloc((size_t)t.numel * sizeof(float));
@@ -226,11 +231,12 @@ static int build_steer_set(const cli_config *cfg, aria_steer *items, aria_steer_
         aria_parity_free(&t);
         int lo = 0, hi = 1 << 30;
         if (win) sscanf(win, "%d-%d", &lo, &hi);
+        double n2 = 0; for (int c = 0; c < (int)t.numel; c++) n2 += (double)d[c] * d[c];
         aria_steer *it = &items[set->n];
-        it->site = s; it->layer = atoi(layer); it->dir = d; it->dim = (int)t.numel;
-        it->scale = (float)atof(scale); it->step_lo = lo; it->step_hi = hi;
-        fprintf(stderr, "[steer] %s layer=%d dim=%d scale=%.4g steps[%d,%d] <- %s\n",
-                site, it->layer, it->dim, it->scale, lo, hi, path);
+        it->site = s; it->op = o; it->layer = atoi(layer); it->dir = d; it->dim = (int)t.numel;
+        it->dir_norm2 = (float)n2; it->scale = (float)atof(scale); it->step_lo = lo; it->step_hi = hi;
+        fprintf(stderr, "[steer] %s/%s layer=%d dim=%d scale=%.4g steps[%d,%d] <- %s\n",
+                site, o == ARIA_STEER_PROJECT ? "project" : "add", it->layer, it->dim, it->scale, lo, hi, path);
         set->n++;
     }
     return 0;

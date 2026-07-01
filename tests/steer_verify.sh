@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# E12 steering-mechanism verification (3 gates). Usage: tests/steer_verify.sh <model_dir>
-#   GATE1  scale-0 == unsteered (byte-identical)      -> the hook is a bit-exact no-op
-#   GATE2  steered != unsteered                       -> the steer has a deterministic effect
-#   GATE3  steer(2a,d) == steer(a,2d) (byte-identical) -> the op is exactly scale*dir (linear)
+# E12 steering-mechanism verification (5 gates). Usage: tests/steer_verify.sh <model_dir>
+#   GATE1  add scale-0 == unsteered (byte-identical)      -> the hook is a bit-exact no-op
+#   GATE2  add steered != unsteered                       -> the steer has a deterministic effect
+#   GATE3  add(2a,d) == add(a,2d) (byte-identical)        -> ADD op is exactly scale*dir (linear)
+#   GATE4  project scale-0 == unsteered (byte-identical)  -> PROJECT is also a bit-exact no-op
+#   GATE5  project(a,d) == project(a,2d) (byte-identical) -> PROJECT uses the unit (||dir||-invariant)
 # Runs single-threaded so byte-identical comparisons aren't flaky under OMP reduction-order
 # variance. Builds a synthetic [1024] direction (no model/dataset needed).
 set -e
@@ -25,9 +27,14 @@ $A --steer residual:16:"$T/d.atns":0.0:0-7  -o "$T/s0.wav"   >/dev/null 2>&1
 $A --steer residual:16:"$T/d.atns":0.2:0-7  -o "$T/sa.wav"   >/dev/null 2>&1
 $A --steer residual:16:"$T/d.atns":0.4:0-7  -o "$T/s2a.wav"  >/dev/null 2>&1
 $A --steer residual:16:"$T/2d.atns":0.2:0-7 -o "$T/sa2d.wav" >/dev/null 2>&1
+$A --steer residual:16:"$T/d.atns":0.0:0-7:project  -o "$T/pp0.wav"  >/dev/null 2>&1
+$A --steer residual:16:"$T/d.atns":0.2:0-7:project  -o "$T/ppd.wav"  >/dev/null 2>&1
+$A --steer residual:16:"$T/2d.atns":0.2:0-7:project -o "$T/pp2d.wav" >/dev/null 2>&1
 fail=0
-cmp -s "$T/uns.wav" "$T/s0.wav"  && echo "GATE1 scale-0==unsteered: PASS"               || { echo "GATE1: FAIL"; fail=1; }
-cmp -s "$T/uns.wav" "$T/sa.wav"  && { echo "GATE2 effect: FAIL"; fail=1; }              || echo "GATE2 steered!=unsteered: PASS"
-cmp -s "$T/s2a.wav" "$T/sa2d.wav" && echo "GATE3 linearity (exactly scale*dir): PASS"   || { echo "GATE3: FAIL"; fail=1; }
+cmp -s "$T/uns.wav" "$T/s0.wav"  && echo "GATE1 add scale-0==unsteered: PASS"            || { echo "GATE1: FAIL"; fail=1; }
+cmp -s "$T/uns.wav" "$T/sa.wav"  && { echo "GATE2 effect: FAIL"; fail=1; }              || echo "GATE2 add steered!=unsteered: PASS"
+cmp -s "$T/s2a.wav" "$T/sa2d.wav" && echo "GATE3 add linearity (exactly scale*dir): PASS" || { echo "GATE3: FAIL"; fail=1; }
+cmp -s "$T/uns.wav" "$T/pp0.wav" && echo "GATE4 project scale-0==unsteered: PASS"        || { echo "GATE4: FAIL"; fail=1; }
+cmp -s "$T/ppd.wav" "$T/pp2d.wav" && echo "GATE5 project ||dir||-invariant: PASS"        || { echo "GATE5: FAIL"; fail=1; }
 [ $fail -eq 0 ] && echo "steer-verify: ALL PASS" || echo "steer-verify: FAILED"
 exit $fail

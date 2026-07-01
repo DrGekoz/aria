@@ -16,12 +16,21 @@
 #define ARIA_STEER_H
 
 typedef enum { ARIA_STEER_RESIDUAL = 0, ARIA_STEER_LATENT, ARIA_STEER_COND } aria_steer_site;
+/* op: ADD = activation addition (x += scale*dir; the ActAdd / MusicRFM family, and the
+ * sf-api injector). PROJECT = directional projection/ablation (x -= scale*(x.u)*u, with unit
+ * u = dir/||dir||; Arditi et al. 2024 "refusal is a single direction" / ds4 dir-steering):
+ * scale>0 removes the direction's component, scale<0 amplifies it. PROJECT depends only on the
+ * unit direction, so it is invariant to ||dir||. */
+typedef enum { ARIA_STEER_ADD = 0, ARIA_STEER_PROJECT } aria_steer_op;
 
 typedef struct {
     aria_steer_site site;   /* where to inject (residual = DiT block output, per layer) */
+    aria_steer_op op;       /* ADD (default) or PROJECT/ablate */
     int   layer;            /* DiT block index (site=residual); ignored otherwise */
-    const float *dir;       /* [dim] calibrated direction; caller-owned */
+    const float *dir;       /* [dim] direction; caller-owned. ADD uses it as-is (calibrated
+                             * norm*unit); PROJECT normalizes it via dir_norm2. */
     int   dim;              /* direction length (1024 for small-music residual) */
+    float dir_norm2;        /* ||dir||^2 over [0,dim) (PROJECT only; precomputed by the caller) */
     float scale;            /* alpha multiplier; 0 = bit-exact no-op */
     int   step_lo, step_hi; /* inclusive denoise-step window the steer is active in */
 } aria_steer;

@@ -199,17 +199,29 @@ static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
     gate_sigmoid(o, gate_ff, S, dim);
     for (size_t i = 0; i < (size_t)S * dim; i++) x[i] += o[i];   /* in-place residual add */
 
-    /* ---------- E12 residual steering: add scale*dir to the block output, broadcast over
-     * all tokens, gated by layer + step-window (matches sa3-sf-api AdditiveInjector). The
-     * scale==0 / out-of-window paths skip entirely, so they stay bit-exact. ---------- */
+    /* ---------- E12 residual steering at the block output, broadcast over all tokens, gated
+     * by layer + step-window. ADD = x += scale*dir (AdditiveInjector). PROJECT = x -= scale *
+     * (x.u) u  (Arditi/ds4 directional ablation; u = dir/||dir||, so per token subtract
+     * scale*(dot(dir,x)/||dir||^2)*dir). scale==0 / out-of-window skip -> bit-exact. ---------- */
     if (steer) for (int s = 0; s < steer->n; s++) {
         const aria_steer *st = &steer->items[s];
         if (st->site != ARIA_STEER_RESIDUAL || st->layer != layer_idx) continue;
         if (st->scale == 0.0f || step < st->step_lo || step > st->step_hi) continue;
         int d = st->dim < dim ? st->dim : dim;
-        for (int t = 0; t < S; t++)
-            for (int c = 0; c < d; c++)
-                x[(size_t)t * dim + c] += st->scale * st->dir[c];
+        if (st->op == ARIA_STEER_PROJECT) {
+            float inv = st->dir_norm2 > 0.0f ? 1.0f / st->dir_norm2 : 0.0f;
+            for (int t = 0; t < S; t++) {
+                float *xt = x + (size_t)t * dim;
+                float dot = 0.0f;
+                for (int c = 0; c < d; c++) dot += st->dir[c] * xt[c];
+                float k = st->scale * dot * inv;
+                for (int c = 0; c < d; c++) xt[c] -= k * st->dir[c];
+            }
+        } else {
+            for (int t = 0; t < S; t++)
+                for (int c = 0; c < d; c++)
+                    x[(size_t)t * dim + c] += st->scale * st->dir[c];
+        }
     }
 
     aria_arena_restore(ar, mark);

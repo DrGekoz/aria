@@ -441,12 +441,29 @@ __global__ void k_gate_add(float *out, const float *residual, const float *o,
     int i = (int)(idx % dim);
     out[idx] = residual[idx] + o[idx] * (1.0f / (1.0f + expf(-(1.0f - gate[i]))));
 }
-/* E12 residual steering: seq[t,c] += scale * dir[c] for c < ddim, broadcast over all S tokens. */
+/* E12 residual steering (ADD): seq[t,c] += scale * dir[c] for c < ddim, broadcast over all S tokens. */
 __global__ void k_steer_add(float *seq, const float *dir, float scale, int S, int dim, int ddim) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (size_t)S * dim) return;
     int c = (int)(idx % dim);
     if (c < ddim) seq[idx] += scale * dir[c];
+}
+/* E12 directional ablation (PROJECT): seq[t] -= scale*(dot(dir,seq[t])/||dir||^2)*dir, per token.
+ * One block per token; blockDim.x-wide reduction of the dot product. */
+__global__ void k_steer_project(float *seq, const float *dir, float scale, float inv_norm2,
+                                int S, int dim, int ddim) {
+    int t = blockIdx.x; if (t >= S) return;
+    __shared__ float red[RED_TH];
+    float *xt = seq + (size_t)t * dim;
+    float partial = 0.0f;
+    for (int c = threadIdx.x; c < ddim; c += blockDim.x) partial += dir[c] * xt[c];
+    red[threadIdx.x] = partial; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    float k = scale * red[0] * inv_norm2;
+    for (int c = threadIdx.x; c < ddim; c += blockDim.x) xt[c] -= k * dir[c];
 }
 __global__ void k_extract_heads(float *dst, const float *src, int S, int H, int hd, int stride, int off) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;   /* (h*S+s)*hd+d */
@@ -712,7 +729,12 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
         if (st->site != ARIA_STEER_RESIDUAL || st->layer != blk || st->scale == 0.0f) continue;
         if (h->cur_step < st->step_lo || h->cur_step > st->step_hi) continue;
         if (!h->d_steer_dir[s]) continue;
-        k_steer_add<<<nSd, THREADS>>>(seq, h->d_steer_dir[s], st->scale, S, dim, st->dim);
+        if (st->op == ARIA_STEER_PROJECT) {
+            float inv = st->dir_norm2 > 0.0f ? 1.0f / st->dir_norm2 : 0.0f;
+            k_steer_project<<<S, RED_TH>>>(seq, h->d_steer_dir[s], st->scale, inv, S, dim, st->dim);
+        } else {
+            k_steer_add<<<nSd, THREADS>>>(seq, h->d_steer_dir[s], st->scale, S, dim, st->dim);
+        }
     }
 
     da_restore(ar, mark);
