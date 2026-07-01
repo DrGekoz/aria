@@ -279,6 +279,25 @@ __global__ void k_softmax(float *x, int rows, int cols, const float *mask) {
 __global__ void k_scale(float *y, const float *x, float a, int n) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < (size_t)n) y[i] = x[i] * a;
 }
+/* k_softmax with fp16 output: identical fp32 math (x is the fp32 scratch), the final
+ * normalize writes __float2half(e*inv) straight into the AV GEMM's half buffer -- same
+ * RTNE value the old separate k_f32_to_f16 pass produced, one S*S*H round-trip less. */
+__global__ void k_softmax_f16(float *x, __half *out, int rows, int cols) {
+    int r = blockIdx.x; if (r >= rows) return;
+    float *xr = x + (size_t)r * cols; __half *orow = out + (size_t)r * cols;
+    __shared__ float red[RED_TH];
+    float mx = -INFINITY;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) mx = fmaxf(mx, xr[i]);
+    red[threadIdx.x] = mx; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]); __syncthreads(); }
+    mx = red[0]; __syncthreads();
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) { float e = expf(xr[i] - mx); xr[i] = e; sum += e; }
+    red[threadIdx.x] = sum; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s]; __syncthreads(); }
+    float inv = red[0] > 0.0f ? 1.0f / red[0] : 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) orow[i] = __float2half(xr[i] * inv);
+}
 extern "C" void aria_cuda_softmax(float *x, int rows, int cols, const float *mask) {
     float *dx = d_in(x, (size_t)rows * cols), *dm = mask ? d_in(mask, (size_t)rows * cols) : NULL;
     k_softmax<<<rows, RED_TH>>>(dx, rows, cols, dm); CK(cudaGetLastError());
@@ -519,10 +538,11 @@ static void attn_dev(cublasHandle_t cb, darena *ar, float *out, const float *q, 
     const float scale = 1.0f / sqrtf((float)D), one = 1.0f, zero = 0.0f;
     size_t ns = (size_t)H * Nq * Nk;
     if (!fp16) {
+        /* 1/sqrt(D) folded into the QK^T alpha (cuBLAS applies alpha to the accumulated
+         * product -- same op/order as the old separate k_scale pass, one S*S*H pass less). */
         cublasSgemmStridedBatched(cb, CUBLAS_OP_T, CUBLAS_OP_N, Nk, Nq, D,
-            &one, k, D, (long long)Nk * D, q, D, (long long)Nq * D,
+            &scale, k, D, (long long)Nk * D, q, D, (long long)Nq * D,
             &zero, scores, Nk, (long long)Nq * Nk, H);
-        k_scale<<<nblocks(ns), THREADS>>>(scores, scores, scale, H * Nq * Nk);
         k_softmax<<<H * Nq, RED_TH>>>(scores, H * Nq, Nk, NULL);
         cublasSgemmStridedBatched(cb, CUBLAS_OP_N, CUBLAS_OP_N, D, Nq, Nk,
             &one, v, D, (long long)Nk * D, scores, Nk, (long long)Nq * Nk,
@@ -536,12 +556,12 @@ static void attn_dev(cublasHandle_t cb, darena *ar, float *out, const float *q, 
     k_f32_to_f16<<<nblocks(nq), THREADS>>>(qh, q, nq);
     k_f32_to_f16<<<nblocks(nk), THREADS>>>(kh, k, nk);
     k_f32_to_f16<<<nblocks(nk), THREADS>>>(vh, v, nk);
+    /* alpha = 1/sqrt(D) folded into QK^T (drops the k_scale S*S*H pass); softmax writes the
+     * fp16 probabilities for the AV GEMM directly (drops the k_f32_to_f16 S*S*H pass). */
     cublasGemmStridedBatchedEx(cb, CUBLAS_OP_T, CUBLAS_OP_N, Nk, Nq, D,
-        &one, kh, CUDA_R_16F, D, (long long)Nk * D, qh, CUDA_R_16F, D, (long long)Nq * D,
+        &scale, kh, CUDA_R_16F, D, (long long)Nk * D, qh, CUDA_R_16F, D, (long long)Nq * D,
         &zero, scores, CUDA_R_32F, Nk, (long long)Nq * Nk, H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-    k_scale<<<nblocks(ns), THREADS>>>(scores, scores, scale, H * Nq * Nk);
-    k_softmax<<<H * Nq, RED_TH>>>(scores, H * Nq, Nk, NULL);
-    k_f32_to_f16<<<nblocks(ns), THREADS>>>(sh, scores, ns);
+    k_softmax_f16<<<H * Nq, RED_TH>>>(scores, sh, H * Nq, Nk);
     cublasGemmStridedBatchedEx(cb, CUBLAS_OP_N, CUBLAS_OP_N, D, Nq, Nk,
         &one, vh, CUDA_R_16F, D, (long long)Nk * D, sh, CUDA_R_16F, Nk, (long long)Nq * Nk,
         &zero, out, CUDA_R_32F, D, (long long)Nq * D, H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
