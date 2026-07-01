@@ -45,6 +45,7 @@ typedef struct {
     int do_info, do_list, do_generate, do_stream, inpaint_continue, stream_hold, rng_torch;
     int util;                               /* 0 none / 1 wav-roundtrip / 2 hpss-test */
     const char *steer_specs[16]; int n_steer;   /* E12: repeatable --steer site:layer:dir.atns:scale:lo-hi */
+    const char *batch_file;                 /* E13: --batch jobs TSV (resident multi-gen) */
 } cli_config;
 
 static cli_config cli_defaults(void) {
@@ -60,6 +61,7 @@ enum {   /* keys: short flags use their ASCII char; long-only options use ids pa
     K_SEED=256, K_DEVICE, K_BENCH, K_UNCOND, K_PEMB, K_INFO, K_LIST,
     K_INPAINT, K_CONTINUE, K_FROM, K_TO, K_PREC, K_LOADQ, K_RNG,
     K_STREAM, K_CHUNK, K_CTX, K_CHUNKS, K_HOLD, K_WAVRT, K_HPSS, K_STEER,
+    K_BATCH,
 };
 typedef enum { A_NONE, A_ONE, A_TWO, A_OPT } argkind;  /* flag / 1 arg / 2 args / optional 1 arg */
 typedef struct {
@@ -84,6 +86,7 @@ static const opt_spec OPTS[] = {
     {K_RNG,      "rng",           0,  A_ONE,  "<mode>",     "generate", "xoshiro (default) | torch (parity)"},
     {K_STEER,    "steer",         0,  A_ONE,  "<spec>",     "generate", "steer site:layer:dir.atns:scale:lo-hi[:add|project] (repeatable; CPU+GPU)"},
     {K_BENCH,    "bench",         0,  A_ONE,  "<n>",        "generate", "generate N times resident, report warm-min"},
+    {K_BATCH,    "batch",         0,  A_ONE,  "<jobs.tsv>", "generate", "run jobs (out<TAB>seed<TAB>steer|-<TAB>prompt) against one resident model"},
 
     {K_CONTINUE, "continue",      0,  A_ONE,  "<in.wav>",   "edit",     "extend a clip (GPU or CPU)"},
     {K_INPAINT,  "inpaint",       0,  A_ONE,  "<in.wav>",   "edit",     "regenerate a region of a clip"},
@@ -144,6 +147,7 @@ static int cli_apply(int key, char **a, cli_config *c) {
     case K_STEER:
         if (c->n_steer >= 16) { fprintf(stderr, "too many --steer (max 16)\n"); return 1; }
         c->steer_specs[c->n_steer++] = a[0]; break;
+    case K_BATCH:  c->batch_file = a[0]; break;
     case K_INFO:   c->do_info = 1; break;
     case K_LIST:   c->do_list = 1; if (a[0]) c->list_prefix = a[0]; break;
     case K_WAVRT:  c->util = 1; c->util_a = a[0]; c->util_b = a[1]; break;
@@ -200,49 +204,113 @@ static int cli_parse(int argc, char **argv, cli_config *c) {
     return 0;
 }
 
-/* E12: parse the repeatable --steer specs (site:layer:dir.atns:scale:lo-hi) into a steer set,
- * loading each .atns direction. `items` is caller storage [>=n_steer]; on success fills `set`
- * (free each set->items[i].dir with free_steer_set after generation). Returns 0, or 1 on error. */
+/* E12: parse ONE steer spec (site:layer:dir.atns:scale:lo-hi[:add|project]) into *it,
+ * loading the .atns direction (caller frees it->dir, e.g. via free_steer_set). 0 ok / 1 error. */
+static int parse_steer_spec(const char *spec, aria_steer *it) {
+    char buf[1024];
+    snprintf(buf, sizeof buf, "%s", spec);
+    char *site = strtok(buf, ":"), *layer = strtok(NULL, ":"), *path = strtok(NULL, ":");
+    char *scale = strtok(NULL, ":"), *win = strtok(NULL, ":"), *op = strtok(NULL, ":");
+    if (!site || !layer || !path || !scale) {
+        fprintf(stderr, "bad --steer '%s' (want site:layer:dir.atns:scale:lo-hi[:add|project])\n", spec);
+        return 1;
+    }
+    aria_steer_site s;
+    if      (!strcmp(site, "residual")) s = ARIA_STEER_RESIDUAL;
+    else if (!strcmp(site, "latent"))   s = ARIA_STEER_LATENT;
+    else if (!strcmp(site, "cond"))     s = ARIA_STEER_COND;
+    else { fprintf(stderr, "unknown --steer site '%s' (residual|latent|cond)\n", site); return 1; }
+    aria_steer_op o = ARIA_STEER_ADD;
+    if (op) {
+        if      (!strcmp(op, "project") || !strcmp(op, "ablate")) o = ARIA_STEER_PROJECT;
+        else if (strcmp(op, "add")) { fprintf(stderr, "unknown --steer op '%s' (add|project)\n", op); return 1; }
+    }
+    aria_parity_tensor t;
+    if (aria_parity_load(path, &t) != 0) { fprintf(stderr, "cannot load steer direction %s\n", path); return 1; }
+    float *d = malloc((size_t)t.numel * sizeof(float));
+    memcpy(d, t.data, (size_t)t.numel * sizeof(float));
+    aria_parity_free(&t);
+    int lo = 0, hi = 1 << 30;
+    if (win) sscanf(win, "%d-%d", &lo, &hi);
+    double n2 = 0; for (int c = 0; c < (int)t.numel; c++) n2 += (double)d[c] * d[c];
+    it->site = s; it->op = o; it->layer = atoi(layer); it->dir = d; it->dim = (int)t.numel;
+    it->dir_norm2 = (float)n2; it->scale = (float)atof(scale); it->step_lo = lo; it->step_hi = hi;
+    fprintf(stderr, "[steer] %s/%s layer=%d dim=%d scale=%.4g steps[%d,%d] <- %s\n",
+            site, o == ARIA_STEER_PROJECT ? "project" : "add", it->layer, it->dim, it->scale, lo, hi, path);
+    return 0;
+}
+
+/* E12: parse the repeatable --steer specs into a steer set. `items` is caller storage
+ * [>=n_steer]; on success fills `set` (free with free_steer_set after generation). */
 static int build_steer_set(const cli_config *cfg, aria_steer *items, aria_steer_set *set) {
     set->items = items; set->n = 0;
     for (int i = 0; i < cfg->n_steer; i++) {
-        char buf[1024];
-        snprintf(buf, sizeof buf, "%s", cfg->steer_specs[i]);
-        char *site = strtok(buf, ":"), *layer = strtok(NULL, ":"), *path = strtok(NULL, ":");
-        char *scale = strtok(NULL, ":"), *win = strtok(NULL, ":"), *op = strtok(NULL, ":");
-        if (!site || !layer || !path || !scale) {
-            fprintf(stderr, "bad --steer '%s' (want site:layer:dir.atns:scale:lo-hi[:add|project])\n", cfg->steer_specs[i]);
-            return 1;
-        }
-        aria_steer_site s;
-        if      (!strcmp(site, "residual")) s = ARIA_STEER_RESIDUAL;
-        else if (!strcmp(site, "latent"))   s = ARIA_STEER_LATENT;
-        else if (!strcmp(site, "cond"))     s = ARIA_STEER_COND;
-        else { fprintf(stderr, "unknown --steer site '%s' (residual|latent|cond)\n", site); return 1; }
-        aria_steer_op o = ARIA_STEER_ADD;
-        if (op) {
-            if      (!strcmp(op, "project") || !strcmp(op, "ablate")) o = ARIA_STEER_PROJECT;
-            else if (strcmp(op, "add")) { fprintf(stderr, "unknown --steer op '%s' (add|project)\n", op); return 1; }
-        }
-        aria_parity_tensor t;
-        if (aria_parity_load(path, &t) != 0) { fprintf(stderr, "cannot load steer direction %s\n", path); return 1; }
-        float *d = malloc((size_t)t.numel * sizeof(float));
-        memcpy(d, t.data, (size_t)t.numel * sizeof(float));
-        aria_parity_free(&t);
-        int lo = 0, hi = 1 << 30;
-        if (win) sscanf(win, "%d-%d", &lo, &hi);
-        double n2 = 0; for (int c = 0; c < (int)t.numel; c++) n2 += (double)d[c] * d[c];
-        aria_steer *it = &items[set->n];
-        it->site = s; it->op = o; it->layer = atoi(layer); it->dir = d; it->dim = (int)t.numel;
-        it->dir_norm2 = (float)n2; it->scale = (float)atof(scale); it->step_lo = lo; it->step_hi = hi;
-        fprintf(stderr, "[steer] %s/%s layer=%d dim=%d scale=%.4g steps[%d,%d] <- %s\n",
-                site, o == ARIA_STEER_PROJECT ? "project" : "add", it->layer, it->dim, it->scale, lo, hi, path);
+        if (parse_steer_spec(cfg->steer_specs[i], &items[set->n]) != 0) return 1;
         set->n++;
     }
     return 0;
 }
 static void free_steer_set(aria_steer_set *set) {
     for (int i = 0; i < set->n; i++) free((void *)set->items[i].dir);
+}
+
+/* E13: batch mode -- run many generations against ONE resident ctx, amortizing model
+ * open/parse, GPU weight upload/quantize and per-prompt text encoding (the caches in
+ * aria_model_sa3 -- cached_emb, cdit, cdec -- only live per process; one-shot CLI sweeps
+ * re-pay them every invocation). Jobs file: one line per job,
+ *   out.wav<TAB>seed<TAB>steer-spec|-<TAB>prompt
+ * '#'/empty lines skipped. Duration/steps/device/precision are shared from the CLI. */
+static int cmd_batch(aria_ctx *ctx, const cli_config *cfg) {
+    FILE *fh = fopen(cfg->batch_file, "r");
+    if (!fh) { fprintf(stderr, "cannot open batch file %s\n", cfg->batch_file); return 1; }
+    char line[4096];
+    int ok = 0, failed = 0;
+    struct timespec tb0, tb1;
+    clock_gettime(CLOCK_MONOTONIC, &tb0);
+    while (fgets(line, sizeof line, fh)) {
+        char *nl = strchr(line, '\n'); if (nl) *nl = 0;
+        if (!line[0] || line[0] == '#') continue;
+        char *save = NULL;
+        char *out    = strtok_r(line, "\t", &save);
+        char *seed   = strtok_r(NULL, "\t", &save);
+        char *spec   = strtok_r(NULL, "\t", &save);
+        char *prompt = save;   /* rest of the line (prompts may contain ':' etc., not tabs) */
+        if (!out || !seed || !spec || !prompt || !prompt[0]) {
+            fprintf(stderr, "[batch] bad line (want out<TAB>seed<TAB>steer|-<TAB>prompt)\n");
+            failed++; continue;
+        }
+        aria_gen_params p = ARIA_GEN_PARAMS_DEFAULT;
+        p.prompt = prompt; p.seconds_total = cfg->seconds; p.steps = cfg->steps;
+        p.seed = atoll(seed); p.device = cfg->device; p.precision = cfg->precision;
+        p.rng_torch = cfg->rng_torch;
+        aria_steer it; aria_steer_set set = { &it, 0 };
+        if (strcmp(spec, "-") != 0) {
+            if (parse_steer_spec(spec, &it) != 0) { failed++; continue; }
+            set.n = 1; p.steer = &set;
+        }
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        aria_audio *audio = NULL;
+        int rc = aria_generate(ctx, &p, &audio);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        free_steer_set(&set);
+        if (rc != 0 || !audio) {
+            fprintf(stderr, "[batch] %s: generate error: %s\n", out, aria_last_error());
+            failed++; continue;
+        }
+        if (aria_wav_write(out, audio, 32) != 0) { fprintf(stderr, "[batch] cannot write %s\n", out); failed++; }
+        else {
+            ok++;
+            fprintf(stderr, "[batch %d] %s (%.2fs)\n", ok,
+                    out, (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9);
+        }
+        aria_audio_free(audio);
+    }
+    fclose(fh);
+    clock_gettime(CLOCK_MONOTONIC, &tb1);
+    double tot = (tb1.tv_sec - tb0.tv_sec) + (tb1.tv_nsec - tb0.tv_nsec) / 1e9;
+    printf("batch: %d ok, %d failed, %.1fs total (%.2fs/job)\n", ok, failed, tot, ok ? tot / ok : 0.0);
+    return failed ? 1 : 0;
 }
 
 static int cmd_wav_roundtrip(const char *in, const char *out) {
@@ -548,6 +616,8 @@ int main(int argc, char **argv) {
         rc = cmd_stream(ctx, &p, cfg.stream_chunk, cfg.stream_context, cfg.stream_chunks, cfg.stream_hold, cfg.out_path);
     } else if (cfg.do_list) {
         aria_list_tensors(ctx, cfg.list_prefix);
+    } else if (cfg.batch_file) {
+        rc = cmd_batch(ctx, &cfg);
     } else if (cfg.do_generate) {
         aria_gen_params p = ARIA_GEN_PARAMS_DEFAULT;
         p.prompt = cfg.prompt;
