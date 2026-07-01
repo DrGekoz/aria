@@ -53,20 +53,23 @@ the *scaling* is visible (uncond, warm; Alienware RTX 3070 + i9-10900KF).
 | backend | aria 10 s | aria 60 s | aria 10→60 | SAT 10 s | SAT 60 s | SAT 10→60 | @ 60 s |
 |---|---|---|---|---|---|---|---|
 | **CPU** (20 thr) | 11.2 s | **55.9 s** | 5.0× | 11.3 s | **108.4 s** | 9.6× | **aria 1.94× faster** |
-| **GPU** (fp16) | 0.52 s | **2.07 s** | 4.0× | 0.49 s | **1.32 s** | 2.7× | SAT 1.57× faster |
+| **GPU** (fp16) | 0.46 s | **1.82 s** | 4.0× | 0.49 s | **1.32 s** | 2.7× | SAT 1.38× faster |
 
 **small-music:**
 
 | backend | aria 10 s | aria 60 s | aria 10→60 | SAT 10 s | SAT 60 s | SAT 10→60 | @ 60 s |
 |---|---|---|---|---|---|---|---|
 | **CPU** (20 thr) | 3.58 s | **16.3 s** | 4.6× | 2.79 s | **11.1 s** | 4.0× | SAT 1.47× faster |
-| **GPU** (fp16) | 0.22 s | **0.67 s** | 3.0× | 0.34 s | **0.41 s** | 1.2× | SAT 1.63× faster |
+| **GPU** (fp16) | 0.16 s | **0.60 s** | 3.8× | 0.34 s | **0.41 s** | 1.2× | SAT 1.46× faster |
 
 aria 60 s stage split — medium GPU dit **1.28** + decode 0.78 s, CPU dit 35.1 + decode 20.6 s
 (CPU dit after query-blocked attention, −4% on the 20-core); small-music GPU dit 0.50 +
 decode 0.16 s, CPU dit 12.5 + decode 4.3 s. GPU VRAM @60 s: medium aria 4514 vs SAT 6720 MB.
 The medium GPU dit dropped **1.45 → 1.28 s (−12 %)** by fusing the elementwise long tail
-(see below); the gap to SAT closed 1.68× → 1.57×.
+(see below); the gap to SAT closed 1.68× → 1.57×. Folding 1/√D into the QK^T alpha and the
+fp16 cast into softmax (commit `42962e0`, byte-identical output) removed two more S²·H passes
+per attention: 60 s GPU **medium 2.07 → 1.82 s (−12 %), small 0.67 → 0.60 s (−10 %)**;
+the SAT gap closed further, 1.57× → **1.38×** (medium) and 1.63× → **1.46×** (small).
 
 **small-music has no banded-decoder win** (its decoder already chunks → O(N·34) linear),
 so on CPU it's pure GEMM and MKL edges aria (1.3–1.5×); the medium CPU win is specifically
