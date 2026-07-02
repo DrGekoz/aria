@@ -9,7 +9,10 @@ AR      ?= ar
 CSTD    ?= -std=c11
 DEFS    ?= -D_GNU_SOURCE
 WARN    ?= -Wall -Wextra -Wno-unused-parameter
-OPT     ?= -O3 -march=native -mavx2 -mfma -fopenmp
+# arch/ISA flags, overridable for non-AVX2 / ARM builds (e.g. ARCHFLAGS="" or
+# ARCHFLAGS="-mno-avx2"). Default is byte-identical to the historical flags.
+ARCHFLAGS ?= -march=native -mavx2 -mfma
+OPT     ?= -O3 $(ARCHFLAGS) -fopenmp
 CFLAGS  ?= $(CSTD) $(DEFS) $(WARN) $(OPT)
 LDFLAGS ?= -fopenmp -lm
 
@@ -27,6 +30,7 @@ LIB_SRCS := \
   $(SRC)/aria_parity.c \
   $(SRC)/aria_sa3_config.c \
   $(SRC)/aria_sa3_dit.c \
+  $(SRC)/aria_lora.c \
   $(SRC)/aria_taae.c \
   $(SRC)/aria_sa3_dec.c \
   $(SRC)/aria_sa3_dec_medium.c \
@@ -129,7 +133,7 @@ aria-server: $(BUILD)/aria_server.o $(LIB)
 	$(CC) $(CFLAGS) -I$(SRC) $(BUILD)/aria_server.o -L$(BUILD) -laria $(LDFLAGS) -lpthread -o $@
 
 # ---- tests ----
-TESTS := test_ops test_wav test_config test_sampler test_arena test_quant test_rng
+TESTS := test_ops test_wav test_config test_sampler test_arena test_quant test_rng test_lora
 test: $(LIB)
 	@set -e; \
 	for t in $(TESTS); do \

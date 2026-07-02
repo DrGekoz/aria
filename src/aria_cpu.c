@@ -65,6 +65,14 @@ static inline double aria_sumsq_f(const float *x, int dim) {
     for (; i < dim; i++) ss += (double)x[i] * x[i];
     return ss;
 }
+#else
+/* scalar sum of x[i]^2 in double -- matches the AVX2 double-accumulation reduction
+ * (used by the RMS norms) within float tolerance when built without AVX2/FMA. */
+static inline double aria_sumsq_f(const float *x, int dim) {
+    double ss = 0.0;
+    for (int i = 0; i < dim; i++) ss += (double)x[i] * x[i];
+    return ss;
+}
 #endif
 
 /* y[M,N] = x[M,K] @ W^T + b, W=[N,K] (PyTorch Linear).
@@ -326,6 +334,7 @@ void aria_rmsnorm(float *y, const float *x, const float *weight,
         const float *xr = x + (size_t)r * dim;
         float *yr = y + (size_t)r * dim;
         float inv = (float)(1.0 / sqrt(aria_sumsq_f(xr, dim) / dim + eps));
+#ifdef ARIA_AVX2
         __m256 vi = _mm256_set1_ps(inv);
         int i = 0;
         if (weight) {
@@ -338,6 +347,10 @@ void aria_rmsnorm(float *y, const float *x, const float *weight,
                 _mm256_storeu_ps(yr + i, _mm256_mul_ps(_mm256_loadu_ps(xr + i), vi));
             for (; i < dim; i++) yr[i] = xr[i] * inv;
         }
+#else
+        if (weight) { for (int i = 0; i < dim; i++) yr[i] = xr[i] * inv * weight[i]; }
+        else        { for (int i = 0; i < dim; i++) yr[i] = xr[i] * inv; }
+#endif
     }
 }
 
@@ -363,16 +376,20 @@ void aria_gemma_rmsnorm(float *y, const float *x, const float *weight,
     #pragma omp parallel for schedule(static)
     #endif
     for (int r = 0; r < rows; r++) {
-        const __m256 one = _mm256_set1_ps(1.0f);
         const float *xr = x + (size_t)r * dim;
         float *yr = y + (size_t)r * dim;
         float inv = (float)(1.0 / sqrt(aria_sumsq_f(xr, dim) / dim + eps));
+#ifdef ARIA_AVX2
+        const __m256 one = _mm256_set1_ps(1.0f);
         __m256 vi = _mm256_set1_ps(inv);
         int i = 0;
         for (; i + 8 <= dim; i += 8)
             _mm256_storeu_ps(yr + i, _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(xr + i), vi),
                                                    _mm256_add_ps(one, _mm256_loadu_ps(weight + i))));
         for (; i < dim; i++) yr[i] = xr[i] * inv * (1.0f + weight[i]);
+#else
+        for (int i = 0; i < dim; i++) yr[i] = xr[i] * inv * (1.0f + weight[i]);
+#endif
     }
 }
 
