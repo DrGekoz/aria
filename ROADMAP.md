@@ -24,7 +24,7 @@ int8/q4 quantization, as a library + CLI — all parity-gated.
 | **M4** ✅ | CUDA end-to-end generation | E8.5 |
 | **M5** ✅ | Quantized (Q4) — medium fits low VRAM | E9.4 |  ← Q4 mechanism (CPU+GPU), fidelity-tuned (9.3%), offline `aria-quantize`; medium loads/runs/**fits** on the 3070 at q4 (1.91 GB). A *correct* medium run needs differential DiT attn (E4.5 → M6). |
 | **M6** ✅ | medium model end-to-end | E10.2 |  ← differential DiT + medium decoder (sliding-window/sinusoidal); e2e parity latent 7.3e-3 / audio 1.7e-2; runs on **CPU and GPU** (GPU 0.54 s ≈ stable-audio-tools) |
-| **M7** | Steering (TasteSteer): latent + DiT-residual + cond-space injection, training-free | E12.7 |
+| **M7** 🟡 | Steering: DiT-residual arm done (add+project, CPU+GPU, graph-resident, CLI/server); latent + cond arms open | E12.7 ✅ (residual); E12.2/E12.4 open |
 | **v1.0.0** | Release checklist green | E11.7 |
 
 ## Status snapshot
@@ -42,7 +42,14 @@ offline `aria-quantize`), **E11** (release polish: install/example/CI/progress/t
 **E13.3** (concurrency-clean arenas). Memory: host RSS on the GPU path dropped 7.3 →
 0.44 GB (`madvise` after upload). Build + hermetic + parity all green; benchmarks vs
 stable-audio-tools in [BENCHMARKS.md](BENCHMARKS.md), full snapshot in [STATUS.md](STATUS.md).
-**Open: steering (E12 → M7)**, concurrency (E13.1/2), and the `v1.0.0` tag.
+**Since then (2026-07):** E12 residual steering shipped end-to-end — additive **and**
+projection ops, CPU+GPU, **graph-resident** (steer kernels captured in the CUDA graph via
+device-side effective scales, bf00c9e), `--steer` CLI + `--batch` resident jobs (6d6d76e) +
+**`aria-server`** HTTP binary (c238392; warm steered gen **0.185 s over HTTP** on the 3070);
+exact-math GPU wins (QK-alpha fold + softmax-f16 fusion, 42962e0: 60 s GPU −10–12 %);
+steering-path correctness fixes (d430899). Efficiency methodology re-based (in-process
+`--bench` warm on both sides — see BENCHMARKS.md). **Open: E12.2/E12.4 steering arms,
+E13.1/E13.2 true concurrency, the E15–E18 forward plan below, and the `v1.0.0` tag.**
 
 ## Critical path to M1 (first audio) — ✅ reached
 
@@ -124,7 +131,7 @@ quant), **E8.5c** (GPU decoder), **E10** (medium), **E12** (steering).
 - ✅ **E7.1** **P1** taae_v2 encoder (audio→latent): patchify (256-sample) → SAME encoder (pad to mult 32, WNConv1d mapping 512→768 k1, group-16 + 1 learned new_token → 17, two chunked S=34 transformer halves [0-2 unshifted, 3-5 midpoint-shift], take last of each 17-group, Linear 768→256) → softnorm fwd (`(x·scaling_factor + bias)/running_std`). The differential-attention block + chunk pass are now shared with the decoder via `aria_taae.{c,h}` (extracted; `test_dec` unchanged at 1.4e-4). Verify: staged `test_enc` parity vs `pretransform.encode` — patchify/softnorm exact, SAME encoder 8.9e-5, full encode 9e-4, zero-pad path 1.8e-2 (0.1% rel, softnorm-amplified). deps: E5.3, E2.7.
 - ✅ **E7.2** **P1** Inpaint mask build. `aria_inpaint_mask_latent` nearest-interps an audio-space mask (1=keep, 0=inpaint) to latent length (`mask_lat[t]=mask_audio[(t·audio_len)/T]`, matching torch `F.interpolate(mode='nearest')`); `aria_inpaint_local_cond` builds `local[T,257] = [mask | latent·mask]` (channel 0 = mask, 1..256 = masked_input), matching generation.py. deps: E7.1 · Verify: `test_inpaint` mask/local_cond parity — both **exact (0.0)**.
 - ✅ **E7.3** **P1** Local-additive cond live in DiT (E1.6 hook with a real mask). The DiT velocity with a live `local_add_cond` (built by E7.2) matches `dit._forward(..., local_add_cond=real)` at **2.8e-4** (max|ref| 63.7). deps: E1.6, E4.3, E7.2 · Verify: `test_inpaint` dit_velocity parity.
-- ✅ **E7.4** **P1** continue/inpaint orchestration + CLI. `aria_gen_params` gains `init_audio` + `inpaint_from_s/to_s` + `inpaint_continue`; `sa3_generate` reads+prepares the clip (channel-major, pad/crop, 44.1 kHz), encodes it (E7.1), builds the keep/regenerate mask + local cond (E7.2), attaches it to the request (E7.3), and runs the normal pingpong+decode (pure-noise start). CLI: `--continue <wav>` (regenerate the tail) / `--inpaint <wav> --from <s> --to <s>` (regenerate a region). Inpaint runs on the CPU DiT (the device DiT has no local-cond path yet — follow-up). Verify: `test_inpaint_e2e` end-to-end parity vs the injected-noise PyTorch inpaint — **latent 6.6e-4, audio 2.4e-4**; CLI smoke (base→continue→inpaint) preserves kept regions (continue kept-L1 0.008; inpaint outside-mask 0.004 vs inside-mask 0.014). deps: E7.1–7.3, E6.4. **← M3**
+- ✅ **E7.4** **P1** continue/inpaint orchestration + CLI. `aria_gen_params` gains `init_audio` + `inpaint_from_s/to_s` + `inpaint_continue`; `sa3_generate` reads+prepares the clip (channel-major, pad/crop, 44.1 kHz), encodes it (E7.1), builds the keep/regenerate mask + local cond (E7.2), attaches it to the request (E7.3), and runs the normal pingpong+decode (pure-noise start). CLI: `--continue <wav>` (regenerate the tail) / `--inpaint <wav> --from <s> --to <s>` (regenerate a region). Inpaint runs on the CPU **and device** DiT (per-block local-additive cond uploads to the GPU, 48078cb). Verify: `test_inpaint_e2e` end-to-end parity vs the injected-noise PyTorch inpaint — **latent 6.6e-4, audio 2.4e-4**; CLI smoke (base→continue→inpaint) preserves kept regions (continue kept-L1 0.008; inpaint outside-mask 0.004 vs inside-mask 0.014). deps: E7.1–7.3, E6.4. **← M3**
 
 ## E8 — CUDA backend (parallelizable track)
 
@@ -176,20 +183,32 @@ doubles as the activation-extraction path.
 
 - ✅ **E12.1** **P1** Steering spec + dispatch: `aria_steer` struct (`site`, `layer`, `dir`, `scale`, `step_lo/hi`) + a steer set threaded through `aria_generate`; orchestrator applies steers at registered hooks. deps: E6.4 · Verify: empty/scale-0 steer set ⇒ bitwise-identical output vs unsteered; non-zero scale changes output deterministically. **Done** — `aria_steer.h` (kind-agnostic); step counted in `sa3_denoise`; `tests/steer_verify.sh` GATE1 (scale-0 byte-identical) + GATE2 (deterministic effect) pass.
 - ⬜ **E12.2** **P1** Diffusion-latent steering (256-D SAME arm) hook in the sampler loop, with step-window gating. deps: E12.1, E6.3 · Verify: unit test — injecting known `d` adds exactly `α·d` to `x` only within `[step_lo,step_hi]`; α=0 ≡ unsteered.
-- ✅ **E12.3** **P1** DiT residual-stream steering (per-layer 1024-D arm) hook after the chosen layer's residual add. deps: E12.1, E4.4 · Verify: steering layer L perturbs activations from L onward only; per-layer add matches expected; α=0 ≡ unsteered. **Done** — hook at the `dit_block_core` block output (broadcast over tokens, layer+step-window gated, matches sf-api `AdditiveInjector`); `steer_verify.sh` GATE3 `steer(2α,d)≡steer(α,2d)` byte-identical proves the op is exactly `scale·dir`. **CPU + GPU** — device hook in `dit_block_dev` (`k_steer_add`, `aria_cuda_dit_set_step`; the CUDA graph is disabled while steering since the step-window makes per-step compute non-identical). GPU gates pass; GPU-vs-CPU steered parity corr 1.0 / 0.45 % fp16; GPU steering ~2.5× faster than CPU.
+- ✅ **E12.3** **P1** DiT residual-stream steering (per-layer 1024-D arm) hook after the chosen layer's residual add. deps: E12.1, E4.4 · Verify: steering layer L perturbs activations from L onward only; per-layer add matches expected; α=0 ≡ unsteered. **Done** — hook at the `dit_block_core` block output (broadcast over tokens, layer+step-window gated, matches sf-api `AdditiveInjector`); `steer_verify.sh` GATE3 `steer(2α,d)≡steer(α,2d)` byte-identical proves the op is exactly `scale·dir`. **CPU + GPU** — device hook in `dit_block_dev`. **Graph-resident since bf00c9e:** the steer kernels are recorded INTO the CUDA graph and read a device-side effective scale (0 out-of-window → bit-exact no-op) refreshed per step like dx/gcond; steered graph-vs-inline output byte-identical (full + windowed). A **projection/ablation op** (`ARIA_STEER_PROJECT`, Arditi/ds4-style, c6e5f95) exists alongside additive; 5 gates + graph/inline A/B pass. Steering adds **no measurable GPU overhead** (steered == unsteered 0.16 s warm).
 - ⬜ **E12.4** **P1** Conditioning-space steering (global adaLN 1024-D + cross-attn cond tokens) hook. deps: E12.1, E1.4, E1.5 · Verify: direction on `global_cond` shifts modulation params deterministically; α=0 ≡ unsteered.
 - ⬜ **E12.5** `∥` **P2** Pre-decode latent steering hook (output-space nudge). deps: E12.1, E5.4 · Verify: direction added to latent pre-decode; α=0 ≡ unsteered.
 - ⬜ **E12.6** **P1** `.atns` activation extraction at each site (mean-pooled taps) so contrastive directions (e.g. sweet − neutral) can be built from C runs. deps: E12.2–E12.4 · Verify: tapped activation matches the site's parity dump; contrastive direction is reproducible across runs.
 - ✅ **E12.7** **P1** CLI `--steer site:layer:dir.atns:scale:lo-hi` (repeatable) + direction loader. deps: E12.1 · Verify: parses multiple steers; produces measurably different, logged output. **← M7** **Done** — table-driven `--steer` (repeatable, `.atns` via `aria_parity_load`); `tests/steer_compare.sh` + `sa3-sf-api/experiments/aria_steer_compare.py` stand up the aria↔sf-api comparison (same `norm·unit` direction → both steer; aria ~1.2× faster CPU @ 4 s/8 steps).
-- ⬜ **E12.8** `∥` **P2** Steering validation sweep (scale/layer/site) scored with the taste regressor (wav2taste / sonic-taste-regressor). deps: E12.7 · Verify: taste metric responds monotonically-ish to scale for a known direction; reproducible.
-- ⬜ **E12.9** **P2** (stretch) LoRA-style steering arm: `aria_linear_lora` op + adapter loader on chosen projections (the steering-vs-LoRA comparison). deps: E2.x, E4.4 · Verify: loaded adapter matches a Python LoRA forward within tol; zero-rank ≡ base.
+- ✅ **E12.8** `∥` **P2** Steering validation sweep — done via the **sf-api campaign** (aria reproduces the SA3 dense window: 5 axes × 7 α × 12 prompts × 3 seeds, scored wav2taste+CLAP+FAD; dose-response parity vs PyTorch **r=0.95 small / 0.92 medium**, per-clip r=0.79/0.64; Wilcoxon p<1e-8 at peak α). Drivers live in `sa3-sf-api/experiments/` (aria_window_sweep, overlay_parity, efficiency_compare).
+- ⬜ **E12.9** **P1** (paper-blocking) LoRA runtime-adapter arm, sd.cpp `WeightAdapter` pattern: `aria_linear_lora(x,W,down,up,scale)` = base GEMM + `scale·(x·downᵀ)·upᵀ` at runtime (keeps W quantized/mmap'd; merge mode optional later), safetensors adapter loader by name-prefix, device-resident `scale` so the CUDA graph stays captured (same trick as steering). Standard LoRA only (skip LoHa/LoKr/DoRA). deps: E2.x, E4.4 · Verify: adapter matches a Python LoRA forward within tol; zero-rank ≡ base; unblocks the paper's steering-vs-LoRA table (`tab:cost`).
 
 ## E13 — Batch / server (throughput)
 
 Foundation laid in E2.9b: the immutable model (`aria_sa3_dit`, read-only weights)
 is split from per-request scratch (`aria_sa3_dit_req`, owns its arena + caches),
-so distinct requests share one loaded model with no shared mutable state. Two
-complementary strategies:
+so distinct requests share one loaded model with no shared mutable state.
+
+**Shipped (serialized amortization — NOT E13.1/E13.2):**
+- ✅ **E13.0a** `--batch <jobs.tsv>` (6d6d76e): many jobs against one resident ctx
+  (amortizes model open, GPU upload/quantize, per-prompt T5 encode). ~2× sweep
+  throughput vs one-shot CLI (0.60 vs 1.23 s/job); byte-identical to one-shot.
+- ✅ **E13.0b** `aria-server` (c238392, ds4-server pattern): resident HTTP binary,
+  thread-per-connection → job queue → ONE worker owning the ctx. `GET /health`,
+  `GET /info`, `POST /generate` (JSON in, WAV out, optional steer). Verified on the
+  3070: warm steered gen **0.185 s over HTTP**, server==CLI byte-identical,
+  concurrent requests serialized cleanly. (The commit subject says "E13.2" — a
+  mislabel; the true batch dim below is still open.)
+
+Two complementary strategies remain:
 
 - ⬜ **E13.1** **P1** *Request-parallel (multi-stream)* — a worker pool runs N
   independent `aria_sa3_dit_req` generations against one shared model. Correct
@@ -213,6 +232,124 @@ complementary strategies:
   encoder uses one allocate-once arena for its whole forward. Whole pipeline is now
   per-request-scratch with no hot-path heap churn. Bit-identical output; parity
   green (test_dec / test_t5enc / test_e2e). ~12% faster end-to-end (interleaved A/B).
+
+## E14 — Streaming / interactive (shipped, previously untracked)
+
+The `--stream` stack shipped without a roadmap entry: continuous sliding-window
+generation (`--stream/--chunk/--context/--chunks/--hold`), post-hoc continuation
+(context 6 s + skip + emit ~2 s + tail per window), phase-aligned crossfade, HPSS
+hold mode, raw-f32 stdout piping with a writer thread; GPU continuation; RTF
+0.6–4× on the 3070. Documented in BENCHMARKS.md/PAPER.md. **Open improvements**
+(2026-07 review):
+
+- ⬜ **E14.1** **P1** Partial (emit+halo) decode: decode only the emitted region +
+  halo instead of the full ~12.5 s window each chunk (~6× less decode work/chunk;
+  parity-safe with the banded decoder). Largely subsumed by E16.1 if that lands
+  first. Verify: chunk output byte-parity vs full-window decode.
+- ⬜ **E14.2** **P2** Keep-region-only re-encode: the taae encoder re-runs over the
+  full padded window every chunk (CPU even in GPU mode); encode only the region
+  the continuation actually needs. Verify: identical latents on the kept region.
+- ⬜ **E14.3** **P2** Latent-domain continuation: carry the context as latents
+  instead of decode→re-encode round-trips (removes the encoder from the loop,
+  enables DiT/decode overlap). Design task — changes continuation quality
+  characteristics; A/B against the current path.
+- ⬜ **E14.4** **P2** Stream hygiene: sample-rate/channel handshake on the raw-f32
+  stdout stream + underrun detection/pre-roll for RTF<1 CPU streaming.
+- ⬜ **E14.5** **P3** Instant preview tier (sd.cpp latent-preview analog): a fitted
+  `[256→k]` linear latent→envelope/mel projection for a monitor signal while the
+  real decode runs a window behind; optional distilled tiny decoder later.
+
+## E15 — Edge / Raspberry Pi 5 (the paper's edge claim)
+
+The intro claims SA3 fits a Pi 5-class device; nothing has been measured on ARM.
+**Blocker first:** aria_cpu.c does not even compile without AVX2.
+
+- ⬜ **E15.1** **P0** Non-AVX2 build fix: `aria_rmsnorm`/`aria_gemma_rmsnorm` (and
+  friends) use `__m256`/AVX2-only helpers with no scalar guard, and the Makefile
+  hardcodes `-mavx2 -mfma`. Add scalar fallbacks + a `CPU_ARCH` Makefile knob.
+  Verify: `make` succeeds on ARM (or x86 with `-mno-avx2`) and `make test` passes.
+- ⬜ **E15.2** **P1** NEON kernels: port the 3 hot paths behind `__ARM_NEON` —
+  (1) the 6×16 packed outer-product GEMM microkernel → `float32x4_t` tiles (the
+  packing layer is ISA-agnostic, reuse as-is), (2) `aria_linear_q8/q4` dequant-GEMM
+  (NEON int8 widening + `vfmaq`), (3) attention inner loops + rmsnorm. Scalar path
+  stays as fallback. Verify: parity vs scalar; GEMM GFLOP/s benchmark on Pi 5.
+- ⬜ **E15.3** **P2** Params-on-disk residency (`--params-disk`): per-DiT-block
+  fault-in from mmap + `MADV_DONTNEED` after use → peak RAM = one block + arena
+  (medium on an 8 GB Pi). aria already has both primitives. Verify: medium
+  generates under a hard RSS cap; unchanged output.
+- ⬜ **E15.4** **P2** Arena measure mode: dry-run the op sequence counting
+  allocations (the `peak` field already exists), then allocate exactly peak —
+  replaces static worst-case sizing; per-(seq_len, model) cache. Verify: RSS drop;
+  no mid-run growth.
+- ⬜ **E15.5** **P1** Pi 5 measurement for the paper: small (+ medium q4) 10 s gen
+  wall-clock + RSS on a Raspberry Pi 5 8 GB; replaces the paper's
+  `\tbd{measured Pi 5 latency}`. deps: E15.1 (+E15.2 for a usable number).
+
+## E16 — Long-form decode (the 60 s gap; sd.cpp import)
+
+aria trails stable-audio-tools at 60 s GPU (small 1.46×, medium 1.38× after
+42962e0) and the decoder is the bound. The highest-leverage import from
+stable-diffusion.cpp is its **rolling per-layer feature-cache decode**
+(`wan_vae.hpp`: carry the last K frames of each layer's activations across
+chunk boundaries → seam-free chunked decode with O(window) memory).
+
+- ⬜ **E16.1** **P1** Rolling feature-cache chunked decode for taae_v2: decode the
+  latent in windows, carrying per-layer halo activations (the banded/chunked
+  attention structure already bounds the receptive field — small S=34 midpoint
+  chunks, medium ±17 band). Peak decode memory O(window); unbounded-length output;
+  also serves E14.1 and the Pi-5 ceiling. Verify: byte/tolerance parity vs
+  monolithic decode on 10 s and 60 s clips.
+- ⬜ **E16.2** **P1** Medium GPU decoder glue fusion: `med_block_dev` still runs
+  5×extract + 4×dyt + 4×rope as separate launches per block (the DiT got this
+  fusion pass in E8.5d/e; the decoder didn't). Fuse into the extract/norm kernels.
+  Verify: byte-identical decode; 60 s medium GPU timing.
+- ⬜ **E16.3** **P3** Smootherstep crossfade + auto window sizing (sd.cpp
+  `sd_tensor_merge_2d` / `get_tile_sizes` analogs) for stream joins and E16.1
+  window policy.
+
+## E17 — GPU perf backlog (consolidated, post-42962e0)
+
+- ⬜ **E17.1** **P1** Producer kernels emit fp16: `k_rmsnorm_adaln`, `k_ff_silugate`,
+  `k_merge_heads`, `k_extract_normrope` write fp32 that the next GEMM/attention
+  re-converts (`k_f32_to_f16`, ~6 % of GPU time). Emit `__half` directly where the
+  consumer is fp16. Verify: byte-identical (RTNE preserved) or documented tol.
+- ⬜ **E17.2** **P2** On-device pingpong sampler: the per-step latent D2H→host
+  pingpong→H2D round-trip + host RNG can move device-side (host keeps the
+  schedule); removes 2 transfers/step and the host sync. Verify: parity vs host
+  sampler (xoshiro sequence preserved).
+- ⬜ **E17.3** **P2** Q8/Q4 resident dequant cache: quantized weights re-dequantize
+  into the shared scratch on EVERY GEMM every step; cache the fp16 dequant per
+  weight when VRAM allows (or per-block ring). Verify: q4 timing ≈ fp16 timing.
+- ⬜ **E17.4** **P3** Pinned host staging for per-step latent/gcond + decoder output
+  (pageable async currently degrades to sync copies).
+- ⬜ **E17.5** **P3** cublasLt bias epilogue (drop the separate `k_add_bias` pass).
+
+## E18 — Quantization v2 (sd.cpp-informed)
+
+- ⬜ **E18.1** **P1** Generalized per-tensor recipe table: replace the hardcoded
+  FFN-q4/attn-q8 split with a name-pattern→{q4,q8,f16} table + the auto rule
+  "biases/norms/embeddings/first+last blocks stay high-precision"
+  (sd.cpp `tensor_should_be_converted` / `--tensor-type-rules` analog). Pure
+  metadata, no new kernels. Verify: `test_quant_dit` error ≤ current 9.3 %.
+- ⬜ **E18.2** **P2** Q6_K-style superblock: group 8 of aria's 32-wide q4 blocks
+  under a shared 16-bit super-scale (quantize the scales) → q4 footprint at
+  materially lower error. CPU + CUDA dequant. Verify: velocity rel-RMS vs q8/q4.
+- ⬜ **E18.3** **P3** imatrix-style calibrated quantization in `aria-quantize`
+  (activation-importance pass over a few prompts → importance-weighted scales /
+  per-row q8 promotion).
+
+## E19 — Tests & docs debt (2026-07 audit)
+
+- ⬜ **E19.1** **P1** Hermetic tests for the new surface: `aria_wav_to_mem` ==
+  `aria_wav_write` bytes; `--batch` TSV parsing (incl. bad-spec line isolation);
+  `read_request`/`parse_steer_json` unit harness; a GPU PROJECT dim-mismatch gate
+  (`st->dim > dim`) in steer_verify.
+- ⬜ **E19.2** **P1** STATUS.md refresh: it still marks E11/E12 ⬜ wholesale and
+  lists medium/steering/aria-quantize as "not implemented" — all shipped. Bring it
+  in line with this roadmap (or shrink it to a pointer at ROADMAP.md).
+- ⬜ **E19.3** **P2** README/PAPER.md: document `--batch`, `aria-server`, the
+  graph-resident steering, and the corrected efficiency methodology (warm =
+  in-process `--bench`, both sides).
 
 ## Post-1.0 (north star)
 
