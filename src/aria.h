@@ -39,8 +39,8 @@ typedef struct {
     /* continue / inpaint (E7): regenerate part of an existing clip, keep the rest.
      * Set init_audio to a WAV path. inpaint_from_s..inpaint_to_s marks the region
      * to regenerate (seconds; to_s <= 0 means "to seconds_total"). inpaint_continue
-     * = regenerate [clip_duration, seconds_total] (extend the clip). Runs on the CPU
-     * DiT (the device DiT has no local-cond path yet). */
+     * = regenerate [clip_duration, seconds_total] (extend the clip). Runs on the
+     * CPU and device DiT (per-block local-additive cond is uploaded to the GPU). */
     const char *init_audio;         /* WAV path, or NULL for plain text->audio */
     float inpaint_from_s;           /* start of the regenerated region (seconds) */
     float inpaint_to_s;             /* end of the regenerated region; <= 0 = seconds_total */

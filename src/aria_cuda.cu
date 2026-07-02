@@ -638,8 +638,10 @@ struct aria_cuda_dit {
     float **cross_k, **cross_v, **cross_kd;
     float **local_emb; int has_local;   /* [depth] each [S, ed]; inpaint local-additive cond */
     const aria_steer_set *steer;        /* E12: host steer set (borrowed); residual dirs uploaded below */
-    float **d_steer_dir; int cur_step;  /* [steer->n] device copies of each steer's [dim] direction */
-    float *d_steer_scale;               /* [steer->n] device effective scales (0 out-of-window); lets
+    float **d_steer_dir; int cur_step;  /* [n_steer] device copies of each steer's [dim] direction */
+    int n_steer;                        /* cached steer count: h->steer is BORROWED and the caller's
+                                         * set may be gone by the time free_request runs */
+    float *d_steer_scale;               /* [n_steer] device effective scales (0 out-of-window); lets
                                          * the steer kernels live INSIDE the CUDA graph */
     float *h_steer_scale;               /* pinned host staging for the per-step scale upload */
     darena arena;
@@ -761,11 +763,12 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
         const aria_steer *st = &h->steer->items[s];
         if (st->site != ARIA_STEER_RESIDUAL || st->layer != blk) continue;
         if (!h->d_steer_dir[s] || !h->d_steer_scale) continue;
+        int ddim = st->dim < dim ? st->dim : dim;   /* clamp to the residual width (matches CPU) */
         if (st->op == ARIA_STEER_PROJECT) {
             float inv = st->dir_norm2 > 0.0f ? 1.0f / st->dir_norm2 : 0.0f;
-            k_steer_project<<<S, RED_TH>>>(seq, h->d_steer_dir[s], h->d_steer_scale + s, inv, S, dim, st->dim);
+            k_steer_project<<<S, RED_TH>>>(seq, h->d_steer_dir[s], h->d_steer_scale + s, inv, S, dim, ddim);
         } else {
-            k_steer_add<<<nSd, THREADS>>>(seq, h->d_steer_dir[s], h->d_steer_scale + s, S, dim, st->dim);
+            k_steer_add<<<nSd, THREADS>>>(seq, h->d_steer_dir[s], h->d_steer_scale + s, S, dim, ddim);
         }
     }
 
@@ -857,11 +860,11 @@ static void free_request(aria_cuda_dit *h) {
     if (h->cross_v) for (int b = 0; b < h->depth; b++) cudaFree(h->cross_v[b]);
     if (h->cross_kd) for (int b = 0; b < h->depth; b++) cudaFree(h->cross_kd[b]);
     if (h->local_emb) for (int b = 0; b < h->depth; b++) cudaFree(h->local_emb[b]);
-    if (h->d_steer_dir && h->steer) for (int s = 0; s < h->steer->n; s++) cudaFree(h->d_steer_dir[s]);
+    if (h->d_steer_dir) for (int s = 0; s < h->n_steer; s++) cudaFree(h->d_steer_dir[s]);
     free(h->cross_k); free(h->cross_v); free(h->cross_kd); free(h->local_emb); free(h->d_steer_dir);
     cudaFree(h->d_steer_scale); if (h->h_steer_scale) cudaFreeHost(h->h_steer_scale);
     h->cross_k = h->cross_v = h->cross_kd = NULL; h->local_emb = NULL; h->has_local = 0;
-    h->d_steer_dir = NULL; h->steer = NULL; h->cur_step = 0;
+    h->d_steer_dir = NULL; h->steer = NULL; h->cur_step = 0; h->n_steer = 0;
     h->d_steer_scale = NULL; h->h_steer_scale = NULL;
     h->dx = h->dv = h->dgcond = NULL;
     h->rope_cos = h->rope_sin = NULL; h->arena.base = NULL; h->have_req = 0;
@@ -937,16 +940,20 @@ extern "C" void aria_cuda_dit_set_request(aria_cuda_dit *h, const aria_sa3_dit_r
      * graph stays captured while steering. */
     h->steer = (rv->steer && rv->steer->n > 0) ? rv->steer : NULL;
     if (h->steer) {
-        h->d_steer_dir = (float **)calloc(h->steer->n, sizeof(float *));
-        for (int s = 0; s < h->steer->n; s++) {
+        h->n_steer = h->steer->n;   /* cached: the borrowed set may be gone by free_request time */
+        h->d_steer_dir = (float **)calloc(h->n_steer, sizeof(float *));
+        for (int s = 0; s < h->n_steer; s++) {
             const aria_steer *st = &h->steer->items[s];
             if (st->site == ARIA_STEER_RESIDUAL && st->dir && st->dim > 0)
                 h->d_steer_dir[s] = upload_f32(st->dir, (size_t)st->dim);
         }
-        if (cudaMalloc(&h->d_steer_scale, (size_t)h->steer->n * sizeof(float)) != cudaSuccess)
-            h->d_steer_scale = NULL;   /* NULL -> steer launches skipped (same as a failed dir upload) */
-        if (cudaMallocHost(&h->h_steer_scale, (size_t)h->steer->n * sizeof(float)) != cudaSuccess)
-            h->h_steer_scale = NULL;
+        if (cudaMalloc(&h->d_steer_scale, (size_t)h->n_steer * sizeof(float)) == cudaSuccess) {
+            if (cudaMallocHost(&h->h_steer_scale, (size_t)h->n_steer * sizeof(float)) != cudaSuccess) {
+                /* both or neither: a scale buffer without its staging would leave the kernels
+                 * reading uninitialized device memory. NULL -> steer launches skipped. */
+                cudaFree(h->d_steer_scale); h->d_steer_scale = NULL; h->h_steer_scale = NULL;
+            }
+        } else h->d_steer_scale = NULL;
     }
     h->have_req = 1;
 }

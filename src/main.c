@@ -217,8 +217,11 @@ static int parse_steer_spec(const char *spec, aria_steer *it) {
     }
     aria_steer_site s;
     if      (!strcmp(site, "residual")) s = ARIA_STEER_RESIDUAL;
-    else if (!strcmp(site, "latent"))   s = ARIA_STEER_LATENT;
-    else if (!strcmp(site, "cond"))     s = ARIA_STEER_COND;
+    else if (!strcmp(site, "latent") || !strcmp(site, "cond")) {
+        /* parsed but NOT applied anywhere yet (E12.2/E12.4) -- reject instead of silently no-oping */
+        fprintf(stderr, "--steer site '%s' is not implemented yet (only 'residual' is wired)\n", site);
+        return 1;
+    }
     else { fprintf(stderr, "unknown --steer site '%s' (residual|latent|cond)\n", site); return 1; }
     aria_steer_op o = ARIA_STEER_ADD;
     if (op) {
@@ -228,6 +231,7 @@ static int parse_steer_spec(const char *spec, aria_steer *it) {
     aria_parity_tensor t;
     if (aria_parity_load(path, &t) != 0) { fprintf(stderr, "cannot load steer direction %s\n", path); return 1; }
     float *d = malloc((size_t)t.numel * sizeof(float));
+    if (!d) { aria_parity_free(&t); fprintf(stderr, "steer: out of memory\n"); return 1; }
     memcpy(d, t.data, (size_t)t.numel * sizeof(float));
     aria_parity_free(&t);
     int lo = 0, hi = 1 << 30;

@@ -181,8 +181,8 @@ static char *read_request(int fd, char **body) {
     }
     size_t body_off = (size_t)(hdr_end - buf) + 4;
     size_t clen = 0;
-    const char *cl = strcasestr(buf, "Content-Length:");
-    if (cl) clen = (size_t)strtoul(cl + 15, NULL, 10);
+    const char *cl = strcasestr(buf, "\nContent-Length:");   /* line-anchored: match the header, not a substring */
+    if (cl) clen = (size_t)strtoul(cl + 16, NULL, 10);
     if (clen > MAX_BODY) { free(buf); return NULL; }
     while (len - body_off < clen) {
         if (len + 1 >= cap) { cap = body_off + clen + 1;
@@ -214,8 +214,11 @@ static int parse_steer_json(const char *body, aria_steer *st, char *err, size_t 
     aria_json_get_string(body, "steer_window", win, sizeof win);
     aria_steer_site s;
     if      (!strcmp(site, "residual")) s = ARIA_STEER_RESIDUAL;
-    else if (!strcmp(site, "latent"))   s = ARIA_STEER_LATENT;
-    else if (!strcmp(site, "cond"))     s = ARIA_STEER_COND;
+    else if (!strcmp(site, "latent") || !strcmp(site, "cond")) {
+        /* parsed but NOT applied anywhere yet (E12.2/E12.4) -- reject instead of silently no-oping */
+        snprintf(err, errlen, "steer_site '%s' not implemented yet (only 'residual')", site);
+        return -1;
+    }
     else { snprintf(err, errlen, "unknown steer_site '%s'", site); return -1; }
     aria_steer_op o = ARIA_STEER_ADD;
     if (!strcmp(op, "project") || !strcmp(op, "ablate")) o = ARIA_STEER_PROJECT;
@@ -250,6 +253,11 @@ static void handle_generate(int fd, const char *body) {
     pthread_mutex_init(&j->mu, NULL);
     pthread_cond_init(&j->cv, NULL);
     j->prompt = strdup(prompt);
+    if (!j->prompt) {
+        respond_json(fd, 500, "Internal Server Error", "{\"error\":\"oom\"}");
+        pthread_mutex_destroy(&j->mu); pthread_cond_destroy(&j->cv); free(j);
+        return;
+    }
     double v = 0;
     j->seconds = aria_json_get_number(body, "seconds", &v) == 0 ? (float)v : 0.0f;
     j->steps = aria_json_get_number(body, "steps", &v) == 0 ? (int)v : 0;
@@ -259,6 +267,7 @@ static void handle_generate(int fd, const char *body) {
         char resp[320];
         snprintf(resp, sizeof resp, "{\"error\":\"%.256s\"}", err);
         respond_json(fd, 400, "Bad Request", resp);
+        pthread_mutex_destroy(&j->mu); pthread_cond_destroy(&j->cv);
         free(j->prompt); free(j);
         return;
     }
