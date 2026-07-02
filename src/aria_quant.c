@@ -14,6 +14,15 @@
 #include <omp.h>
 #endif
 
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+/* E15.2b: NEON dequant-on-use GEMM. int8/int4 weights are widened to f32 and
+ * multiplied by the f32 activations (vld1q_s8 -> vmovl -> vcvtq_f32_s32 -> vfmaq),
+ * so the math is identical to the scalar dequant path (relerr matches, not the
+ * int8xint8 vdotq_s32 route which would need activation quantization and raise the
+ * error above the scalar tolerance). AArch64 horizontal reduce via vaddvq. */
+#endif
+
 const char *aria_dtype_name(aria_dtype dt) {
     switch (dt) {
         case ARIA_F32:  return "fp32";
@@ -70,8 +79,27 @@ void aria_linear_q8(float *y, const float *x, const int8_t *q, const float *scal
         float *yr = y + (size_t)m * N;
         for (int n = 0; n < N; n++) {
             const int8_t *qn = q + (size_t)n * K;
-            float acc = 0.0f;
+            float acc;
+#if defined(__ARM_NEON)
+            /* widen 16 int8 weights/iter to f32, fma with x; scale[n] factored out. */
+            float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
+            float32x4_t a2 = vdupq_n_f32(0.0f), a3 = vdupq_n_f32(0.0f);
+            int k = 0;
+            for (; k + 16 <= K; k += 16) {
+                int8x16_t qv = vld1q_s8(qn + k);
+                int16x8_t lo = vmovl_s8(vget_low_s8(qv));
+                int16x8_t hi = vmovl_s8(vget_high_s8(qv));
+                a0 = vfmaq_f32(a0, vld1q_f32(xr + k),      vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo))));
+                a1 = vfmaq_f32(a1, vld1q_f32(xr + k + 4),  vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo))));
+                a2 = vfmaq_f32(a2, vld1q_f32(xr + k + 8),  vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi))));
+                a3 = vfmaq_f32(a3, vld1q_f32(xr + k + 12), vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi))));
+            }
+            acc = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+            for (; k < K; k++) acc += xr[k] * (float)qn[k];
+#else
+            acc = 0.0f;
             for (int k = 0; k < K; k++) acc += xr[k] * (float)qn[k];
+#endif
             yr[n] = acc * scale[n] + (b ? b[n] : 0.0f);
         }
     }
@@ -194,12 +222,50 @@ void aria_linear_q4(float *y, const float *x, const uint8_t *q, const float *sca
                 float mn = sn[2 * bi], sc = sn[2 * bi + 1];
                 /* sum_k x*(min + nib*scale) = min*sum(x) + scale*sum(nib*x) */
                 float xsum = 0.0f, nxsum = 0.0f;
+#if defined(__ARM_NEON)
+                if (k1 - k0 == ARIA_Q4_BLOCK) {   /* full 32-wide block: NEON */
+                    /* 16 bytes -> low/high nibbles (evens/odds) -> zip back to element
+                     * order (elem0..15, elem16..31), widen to f32, fma with contiguous x. */
+                    uint8x16_t bytes = vld1q_u8(qn + (k0 >> 1));
+                    uint8x16_t evens = vandq_u8(bytes, vdupq_n_u8(0x0F));
+                    uint8x16_t odds  = vshrq_n_u8(bytes, 4);
+                    uint8x16x2_t z = vzipq_u8(evens, odds);
+                    float32x4_t xsv = vdupq_n_f32(0.0f), nxv = vdupq_n_f32(0.0f);
+                    for (int c = 0; c < 2; c++) {
+                        uint8x16_t nb = c ? z.val[1] : z.val[0];
+                        uint16x8_t l = vmovl_u8(vget_low_u8(nb));
+                        uint16x8_t h = vmovl_u8(vget_high_u8(nb));
+                        float32x4_t n0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(l)));
+                        float32x4_t n1 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(l)));
+                        float32x4_t n2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(h)));
+                        float32x4_t n3 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(h)));
+                        const float *xp = xr + k0 + c * 16;
+                        float32x4_t x0 = vld1q_f32(xp),     x1 = vld1q_f32(xp + 4);
+                        float32x4_t x2 = vld1q_f32(xp + 8), x3 = vld1q_f32(xp + 12);
+                        xsv = vaddq_f32(xsv, vaddq_f32(vaddq_f32(x0, x1), vaddq_f32(x2, x3)));
+                        nxv = vfmaq_f32(nxv, n0, x0);
+                        nxv = vfmaq_f32(nxv, n1, x1);
+                        nxv = vfmaq_f32(nxv, n2, x2);
+                        nxv = vfmaq_f32(nxv, n3, x3);
+                    }
+                    xsum = vaddvq_f32(xsv);
+                    nxsum = vaddvq_f32(nxv);
+                } else {                          /* partial tail block: scalar */
+                    for (int k = k0; k < k1; k++) {
+                        uint8_t byte = qn[k >> 1];
+                        int nib = (k & 1) ? (byte >> 4) : (byte & 0x0F);
+                        xsum += xr[k];
+                        nxsum += xr[k] * (float)nib;
+                    }
+                }
+#else
                 for (int k = k0; k < k1; k++) {
                     uint8_t byte = qn[k >> 1];
                     int nib = (k & 1) ? (byte >> 4) : (byte & 0x0F);
                     xsum += xr[k];
                     nxsum += xr[k] * (float)nib;
                 }
+#endif
                 acc += mn * xsum + sc * nxsum;
             }
             yr[n] = acc + (b ? b[n] : 0.0f);
