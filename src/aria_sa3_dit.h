@@ -21,6 +21,7 @@
 #include "aria_sa3.h"
 #include "aria_quant.h"
 #include "aria_steer.h"   /* aria_steer_set (E12 residual-site steering) */
+#include "aria_lora.h"    /* aria_lora_adapter (E12.9 runtime LoRA arm) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -108,6 +109,11 @@ void aria_sa3_dit_req_set_local(aria_sa3_dit_req *req, const float *local_raw,
  * current denoise step (for step-window gating). Both default to none/0; steer is borrowed. */
 void aria_sa3_dit_req_set_steer(aria_sa3_dit_req *req, const aria_steer_set *steer);
 void aria_sa3_dit_req_set_step(aria_sa3_dit_req *req, int step);
+/* E12.9: attach a runtime LoRA adapter (CPU DiT). Applied at the 7 hooked block
+ * GEMMs; the per-step 6 in the block loop and ca_to_kv re-folded into the cached
+ * cross K/V here. Borrowed (not freed by the runtime). NULL = none. Call after
+ * req_begin. No-op on the GPU path (host cross K/V deferred; see E12.9b). */
+void aria_sa3_dit_req_set_lora(aria_sa3_dit_req *req, const aria_lora_adapter *lora);
 /* one denoising step: out_CT = velocity(x_CT, t), reusing the request's caches. */
 void aria_sa3_dit_step(const aria_sa3_dit *m, aria_sa3_dit_req *req,
                        float *out_CT, const float *x_CT, float t);

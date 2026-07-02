@@ -91,17 +91,32 @@ static void ff_glu_qw(float *out, const float *x, int N, int inner, int dim_out,
     (void)dim_out;
 }
 
+/* E12.9: apply a matching LoRA residual on top of a just-computed base GEMM output
+ * (y[M,out] = x[M,in] @ W^T). No-op when no adapter matches or scale==0 (base is
+ * left bit-identical). Scratch t[M*rank] comes from the block arena. */
+static void lora_hook(const aria_lora_adapter *lora, int layer, aria_lora_proj proj,
+                      float *y, const float *x, int M, int in, int out, aria_arena *ar) {
+    if (!lora) return;
+    const aria_lora_item *it = aria_lora_find(lora, layer, proj);
+    if (!it) return;
+    float *t = aria_arena_floats(ar, (size_t)M * it->rank);
+    aria_lora_linear(y, x, M, in, out, it->rank, it->scale, it->down, it->up, t);
+}
+
 /* Block forward with the cross-attention K/V already projected and head-split
  * (cross_k/cross_v are [H, Sc, hd]; cross_k is post-k_norm). All temporaries come
  * from `ar` (save/restore-scoped), so the hot loop never malloc/frees. `bq` is the
- * quantized weight overlay (NULL = f32; that branch is bit-identical to before). */
+ * quantized weight overlay (NULL = f32; that branch is bit-identical to before).
+ * `lora` (E12.9) adds low-rank residuals to the 6 per-step block GEMMs; NULL = none
+ * (ca_to_kv is folded into the cached cross K/V by the request, not here). */
 static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
                            const float *cross_k, const float *cross_v, const float *cross_kd, int Sc,
                            const float *global_cond,
                            const float *rope_cos, const float *rope_sin, int rot_dim,
                            const float *local_emb, const aria_dit_block_w *w,
                            const dit_block_q *bq, int diff,
-                           const aria_steer_set *steer, int layer_idx, int step, aria_arena *ar) {
+                           const aria_steer_set *steer, const aria_lora_adapter *lora,
+                           int layer_idx, int step, aria_arena *ar) {
     const float eps_norm = 1e-5f, eps_qk = 1e-6f;
     size_t mark = aria_arena_save(ar);
 
@@ -135,6 +150,7 @@ static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
         float *qkv = aria_arena_floats(ar, (size_t)S * nq * dim);
         if (bq) aria_linear_qw(qkv, h, &bq->sa_to_qkv, NULL, S);  /* bq sized nq*dim */
         else    aria_linear(qkv, h, w->sa_to_qkv, NULL, S, dim, nq * dim);
+        lora_hook(lora, layer_idx, ARIA_LORA_SA_TO_QKV, qkv, h, S, dim, nq * dim, ar);
         extract_heads(qh, qkv, S, H, hd, nq * dim, 0);
         extract_heads(kh, qkv, S, H, hd, nq * dim, dim);
         extract_heads(vh, qkv, S, H, hd, nq * dim, 2 * dim);
@@ -159,6 +175,7 @@ static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
     merge_heads(merged, ao, S, H, hd);
     if (bq) aria_linear_qw(o, merged, &bq->sa_to_out, NULL, S);
     else    aria_linear(o, merged, w->sa_to_out, NULL, S, dim, dim);
+    lora_hook(lora, layer_idx, ARIA_LORA_SA_TO_OUT, o, merged, S, dim, dim, ar);
     gate_sigmoid(o, gate_self, S, dim);
     for (size_t i = 0; i < (size_t)S * dim; i++) x[i] += o[i];   /* in-place residual add */
 
@@ -169,6 +186,7 @@ static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
         float *q = aria_arena_floats(ar, (size_t)S * nq * dim);
         if (bq) aria_linear_qw(q, h, &bq->ca_to_q, NULL, S);  /* bq sized nq*dim */
         else    aria_linear(q, h, w->ca_to_q, NULL, S, dim, nq * dim);
+        lora_hook(lora, layer_idx, ARIA_LORA_CA_TO_Q, q, h, S, dim, nq * dim, ar);
         extract_heads(qh, q, S, H, hd, nq * dim, 0);
         aria_rmsnorm(qh, qh, w->ca_q_norm, H * S, hd, eps_qk);
         aria_attention(ao, qh, cross_k, cross_v, H, S, Sc, hd, NULL, scores);
@@ -182,6 +200,7 @@ static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
     }
     if (bq) aria_linear_qw(o, merged, &bq->ca_to_out, NULL, S);
     else    aria_linear(o, merged, w->ca_to_out, NULL, S, dim, dim);
+    lora_hook(lora, layer_idx, ARIA_LORA_CA_TO_OUT, o, merged, S, dim, dim, ar);
     for (size_t i = 0; i < (size_t)S * dim; i++) x[i] += o[i];   /* in-place residual add */
 
     /* ---------- local-additive (inpaint) cond: x += left-padded local_emb ---------- */
@@ -192,9 +211,27 @@ static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
     aria_rmsnorm(h, x, w->ff_norm, S, dim, eps_norm);
     adaln_modulate(h, scale_ff, shift_ff, S, dim);
     {
-        float *ffs = aria_arena_floats(ar, (size_t)S * 3 * inner);
-        if (bq) ff_glu_qw(o, h, S, inner, dim, &bq->ff_in_w, w->ff_in_b, &bq->ff_out_w, w->ff_out_b, ffs);
-        else    aria_ff_glu(o, h, S, dim, inner, dim, w->ff_in_w, w->ff_in_b, w->ff_out_w, w->ff_out_b, ffs);
+        const aria_lora_item *lff_in  = lora ? aria_lora_find(lora, layer_idx, ARIA_LORA_FF_IN)  : NULL;
+        const aria_lora_item *lff_out = lora ? aria_lora_find(lora, layer_idx, ARIA_LORA_FF_OUT) : NULL;
+        if (!lff_in && !lff_out) {
+            float *ffs = aria_arena_floats(ar, (size_t)S * 3 * inner);
+            if (bq) ff_glu_qw(o, h, S, inner, dim, &bq->ff_in_w, w->ff_in_b, &bq->ff_out_w, w->ff_out_b, ffs);
+            else    aria_ff_glu(o, h, S, dim, inner, dim, w->ff_in_w, w->ff_in_b, w->ff_out_w, w->ff_out_b, ffs);
+        } else {
+            /* explicit GLU so the ff_in/ff_out LoRA residuals slot between the two GEMMs
+             * (base weights untouched; GLU order matches aria_ff_glu / ff_glu_qw). */
+            float *proj  = aria_arena_floats(ar, (size_t)S * 2 * inner);
+            float *gated = aria_arena_floats(ar, (size_t)S * inner);
+            if (bq) aria_linear_qw(proj, h, &bq->ff_in_w, w->ff_in_b, S);
+            else    aria_linear(proj, h, w->ff_in_w, w->ff_in_b, S, dim, 2 * inner);
+            lora_hook(lora, layer_idx, ARIA_LORA_FF_IN, proj, h, S, dim, 2 * inner, ar);
+            for (int n = 0; n < S; n++)
+                aria_silu_gate(gated + (size_t)n * inner,
+                               proj + (size_t)n * 2 * inner + inner, proj + (size_t)n * 2 * inner, inner);
+            if (bq) aria_linear_qw(o, gated, &bq->ff_out_w, w->ff_out_b, S);
+            else    aria_linear(o, gated, w->ff_out_w, w->ff_out_b, S, inner, dim);
+            lora_hook(lora, layer_idx, ARIA_LORA_FF_OUT, o, gated, S, inner, dim, ar);
+        }
     }
     gate_sigmoid(o, gate_ff, S, dim);
     for (size_t i = 0; i < (size_t)S * dim; i++) x[i] += o[i];   /* in-place residual add */
@@ -259,7 +296,7 @@ void aria_dit_block_forward(float *x, int S, int dim, int num_heads, int head_di
                   + (1u << 18)) * sizeof(float);
     aria_arena_init(&ar, cap);
     dit_block_core(x, S, dim, H, hd, inner, cross_k, cross_v, cross_kd, Sc, global_cond,
-                   rope_cos, rope_sin, rot_dim, NULL, w, NULL, differential, NULL, 0, 0, &ar);
+                   rope_cos, rope_sin, rot_dim, NULL, w, NULL, differential, NULL, NULL, 0, 0, &ar);
     aria_arena_free(&ar);
     free(cross_k); free(cross_v); free(cross_kd);
 }
@@ -502,7 +539,35 @@ struct aria_sa3_dit_req {
     float **cross_kd;                       /* [depth] differential cross k_diff (post k_norm), or NULL */
     float **local_emb; int has_local;       /* [depth] each [S, ed] (left-padded) or NULL */
     const aria_steer_set *steer; int cur_step;  /* E12: residual-site steering + current denoise step */
+    const aria_lora_adapter *lora;          /* E12.9: runtime LoRA adapter (CPU), or NULL */
 };
+
+/* Project block b's cross-attention K/V from cross_ed into the (pre-allocated)
+ * r->cross_k[b]/cross_v[b]/cross_kd[b], folding k_norm into K/K_diff. `kv` is caller
+ * scratch [n_cond, nkv*dim]. With a matching ca_to_kv LoRA item its low-rank residual
+ * is added to the kv projection before the head split (base weight untouched). */
+static void req_project_cross_kv(aria_sa3_dit_req *r, int b, float *kv,
+                                 const aria_lora_adapter *lora) {
+    const aria_sa3_dit *m = r->m;
+    int ed = m->ed, H = m->num_heads, hd = m->head_dim, dim = ed, diff = m->differential;
+    int nkv = diff ? 3 : 2, n_cond = r->n_cond;
+    const aria_dit_block_w *w = &m->blocks[b];
+    aria_linear(kv, r->cross_ed, w->ca_to_kv, NULL, n_cond, ed, nkv * dim);   /* f32 (once/request) */
+    if (lora) {
+        const aria_lora_item *it = aria_lora_find(lora, b, ARIA_LORA_CA_TO_KV);
+        if (it) aria_lora_linear(kv, r->cross_ed, n_cond, ed, nkv * dim,
+                                 it->rank, it->scale, it->down, it->up, NULL);
+    }
+    extract_heads(r->cross_k[b], kv, n_cond, H, hd, nkv * dim, 0);
+    if (diff) {                                      /* chunk order: k, k_diff, v */
+        extract_heads(r->cross_kd[b], kv, n_cond, H, hd, nkv * dim, dim);
+        extract_heads(r->cross_v[b],  kv, n_cond, H, hd, nkv * dim, 2 * dim);
+        aria_rmsnorm(r->cross_kd[b], r->cross_kd[b], w->ca_k_norm, H * n_cond, hd, 1e-6f);
+    } else {
+        extract_heads(r->cross_v[b], kv, n_cond, H, hd, nkv * dim, dim);
+    }
+    aria_rmsnorm(r->cross_k[b], r->cross_k[b], w->ca_k_norm, H * n_cond, hd, 1e-6f);
+}
 
 aria_sa3_dit_req *aria_sa3_dit_req_begin(const aria_sa3_dit *m, int T,
                                          const float *cross_768, int n_cond,
@@ -534,20 +599,10 @@ aria_sa3_dit_req *aria_sa3_dit_req_begin(const aria_sa3_dit *m, int T,
     r->cross_kd = diff ? calloc((size_t)depth, sizeof(float *)) : NULL;
     float *kv = malloc((size_t)n_cond * nkv * dim * sizeof(float));
     for (int b = 0; b < depth; b++) {
-        const aria_dit_block_w *w = &m->blocks[b];
-        aria_linear(kv, r->cross_ed, w->ca_to_kv, NULL, n_cond, ed, nkv * dim);  /* always f32 (once/request) */
         r->cross_k[b] = malloc((size_t)H * n_cond * hd * sizeof(float));
         r->cross_v[b] = malloc((size_t)H * n_cond * hd * sizeof(float));
-        extract_heads(r->cross_k[b], kv, n_cond, H, hd, nkv * dim, 0);
-        if (diff) {                                      /* chunk order: k, k_diff, v */
-            r->cross_kd[b] = malloc((size_t)H * n_cond * hd * sizeof(float));
-            extract_heads(r->cross_kd[b], kv, n_cond, H, hd, nkv * dim, dim);
-            extract_heads(r->cross_v[b],  kv, n_cond, H, hd, nkv * dim, 2 * dim);
-            aria_rmsnorm(r->cross_kd[b], r->cross_kd[b], w->ca_k_norm, H * n_cond, hd, 1e-6f);
-        } else {
-            extract_heads(r->cross_v[b], kv, n_cond, H, hd, nkv * dim, dim);
-        }
-        aria_rmsnorm(r->cross_k[b], r->cross_k[b], w->ca_k_norm, H * n_cond, hd, 1e-6f);
+        if (diff) r->cross_kd[b] = malloc((size_t)H * n_cond * hd * sizeof(float));
+        req_project_cross_kv(r, b, kv, NULL);   /* base only; ca_to_kv LoRA folded in set_lora */
     }
     free(kv);
     }  /* !gpu */
@@ -589,6 +644,21 @@ void aria_sa3_dit_req_set_local(aria_sa3_dit_req *r, const float *local_raw,
 void aria_sa3_dit_req_set_steer(aria_sa3_dit_req *r, const aria_steer_set *steer) { r->steer = steer; }
 void aria_sa3_dit_req_set_step(aria_sa3_dit_req *r, int step) { r->cur_step = step; }
 
+void aria_sa3_dit_req_set_lora(aria_sa3_dit_req *r, const aria_lora_adapter *lora) {
+    r->lora = lora;
+    if (!lora || !r->cross_k) return;   /* GPU path: host cross K/V deferred (E12.9b) */
+    /* re-fold ca_to_kv adapters into the cached cross K/V (projected base-only in
+     * req_begin). Only blocks that carry a ca_to_kv item are recomputed. */
+    int nkv = r->m->differential ? 3 : 2;
+    float *kv = NULL;
+    for (int b = 0; b < r->m->depth; b++) {
+        if (!aria_lora_find(lora, b, ARIA_LORA_CA_TO_KV)) continue;
+        if (!kv) kv = malloc((size_t)r->n_cond * nkv * r->m->ed * sizeof(float));
+        req_project_cross_kv(r, b, kv, lora);
+    }
+    free(kv);
+}
+
 void aria_sa3_dit_step(const aria_sa3_dit *m, aria_sa3_dit_req *r,
                        float *out_CT, const float *x_CT, float t) {
     int C = m->io_ch, ed = m->ed, Mt = m->n_mem, S = r->S, T = r->T, rot = m->rot_dim;
@@ -619,7 +689,7 @@ void aria_sa3_dit_step(const aria_sa3_dit *m, aria_sa3_dit_req *r,
                        r->cross_k[b], r->cross_v[b], r->cross_kd ? r->cross_kd[b] : NULL, r->n_cond, gcond,
                        r->rope_cos, r->rope_sin, rot,
                        r->has_local ? r->local_emb[b] : NULL, &m->blocks[b],
-                       m->bq ? &m->bq[b] : NULL, m->differential, r->steer, b, r->cur_step, ar);
+                       m->bq ? &m->bq[b] : NULL, m->differential, r->steer, r->lora, b, r->cur_step, ar);
 
     /* strip memory tokens, project_out [T,ed] -> [T,C] */
     float *outtc = aria_arena_floats(ar, (size_t)T * C);

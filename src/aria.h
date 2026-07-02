@@ -17,6 +17,7 @@
 #include "aria_wav.h"
 #include "aria_quant.h"   /* aria_dtype (precision selection) */
 #include "aria_steer.h"   /* aria_steer_set (E12 activation steering) */
+#include "aria_lora.h"    /* aria_lora_adapter (E12.9 runtime LoRA arm) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -55,9 +56,10 @@ typedef struct {
                                        * init_audio file); not freed by the runtime.
                                        * Used by the streaming loop to avoid temp WAVs. */
     const aria_steer_set *steer;      /* optional activation steering (E12); NULL = none */
+    const aria_lora_adapter *lora;    /* optional runtime LoRA adapter (E12.9, CPU); NULL = none */
 } aria_gen_params;
 
-#define ARIA_GEN_PARAMS_DEFAULT { NULL, NULL, 15.0f, 8, 1.0f, 0, ARIA_DEVICE_AUTO, ARIA_F32, NULL, NULL, 0.0f, 0.0f, 0, NULL, NULL, 0, NULL, NULL }
+#define ARIA_GEN_PARAMS_DEFAULT { NULL, NULL, 15.0f, 8, 1.0f, 0, ARIA_DEVICE_AUTO, ARIA_F32, NULL, NULL, 0.0f, 0.0f, 0, NULL, NULL, 0, NULL, NULL, NULL }
 
 /* Load a model from a directory containing model_config.json + model.safetensors.
  * Returns NULL on error (see aria_last_error()). */

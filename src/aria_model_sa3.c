@@ -353,6 +353,7 @@ static int sa3_generate(aria_ctx *ctx, void *state,
         free(local_TC);
     }
     aria_sa3_dit_req_set_steer(req, p->steer);   /* E12: residual-site steering (CPU path) */
+    aria_sa3_dit_req_set_lora(req, on_gpu ? NULL : p->lora);   /* E12.9: runtime LoRA (CPU DiT only) */
     sa3_dctx dc = { st->dit, req, NULL, NULL, NULL, 0 };
 #ifdef ARIA_CUDA
     if (on_gpu) {

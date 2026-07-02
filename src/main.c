@@ -46,6 +46,7 @@ typedef struct {
     int util;                               /* 0 none / 1 wav-roundtrip / 2 hpss-test */
     const char *steer_specs[16]; int n_steer;   /* E12: repeatable --steer site:layer:dir.atns:scale:lo-hi */
     const char *batch_file;                 /* E13: --batch jobs TSV (resident multi-gen) */
+    const char *lora_spec;                  /* E12.9: --lora file.safetensors[:alpha] */
 } cli_config;
 
 static cli_config cli_defaults(void) {
@@ -61,7 +62,7 @@ enum {   /* keys: short flags use their ASCII char; long-only options use ids pa
     K_SEED=256, K_DEVICE, K_BENCH, K_UNCOND, K_PEMB, K_INFO, K_LIST,
     K_INPAINT, K_CONTINUE, K_FROM, K_TO, K_PREC, K_LOADQ, K_RNG,
     K_STREAM, K_CHUNK, K_CTX, K_CHUNKS, K_HOLD, K_WAVRT, K_HPSS, K_STEER,
-    K_BATCH,
+    K_BATCH, K_LORA,
 };
 typedef enum { A_NONE, A_ONE, A_TWO, A_OPT } argkind;  /* flag / 1 arg / 2 args / optional 1 arg */
 typedef struct {
@@ -85,6 +86,7 @@ static const opt_spec OPTS[] = {
     {K_LOADQ,    "load-quant",    0,  A_ONE,  "<file>",     "generate", "load a pre-quantized .aria DiT overlay"},
     {K_RNG,      "rng",           0,  A_ONE,  "<mode>",     "generate", "xoshiro (default) | torch (parity)"},
     {K_STEER,    "steer",         0,  A_ONE,  "<spec>",     "generate", "steer site:layer:dir.atns:scale:lo-hi[:add|project] (repeatable; CPU+GPU)"},
+    {K_LORA,     "lora",          0,  A_ONE,  "<file[:a]>", "generate", "apply a LoRA adapter safetensors (optional :alpha; forces CPU DiT)"},
     {K_BENCH,    "bench",         0,  A_ONE,  "<n>",        "generate", "generate N times resident, report warm-min"},
     {K_BATCH,    "batch",         0,  A_ONE,  "<jobs.tsv>", "generate", "run jobs (out<TAB>seed<TAB>steer|-<TAB>prompt) against one resident model"},
 
@@ -148,6 +150,7 @@ static int cli_apply(int key, char **a, cli_config *c) {
         if (c->n_steer >= 16) { fprintf(stderr, "too many --steer (max 16)\n"); return 1; }
         c->steer_specs[c->n_steer++] = a[0]; break;
     case K_BATCH:  c->batch_file = a[0]; break;
+    case K_LORA:   c->lora_spec = a[0]; c->do_generate = 1; break;
     case K_INFO:   c->do_info = 1; break;
     case K_LIST:   c->do_list = 1; if (a[0]) c->list_prefix = a[0]; break;
     case K_WAVRT:  c->util = 1; c->util_a = a[0]; c->util_b = a[1]; break;
@@ -256,6 +259,24 @@ static int build_steer_set(const cli_config *cfg, aria_steer *items, aria_steer_
 }
 static void free_steer_set(aria_steer_set *set) {
     for (int i = 0; i < set->n; i++) free((void *)set->items[i].dir);
+}
+
+/* E12.9: load a '--lora <file.safetensors>[:alpha]' adapter. A trailing ':<number>'
+ * overrides alpha (scale = alpha/rank); anything else is treated as part of the path.
+ * Returns NULL on error (message printed). Caller frees with aria_lora_free. */
+static aria_lora_adapter *load_lora_arg(const char *spec) {
+    char buf[1024];
+    snprintf(buf, sizeof buf, "%s", spec);
+    float alpha = 0.0f;
+    char *colon = strrchr(buf, ':');
+    if (colon) {
+        char *end = NULL;
+        float v = strtof(colon + 1, &end);
+        if (end != colon + 1 && *end == '\0') { alpha = v; *colon = '\0'; }
+    }
+    aria_lora_adapter *a = aria_lora_load(buf, alpha);
+    if (!a) fprintf(stderr, "cannot load LoRA adapter %s\n", buf);
+    return a;
 }
 
 /* E13: batch mode -- run many generations against ONE resident ctx, amortizing model
@@ -642,6 +663,16 @@ int main(int argc, char **argv) {
             if (build_steer_set(&cfg, steer_items, &steer_set) != 0) { aria_free(ctx); return 1; }
             p.steer = &steer_set;
         }
+        aria_lora_adapter *lora = NULL;   /* E12.9 runtime LoRA adapter (CPU DiT) */
+        if (cfg.lora_spec) {
+            lora = load_lora_arg(cfg.lora_spec);
+            if (!lora) { free_steer_set(&steer_set); aria_free(ctx); return 1; }
+            p.lora = lora;
+            if (p.device != ARIA_DEVICE_CPU) {   /* GPU LoRA is E12.9b (not implemented) */
+                p.device = ARIA_DEVICE_CPU;
+                fprintf(stderr, "[lora] GPU LoRA is out of scope (E12.9b); running the DiT on the CPU\n");
+            }
+        }
         if (isatty(fileno(stderr))) p.progress = cli_progress;  /* live progress on a terminal */
         double best = 1e9;
         for (int b = 0; b < cfg.bench && rc == 0; b++) {
@@ -663,6 +694,7 @@ int main(int argc, char **argv) {
             aria_audio_free(audio);
         }
         free_steer_set(&steer_set);
+        if (lora) aria_lora_free(lora);
     } else if (cfg.do_info) {
         /* header already printed */
     }
