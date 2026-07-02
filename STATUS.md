@@ -108,7 +108,7 @@ cores (RTX 3070, sm_86 — bench there). fp16/bf16 fall back to fp32/fp16 for no
 | **M4** CUDA end-to-end generation | ✅ |
 | **M5** quantized (Q4) — medium fits low VRAM | ✅ |
 | **M6** medium model end-to-end | ✅ |
-| M7 steering (TasteSteer) | ⬜ |
+| **M7** steering | 🟡 | residual arm ✅ (add+project, CPU+GPU, graph-resident); latent/cond arms ⬜ |
 
 ## Epics — status
 
@@ -121,13 +121,14 @@ cores (RTX 3070, sm_86 — bench there). fp16/bf16 fall back to fp32/fp16 for no
 | **E4** SA3 DiT forward | ✅ | block-0 + full parity; **E4.5 ✅** differential attention (medium), synthetic 7.7e-7 |
 | **E5** taae_v2 decoder | ✅ | softnorm + chunked resampling + unpatch, full latent→audio parity |
 | **E6** Sampler + end-to-end | ✅ (E6.5 ⬜) | LogSNR + xoshiro + pingpong + e2e WAV; CFG/`--cfg` flag ⬜ (base-checkpoint only) |
-| **E7** continue / inpaint | ✅ | taae **encoder** (parity 9e-4), inpaint mask + local-add cond (exact), `--continue`/`--inpaint`, e2e parity (audio 2.4e-4); CPU DiT (GPU local-cond ⬜) |
-| **E8** CUDA backend | ✅ E8.1–E8.5d · ⬜ E8.5e/E8.6 | scaffold, all op kernels, device-resident **DiT + decoder**, profile-guided kernels (4.73→**0.29 s** warm — **on par with / ahead of PyTorch**); last micro-opts (E8.5e) + SSD streaming ⬜ |
+| **E7** continue / inpaint | ✅ | taae **encoder** (parity 9e-4), inpaint mask + local-add cond (exact), `--continue`/`--inpaint`, e2e parity (audio 2.4e-4); CPU **and GPU** DiT |
+| **E8** CUDA backend | ✅ E8.1–E8.5e (partial) · ⬜ E8.6 | device-resident DiT + decoder, profile-guided kernels, CUDA-graph denoise loop, QK-alpha fold + softmax-f16 fusion, medium-decoder glue fusion (E16.2); SSD streaming ⬜ |
 | **E9** Precision & Quantization | ✅ E9.1–E9.4 · 🟡 E9.0 | `aria_quant` (Q8/Q4 pack + dequant GEMM) + `--precision` seam on **CPU and GPU**; q8 2.45 %, **q4 fidelity-tuned to 9.3 %** (asym int4 + Q8 attention); GPU packs weights in VRAM (dequant-on-use); offline **`aria-quantize`** + `--load-quant`. **M5 reached** (medium fits the 3070 at q4). 🟡 E9.0 fp16/bf16 CPU storage still falls back to fp32 |
-| **E10** medium model | ✅ E10.1/E10.2 (CPU) | **medium end-to-end on CPU** — differential DiT (E4.5) + medium decoder (`aria_sa3_dec_medium`: sliding-window + sinusoidal FF); e2e parity audio 1.7e-2. GPU/quant for medium = perf follow-up |
-| **E11** Release polish (v1.0.0) | ⬜ | API/install finalize, CLI UX, Philox RNG, docs, CI |
-| **E12** Steering (TasteSteer) | ⬜ | latent / DiT-residual / cond-space hooks + `--steer` |
-| **E13** Batch / server | ✅ E13.3 · ⬜ E13.1/2 | enc/dec arena done (concurrency-clean); request-parallel + batched-forward APIs ⬜ |
+| **E10** medium model | ✅ | medium end-to-end on **CPU and GPU** (device differential DiT + banded decoder, 10 s warm 0.46 s); q4 fits the 3070 |
+| **E11** Release polish (v1.0.0) | ✅ E11.1–11.6 · 🔶 E11.7 | install/example/CI/progress/torch-RNG/docs done; pending the release tag |
+| **E12** Steering | 🟡 | **residual arm ✅**: add + projection ops, CPU+GPU, **graph-resident** (bf00c9e), `--steer` CLI, LoRA runtime arm (E12.9, CPU); latent (E12.2) / cond (E12.4) arms ⬜ (rejected at parse until wired) |
+| **E13** Batch / server | ✅ E13.0/E13.3 · ⬜ E13.1/2 | `--batch` resident jobs + **`aria-server`** HTTP binary (serialized worker; warm steered 0.185 s over HTTP); request-parallel + batched-forward APIs ⬜ |
+| **E14–E19** 2026-07 plan | ⬜/🟡 | streaming improvements, edge/Pi5 (E15.1 non-AVX2 fix ✅), long-form decode, GPU backlog, quant v2, tests/docs — see ROADMAP.md |
 
 ## Known gaps / notes
 
@@ -135,10 +136,10 @@ cores (RTX 3070, sm_86 — bench there). fp16/bf16 fall back to fp32/fp16 for no
   exported tokenizer (`scripts/export_tokenizer.py`). `--uncond` / `--prompt-embed` work without it.
 - **GT 1030 (2 GB)** is correctness-validation only (fits via fp16; slower than the CPU). Real GPU
   speed is the **RTX 3070** (sm_86).
-- **Continue/inpaint runs on the CPU DiT** — the device DiT has no local-cond path yet (follow-up).
-  Init WAV must already be at the model sample rate (44.1 kHz); no resampler yet.
+- Continue/inpaint init WAV must already be at the model sample rate (44.1 kHz); no resampler yet.
 - **Quantization**: q8 usable, q4 coarse; on CPU it's a footprint win not speed (scalar dequant
   GEMM). On GPU the weights are packed in VRAM (dequant-on-use) — the medium-fits path — but the
   speed win needs tensor cores (verify on the RTX 3070). q4 fidelity tuning pending.
-- Not implemented: medium (E10), steering (E12), batch/server APIs (E13.1/2), SSD streaming
-  (E8.6), GPU inpaint, offline `aria-quantize` (E9.2).
+- Not implemented: latent/cond steering arms (E12.2/E12.4), request-parallel + batched-forward
+  APIs (E13.1/2), SSD streaming (E8.6), NEON/ARM kernels (E15.2), windowed long-form decode on
+  GPU (E16.1b). Everything else in E0–E13 has shipped — see ROADMAP.md for the current plan.
