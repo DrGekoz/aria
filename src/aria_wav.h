@@ -9,6 +9,7 @@
 #ifndef ARIA_WAV_H
 #define ARIA_WAV_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 typedef struct {
@@ -23,6 +24,10 @@ void aria_audio_free(aria_audio *a);
 
 /* bits: 16 -> PCM16, 32 -> IEEE float32. Returns 0 on success, -1 on error. */
 int aria_wav_write(const char *path, const aria_audio *a, int bits);
+
+/* Same encoding into a malloc'd buffer (*out, *out_len); caller frees. 0 ok / -1 error.
+ * For in-memory consumers (e.g. the HTTP server response). */
+int aria_wav_to_mem(const aria_audio *a, int bits, void **out, size_t *out_len);
 
 /* Reads PCM16 / PCM24 / PCM32 / float32 WAV into interleaved float. NULL on error. */
 aria_audio *aria_wav_read(const char *path);

@@ -124,6 +124,10 @@ $(LIB): $(LIB_OBJS)
 aria: $(BUILD)/main.o $(BUILD)/aria_hpss.o $(LIB)
 	$(CC) $(CFLAGS) -I$(SRC) $(BUILD)/main.o $(BUILD)/aria_hpss.o -L$(BUILD) -laria $(LDFLAGS) -o $@
 
+# resident HTTP server (E13.2, ds4-server pattern): one worker thread owns the ctx
+aria-server: $(BUILD)/aria_server.o $(LIB)
+	$(CC) $(CFLAGS) -I$(SRC) $(BUILD)/aria_server.o -L$(BUILD) -laria $(LDFLAGS) -lpthread -o $@
+
 # ---- tests ----
 TESTS := test_ops test_wav test_config test_sampler test_arena test_quant test_rng
 test: $(LIB)
@@ -168,6 +172,7 @@ cuda:
 	rm -f $(BUILD)/*.o $(BUILD)/libaria.a aria   # CFLAGS change; keep dumps
 	$(NVCC) -ccbin $(CUDA_CCBIN) -arch=$(CUDA_ARCH) -O3 --default-stream per-thread -I$(SRC) -c $(SRC)/aria_cuda.cu -o $(BUILD)/aria_cuda.o
 	$(MAKE) aria CFLAGS="$(CUDA_CFLAGS)" LDFLAGS="$(CUDA_LDFLAGS)" EXTRA_LIB_OBJS="$(BUILD)/aria_cuda.o"
+	$(MAKE) aria-server CFLAGS="$(CUDA_CFLAGS)" LDFLAGS="$(CUDA_LDFLAGS)" EXTRA_LIB_OBJS="$(BUILD)/aria_cuda.o"
 
 # CUDA op parity vs CPU (skips cleanly if no device)
 test_cuda:

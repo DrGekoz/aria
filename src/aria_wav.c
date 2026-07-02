@@ -73,6 +73,48 @@ int aria_wav_write(const char *path, const aria_audio *a, int bits) {
     return 0;
 }
 
+static uint8_t *m_u32(uint8_t *p, uint32_t v) { p[0]=v&0xff; p[1]=(v>>8)&0xff; p[2]=(v>>16)&0xff; p[3]=(v>>24)&0xff; return p+4; }
+static uint8_t *m_u16(uint8_t *p, uint16_t v) { p[0]=v&0xff; p[1]=(v>>8)&0xff; return p+2; }
+
+int aria_wav_to_mem(const aria_audio *a, int bits, void **out, size_t *out_len) {
+    if (!a || !out || !out_len || (bits != 16 && bits != 32)) return -1;
+    int ch = a->channels;
+    int64_t nf = a->num_frames, n = nf * ch;
+    int bps = bits / 8;
+    uint32_t data_bytes = (uint32_t)(n * bps);
+    uint32_t block_align = (uint32_t)(ch * bps);
+    size_t total = 44 + data_bytes;
+    uint8_t *buf = malloc(total);
+    if (!buf) return -1;
+    uint8_t *p = buf;
+    memcpy(p, "RIFF", 4); p += 4;
+    p = m_u32(p, 36 + data_bytes);
+    memcpy(p, "WAVE", 4); p += 4;
+    memcpy(p, "fmt ", 4); p += 4;
+    p = m_u32(p, 16);
+    p = m_u16(p, (uint16_t)(bits == 32 ? 3 : 1));   /* 3=IEEE float, 1=PCM */
+    p = m_u16(p, (uint16_t)ch);
+    p = m_u32(p, (uint32_t)a->sample_rate);
+    p = m_u32(p, (uint32_t)a->sample_rate * block_align);
+    p = m_u16(p, (uint16_t)block_align);
+    p = m_u16(p, (uint16_t)bits);
+    memcpy(p, "data", 4); p += 4;
+    p = m_u32(p, data_bytes);
+    if (bits == 32) {
+        memcpy(p, a->data, (size_t)n * sizeof(float));
+    } else {
+        for (int64_t i = 0; i < n; i++) {
+            float s = clampf(a->data[i], -1.0f, 1.0f);
+            int32_t v = (int32_t)lrintf(s * 32767.0f);
+            if (v > 32767) v = 32767;
+            if (v < -32768) v = -32768;
+            p = m_u16(p, (uint16_t)(int16_t)v);
+        }
+    }
+    *out = buf; *out_len = total;
+    return 0;
+}
+
 static uint32_t r_u32(const uint8_t *p) { return p[0] | (p[1]<<8) | (p[2]<<16) | ((uint32_t)p[3]<<24); }
 static uint16_t r_u16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1]<<8)); }
 
