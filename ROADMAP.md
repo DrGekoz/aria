@@ -281,8 +281,9 @@ The intro claims SA3 fits a Pi 5-class device; nothing has been measured on ARM.
   (`vld1q_dup`+`vfmaq`, packing layer reused verbatim) + fp64-accum sumsq/rmsnorm.
   Pi 5: GEMM 34→58 GFLOP/s, 10 s clip 50.5→28.4 s (1.78×; DiT 1.90×), parity vs
   scalar 3.8e-5, x86 byte-unchanged. Attention left to autovec (<15 % post-port).
-  Follow-up **E15.2b**: q8/q4 dequant-GEMM NEON port (q8 is 3.5× slower than fp32
-  on the Pi today — footprint-only until then).
+  **E15.2b done (4a813da)**: NEON q8/q4 dequant-GEMM — small q8 on the Pi 276 → 67.1 s
+  (4.1×); enables **medium q4 on the Pi: 10 s clip 242 s at 6.79 GB peak** (with E16.1
+  windowed decode; fp32 medium would not fit). sdot int8 path = future micro-opt.
 - ⬜ **E15.3** **P2** Params-on-disk residency (`--params-disk`): per-DiT-block
   fault-in from mmap + `MADV_DONTNEED` after use → peak RAM = one block + arena
   (medium on an 8 GB Pi). aria already has both primitives. Verify: medium

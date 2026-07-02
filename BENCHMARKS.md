@@ -183,16 +183,22 @@ First measured deployment on the paper's edge device — **Raspberry Pi 5, 4× C
 8 GB**, small-music fp32, 8-step, CPU only (`make ARCHFLAGS="-mcpu=native"`), windowed
 decode (E16.1) active:
 
-| build | 10 s clip | 4 s clip | GEMM GFLOP/s | peak RSS |
-|---|---|---|---|---|
-| scalar / gcc autovec | 50.5 s | 29.9 s | 34 (K-blk 12.9) | ~1.9 GB |
-| **NEON (E15.2, 20ef680)** | **28.4 s** | 16.6 s | **58** (K-blk 52.6) | ~1.9 GB |
+| model / build | 10 s clip | peak RSS |
+|---|---|---|
+| small fp32, scalar / gcc autovec | 50.5 s | ~1.9 GB |
+| **small fp32, NEON (E15.2)** | **28.4 s** | ~1.9 GB |
+| small q8, scalar dequant | 276 s | 2.9 GB |
+| small q8, **NEON dequant (E15.2b)** | **67.1 s** (4.1×) | 2.9 GB |
+| **medium q4, NEON** | **242 s** | **6.79 GB — fits the 8 GB board** |
 
-≈ **0.35× realtime** for a 10 s stereo clip on a $80 board; NEON-vs-scalar parity 3.8e-5
-(fp reordering), full test suite green on ARM. q8 on this CPU is a *footprint* lever only
-(scalar dequant GEMM is ~3.5× slower than fp32+NEON). The pre-E16.1 baseline was 78 s /
-2.5 GB — windowed decode + NEON together took the Pi from 78 → 28.4 s and bounded decode
-memory. Remaining levers: q8 dequant-GEMM NEON port, threads-vs-thermals tuning.
+(small fp32 NEON: 4 s clip 16.6 s; GEMM 34 → 58 GFLOP/s, K-blocked 12.9 → 52.6.)
+
+≈ **0.35× realtime** for small on a $80 board, and — the paper's edge claim, measured —
+**the 1.2 B-parameter medium variant generates on the Pi at 4-bit** (windowed decode +
+q4 + NEON dequant are jointly the enabler: fp32 medium would not fit, and the pre-E16.1
+monolithic decode would have blown the 8 GB budget). NEON-vs-scalar parity 3.8e-5; full
+test suite green on ARM. Remaining levers: E15.3 params-on-disk (headroom below 6.8 GB),
+sdot int8 path, threads-vs-thermals tuning.
 
 ## Takeaways
 
