@@ -1327,6 +1327,12 @@ extern "C" void aria_cuda_dec_free(aria_cuda_dec *h) {
 #define MD_DEPTH 12
 #define MD_WIN   17
 
+/* E16.2: fuse the per-block extract+DyT+RoPE glue into one kernel per q/k/qd/kd.
+ * Compile with -DMED_FUSE_GLUE=0 to restore the old 13-launch/block path for an A/B byte compare. */
+#ifndef MED_FUSE_GLUE
+#define MED_FUSE_GLUE 1
+#endif
+
 /* Fused sliding-window attention: one warp per query (h,i) computes only the
  * [i-W, i+W] band (<= 2W+1 keys) -- QK via shuffle-reduce, softmax over the band in
  * shared, then AV. O(N*(2W+1)) instead of the full O(N^2)-then-mask, and no N*N score
@@ -1377,6 +1383,29 @@ __global__ void k_ff_singate(float *out, const float *proj, int S, int inner) {
     out[idx] = sinf(3.14159265359f * pr[inner + i]) * pr[i];
 }
 
+/* fused extract-head + per-head DyT (dynamic tanh) + RoPE -> head-major out[h,s,:hd].
+ * Medium-decoder analogue of the DiT's k_extract_normrope: replaces a k_extract_heads +
+ * k_dyt + k_rope chain (saves two [H,N,hd] HBM round-trips + two launches per q/k). One
+ * block per (h,s) row, hd threads (hd<=64). DyT is elementwise (no reduction), so shared
+ * mem only stages the DyT output for RoPE's i,i+rot/2 pairing. Math matches exactly:
+ * DyT y=tanh(alpha*x)*gamma+beta (aria_dynamic_tanh) then k_rope (same product order). */
+__global__ void k_extract_dytrope(float *out, const float *src, float alpha,
+                                  const float *g, const float *b,
+                                  const float *rcos, const float *rsin,
+                                  int S, int H, int hd, int stride, int off, int rot) {
+    int hs = blockIdx.x; if (hs >= H * S) return;
+    int s = hs % S, h = hs / S, d = threadIdx.x;
+    const float *sp = src + (size_t)s * stride + off + (size_t)h * hd;
+    __shared__ float vec[64];
+    vec[d] = tanhf(alpha * sp[d]) * g[d] + b[d];   /* DyT */
+    __syncthreads();
+    int rh = rot / 2; float res;
+    if (d >= rot)    res = vec[d];
+    else if (d < rh) res = vec[d] * rcos[(size_t)s * rh + d]      - vec[d + rh] * rsin[(size_t)s * rh + d];
+    else { int i = d - rh; res = vec[d] * rcos[(size_t)s * rh + i] + vec[i] * rsin[(size_t)s * rh + i]; }
+    out[(size_t)hs * hd + d] = res;
+}
+
 /* sliding-window self-attention (Nq=Nk=N), fused band kernel: one warp per query */
 static void attn_dev_band(float *out, const float *q, const float *k, const float *v,
                           int H, int N, int D, int W) {
@@ -1409,6 +1438,15 @@ static void med_block_dev(aria_cuda_dec_medium *h, float *seq, int N, const floa
     float *ob = da_alloc(ar, NH), *od = da_alloc(ar, NH), *merged = da_alloc(ar, (size_t)N * D);
     float *qkv = da_alloc(ar, (size_t)N * MD_QKV);
     gemm_f16w(h->cublas, ar, qkv, hh, w->to_qkv, NULL, N, D, MD_QKV);
+#if MED_FUSE_GLUE
+    /* v: plain extract (never normed/roped). q/k/qd/kd: fused extract+DyT+RoPE.
+     * 13 launches (5 extract + 4 dyt + 4 rope) -> 5 (1 extract + 4 fused). */
+    k_extract_heads<<<nblocks(NH), THREADS>>>(v, qkv, N, H, hd, MD_QKV, 2 * D);
+    k_extract_dytrope<<<H * N, hd>>>(q,  qkv, w->qn_alpha, w->qn_gamma, w->qn_beta, rcos, rsin, N, H, hd, MD_QKV, 0,     MD_ROT);
+    k_extract_dytrope<<<H * N, hd>>>(k,  qkv, w->kn_alpha, w->kn_gamma, w->kn_beta, rcos, rsin, N, H, hd, MD_QKV, D,     MD_ROT);
+    k_extract_dytrope<<<H * N, hd>>>(qd, qkv, w->qn_alpha, w->qn_gamma, w->qn_beta, rcos, rsin, N, H, hd, MD_QKV, 3 * D, MD_ROT);
+    k_extract_dytrope<<<H * N, hd>>>(kd, qkv, w->kn_alpha, w->kn_gamma, w->kn_beta, rcos, rsin, N, H, hd, MD_QKV, 4 * D, MD_ROT);
+#else
     k_extract_heads<<<nblocks(NH), THREADS>>>(q,  qkv, N, H, hd, MD_QKV, 0);
     k_extract_heads<<<nblocks(NH), THREADS>>>(k,  qkv, N, H, hd, MD_QKV, D);
     k_extract_heads<<<nblocks(NH), THREADS>>>(v,  qkv, N, H, hd, MD_QKV, 2 * D);
@@ -1423,6 +1461,7 @@ static void med_block_dev(aria_cuda_dec_medium *h, float *seq, int N, const floa
     k_rope<<<nblocks(hn), THREADS>>>(qd, rcos, rsin, H, N, hd, MD_ROT);
     k_rope<<<nblocks(hn), THREADS>>>(k,  rcos, rsin, H, N, hd, MD_ROT);
     k_rope<<<nblocks(hn), THREADS>>>(kd, rcos, rsin, H, N, hd, MD_ROT);
+#endif
     attn_dev_band(ob, q,  k,  v, H, N, hd, MD_WIN);
     attn_dev_band(od, qd, kd, v, H, N, hd, MD_WIN);
     k_subtract<<<nblocks(NH), THREADS>>>(ob, od, NH);
@@ -1504,6 +1543,18 @@ extern "C" void aria_cuda_dec_medium_forward(aria_cuda_dec_medium *h, float *aud
     /* seq[N, 1536]: token t at row t*17, new_tokens at the next 16 (no even-pad) */
     float *seq = da_alloc(&ar, (size_t)N * D);
     k_expand_tokens<<<nblocks((size_t)N * D), THREADS>>>(seq, x, h->new_tokens, T, T, D);
+    static int med_glue_reported = 0;
+    if (!med_glue_reported) {
+        med_glue_reported = 1;
+#if MED_FUSE_GLUE
+        fprintf(stderr, "[aria] med decoder head-glue FUSED: 13->5 launches/block "
+                "(5x extract+4x dyt+4x rope -> 1x extract + 4x extract_dytrope); "
+                "%d blocks/decode: %d->%d (-%d)\n", MD_DEPTH, 13 * MD_DEPTH, 5 * MD_DEPTH, 8 * MD_DEPTH);
+#else
+        fprintf(stderr, "[aria] med decoder head-glue UNFUSED: 13 launches/block "
+                "(%d blocks/decode: %d)\n", MD_DEPTH, 13 * MD_DEPTH);
+#endif
+    }
     for (int b = 0; b < MD_DEPTH; b++)
         med_block_dev(h, seq, N, rcos, rsin, &h->blocks[b], (MD_DEPTH - b) < 8, &ar);
 
