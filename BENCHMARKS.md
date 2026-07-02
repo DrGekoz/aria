@@ -70,6 +70,8 @@ The medium GPU dit dropped **1.45 → 1.28 s (−12 %)** by fusing the elementwi
 fp16 cast into softmax (commit `42962e0`, byte-identical output) removed two more S²·H passes
 per attention: 60 s GPU **medium 2.07 → 1.82 s (−12 %), small 0.67 → 0.60 s (−10 %)**;
 the SAT gap closed further, 1.57× → **1.38×** (medium) and 1.63× → **1.46×** (small).
+Fusing the medium-decoder head glue (E16.2, `cab0808`, byte-identical, 156 → 60 launches per
+decode) took 60 s medium to **1.73 s** — the gap is now **1.31×**.
 
 **small-music has no banded-decoder win** (its decoder already chunks → O(N·34) linear),
 so on CPU it's pure GEMM and MKL edges aria (1.3–1.5×); the medium CPU win is specifically
