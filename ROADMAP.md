@@ -293,12 +293,16 @@ stable-diffusion.cpp is its **rolling per-layer feature-cache decode**
 (`wan_vae.hpp`: carry the last K frames of each layer's activations across
 chunk boundaries → seam-free chunked decode with O(window) memory).
 
-- ⬜ **E16.1** **P1** Rolling feature-cache chunked decode for taae_v2: decode the
-  latent in windows, carrying per-layer halo activations (the banded/chunked
-  attention structure already bounds the receptive field — small S=34 midpoint
-  chunks, medium ±17 band). Peak decode memory O(window); unbounded-length output;
-  also serves E14.1 and the Pi-5 ceiling. Verify: byte/tolerance parity vs
-  monolithic decode on 10 s and 60 s clips.
+- ✅ **E16.1** **P1** Bounded-memory windowed decode (v1 = stateless halo-recompute,
+  CPU): each window decodes `[start−H, end+H)` and keeps `[start, end)`. Derived
+  halos: small **H=2** latent frames (two midpoint-shifted chunk passes compose to
+  ±2), medium **H=12** (12 blocks × ±17-token band = ±204 tokens = ±12 frames; rope
+  regenerated at each window's absolute offset). Auto above one window on the CPU
+  path; `ARIA_DEC_WINDOW=<seconds>` overrides (default 8 s, 0 = off). **Byte-identical**
+  to monolithic (both models, e2e cmp); 60 s medium decode peak RSS **−1.06 GB (−36 %)**.
+  Windowed-vs-monolithic gates in test_dec / test_dec_medium. Follow-ups: **E16.1b**
+  GPU windowed decode; **E16.1c** stateful feature-cache (sd.cpp wan_vae, saves the
+  2H recompute) + streaming/continue paths honoring `ARIA_DEC_WINDOW`.
 - ⬜ **E16.2** **P1** Medium GPU decoder glue fusion: `med_block_dev` still runs
   5×extract + 4×dyt + 4×rope as separate launches per block (the DiT got this
   fusion pass in E8.5d/e; the decoder didn't). Fuse into the extract/norm kernels.

@@ -8,10 +8,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <math.h>
 
 static const char *DUMPS;
 static int fails = 0;
+
+/* deterministic pseudo-random latent fill (LCG), so the windowed==monolithic gate
+ * is hermetic given the model weights (no PyTorch dump needed). */
+static void fill_latent(float *lat, int64_t n, uint64_t seed) {
+    uint64_t s = seed;
+    for (int64_t i = 0; i < n; i++) {
+        s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+        lat[i] = (float)(s >> 33) / 2147483648.0f - 1.0f;   /* ~U(-1,1) */
+    }
+}
 
 static int load(const char *name, aria_parity_tensor *t) {
     char path[1024];
@@ -36,7 +47,7 @@ static void compare(const char *what, const float *got, const float *ref, int64_
 int main(void) {
     const char *model = getenv("ARIA_MODEL");
     DUMPS = getenv("ARIA_DUMPS");
-    if (!model || !DUMPS) { printf("test_dec: SKIP (set ARIA_MODEL and ARIA_DUMPS)\n"); return 0; }
+    if (!model) { printf("test_dec: SKIP (set ARIA_MODEL)\n"); return 0; }
 
     char path[1024];
     snprintf(path, sizeof(path), "%s/model.safetensors", model);
@@ -44,6 +55,30 @@ int main(void) {
     if (!sf) { printf("FAIL: open safetensors\n"); return 1; }
     aria_sa3_dec *m = aria_sa3_dec_load(sf);
     if (!m) { printf("FAIL: decoder load\n"); safetensors_close(sf); return 1; }
+
+    /* E16.1 gate: windowed decode must be byte-identical to the monolithic decode.
+     * Model-backed but hermetic (fixed synthetic latent; no PyTorch dump needed). */
+    {
+        int T = 220;   /* ~20.4 s; W=86 (~8 s) => 3 windows incl. a partial last one */
+        int64_t nl = (int64_t)256 * T, na = (int64_t)2 * T * 4096;
+        float *lat = malloc((size_t)nl * sizeof(float));
+        fill_latent(lat, nl, 0xA53F00D1ULL);
+        float *mono = malloc((size_t)na * sizeof(float));
+        float *win  = malloc((size_t)na * sizeof(float));
+        aria_sa3_dec_forward(m, mono, lat, T);
+        aria_sa3_dec_forward_windowed(m, win, lat, T, 86);
+        float md = aria_parity_maxabsdiff(mono, win, na);
+        if (md != 0.0f) { printf("FAIL windowed(small): T=%d W=86 maxdiff=%.3e (want byte-exact)\n", T, md); fails++; }
+        else printf("ok   windowed(small): T=%d W=86 maxdiff=0 (byte-identical)\n", T);
+        free(lat); free(mono); free(win);
+    }
+
+    if (!DUMPS) {
+        printf("test_dec: windowed gate only (set ARIA_DUMPS for PyTorch parity)\n");
+        aria_sa3_dec_free(m); safetensors_close(sf);
+        if (fails) { printf("test_dec: FAILED\n"); return 1; }
+        printf("test_dec: OK\n"); return 0;
+    }
 
     aria_parity_tensor latent, soft, decref, audref;
     if (load("latent.atns", &latent) || load("after_softnorm.atns", &soft) ||

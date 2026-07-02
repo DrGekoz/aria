@@ -38,6 +38,18 @@ void aria_sa3_dec_medium_forward(const aria_sa3_dec_medium *m, float *audio, con
 /* full decode: latent[256,T] -> out_audio[2, T*4096] (caller allocates). */
 void aria_sa3_dec_forward(const aria_sa3_dec *m, float *out_audio, const float *latent, int T);
 
+/* ---- E16.1 bounded-memory windowed decode (CPU) ----
+ * Decode the latent in W-frame windows with a halo of the decoder's receptive
+ * field, keeping and concatenating only each window's interior. Peak decode arena
+ * is O(window) instead of O(T), yet the output is byte-identical to the monolithic
+ * decode (the halo derivation is in aria_sa3_dec.c / aria_sa3_dec_medium.c).
+ * window_frames <= 0 selects a built-in default (~8 s). GPU windowed decode is
+ * future work (E16.1b) -- the CUDA decoders stay monolithic. */
+void aria_sa3_dec_forward_windowed(const aria_sa3_dec *m, float *out_audio,
+                                   const float *latent, int T, int window_frames);
+void aria_sa3_dec_medium_forward_windowed(const aria_sa3_dec_medium *m, float *audio,
+                                          const float *latent, int T, int window_frames);
+
 /* ---- stage entry points (staged parity) ---- */
 void aria_sa3_softnorm_decode(const aria_sa3_dec *m, float *z, const float *latent, int T); /* z[256,T] */
 void aria_sa3_same_decode(const aria_sa3_dec *m, float *dec, const float *z, int T);        /* dec[512,T*16] */

@@ -1,6 +1,7 @@
 build/
 aria
 aria-quantize
+aria-server
 example
 *.o
 *.a

@@ -114,6 +114,54 @@ void aria_sa3_dec_forward(const aria_sa3_dec *m, float *out_audio, const float *
     free(dec);
 }
 
+/* ---- E16.1 windowed decode (small-music) ------------------------------------
+ * The decoder's receptive field in LATENT-FRAME space is small, so we can decode
+ * frames [start, end) exactly by feeding the slice [A, B) = [start-H, end+H) and
+ * keeping only [start, end). Derivation (from aria_sa3_same_decode + taae_chunk_pass):
+ *
+ *   Each latent frame f expands to a 17-token group (1 proj token + 16 new_tokens),
+ *   so seq position p belongs to frame p/17. The two chunk passes are the ONLY
+ *   cross-frame mixing (proj, extract, WNConv1d k3, unpatch are per-frame or +/-1):
+ *     - pass 1 (shift=0): disjoint S=34 chunks = frame pairs {0,1},{2,3},...  No
+ *       leakage across a pair.
+ *     - pass 2 (shift=1): pad 17 front/back then S=34 chunks = frame pairs
+ *       {1,2},{3,4},...  i.e. the midpoint shift straddles the pass-1 pairs.
+ *   Composing the two: an output frame f's pass-2 chunk is {f-1,f} (f even) or
+ *   {f,f+1} (f odd); each of those frames' pass-1 chunk pulls in one more neighbour,
+ *   giving a receptive field of [f-2,f+1] (even) / [f-1,f+2] (odd) -- at most +/-2
+ *   frames. Pass 1 has no padding (exact for every in-slice frame once A is even so
+ *   the local pairing matches the global one); pass 2's edge padding corrupts only
+ *   the slice's first (A) and last (B-1) frame, both discarded in the halo. The k3
+ *   mapping conv adds only a +/-1 feat-position (<< 1 frame) dependency.
+ *   => H = 2 latent frames, with A snapped DOWN and B snapped UP to the 2-frame
+ *      (S=34) chunk grid. At the true edges (A=0 / B=T) the slice padding matches
+ *      the monolithic padding, so no halo is needed there. Result is byte-identical.
+ * Peak arena is O(window): seq/feat/mapped/audio-slice all size to B-A, not T. */
+#define DEC_WIN_HALO 2   /* latent frames; see derivation above */
+
+void aria_sa3_dec_forward_windowed(const aria_sa3_dec *m, float *out_audio,
+                                   const float *latent, int T, int window_frames) {
+    int W = window_frames > 0 ? window_frames : 86;   /* ~8 s at 44.1 kHz / 4096 */
+    const int H = DEC_WIN_HALO;
+    int maxwf = W + 2 * H + 2;                          /* upper bound on slice frames */
+    float *lat_slice = malloc((size_t)256 * maxwf * sizeof(float));
+    float *aud_slice = malloc((size_t)2 * maxwf * 4096 * sizeof(float));
+    for (int start = 0; start < T; start += W) {
+        int end = start + W; if (end > T) end = T;
+        int A = start - H; if (A < 0) A = 0; A -= (A & 1);        /* snap down to even */
+        int B = end + H;   if (B > T) B = T; else if (B & 1) B++; /* interior: snap up to even */
+        int wf = B - A;
+        for (int c = 0; c < 256; c++)
+            memcpy(lat_slice + (size_t)c * wf, latent + (size_t)c * T + A, (size_t)wf * sizeof(float));
+        aria_sa3_dec_forward(m, aud_slice, lat_slice, wf);       /* audio[2, wf*4096] */
+        for (int c = 0; c < 2; c++)
+            memcpy(out_audio + (size_t)c * T * 4096 + (size_t)start * 4096,
+                   aud_slice + (size_t)c * wf * 4096 + (size_t)(start - A) * 4096,
+                   (size_t)(end - start) * 4096 * sizeof(float));
+    }
+    free(lat_slice); free(aud_slice);
+}
+
 void aria_sa3_dec_block_test(const aria_sa3_dec *m, int idx, float *xc, int N) {
     float *rcos = malloc((size_t)N * (DEC_ROT / 2) * sizeof(float));
     float *rsin = malloc((size_t)N * (DEC_ROT / 2) * sizeof(float));

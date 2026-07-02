@@ -383,15 +383,29 @@ static int sa3_generate(aria_ctx *ctx, void *state,
 #endif
     aria_sa3_dit_req_end(req);
 
-    /* decode -> interleaved stereo (GPU if the DiT ran there, else CPU) */
+    /* decode -> interleaved stereo (GPU if the DiT ran there, else CPU).
+     * E16.1: on the CPU, decode long latents in ~8 s windows (halo-recompute) so
+     * peak decode arena is O(window) not O(T) -- byte-identical to monolithic.
+     * ARIA_DEC_WINDOW=<seconds> overrides the window (0 disables). GPU windowed
+     * decode is future work (E16.1b): the device decoders stay monolithic. */
+    double win_s = 8.0;
+    const char *we = getenv("ARIA_DEC_WINDOW");
+    if (we && we[0]) win_s = atof(we);
+    int win_frames = win_s > 0 ? (int)lround(win_s * st->sample_rate / st->cfg.downsampling_ratio) : 0;
+    int windowed = win_frames > 0 && T > win_frames;   /* only when there's >1 window */
     float *audio = malloc((size_t)2 * T * 4096 * sizeof(float));
 #ifdef ARIA_CUDA
     if (st->cdec_med)  aria_cuda_dec_medium_forward(st->cdec_med, audio, x, T);
     else if (st->cdec) aria_cuda_dec_forward(st->cdec, audio, x, T);
     else
 #endif
-    if (st->is_medium) aria_sa3_dec_medium_forward(st->dec_med, audio, x, T);
-    else               aria_sa3_dec_forward(st->dec, audio, x, T);
+    if (st->is_medium) {
+        if (windowed) aria_sa3_dec_medium_forward_windowed(st->dec_med, audio, x, T, win_frames);
+        else          aria_sa3_dec_medium_forward(st->dec_med, audio, x, T);
+    } else {
+        if (windowed) aria_sa3_dec_forward_windowed(st->dec, audio, x, T, win_frames);
+        else          aria_sa3_dec_forward(st->dec, audio, x, T);
+    }
 #ifdef ARIA_CUDA
     /* once the DiT+decoder are device-resident, the host F32 weights aren't read on
      * the hot path again -- drop them to reclaim ~the model size of host RSS. The few

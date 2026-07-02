@@ -129,8 +129,26 @@ void aria_sa3_dec_medium_get_view(const aria_sa3_dec_medium *m, aria_sa3_dec_med
     }
 }
 
-/* latent[256,T] -> audio[2, T*4096] */
-void aria_sa3_dec_medium_forward(const aria_sa3_dec_medium *m, float *audio, const float *latent, int T) {
+/* rope cos/sin for ABSOLUTE token positions [pos0, pos0+n). Same formula as
+ * aria_rope_freqs (base 10000, TAAE_ROT rotated dims); byte-identical to it when
+ * pos0 == 0. The offset lets a decode window carry its tokens' true global rotary
+ * phase so band attention matches the monolithic decode bit-for-bit (E16.1). */
+static void med_rope_freqs_at(float *cos_t, float *sin_t, int n, int pos0) {
+    const int rh = TAAE_ROT / 2;
+    for (int i = 0; i < rh; i++) {
+        double inv = 1.0 / pow(10000.0, (double)(2 * i) / (double)TAAE_ROT);
+        for (int p = 0; p < n; p++) {
+            double ang = (double)(pos0 + p) * inv;
+            cos_t[(size_t)p * rh + i] = (float)cos(ang);
+            sin_t[(size_t)p * rh + i] = (float)sin(ang);
+        }
+    }
+}
+
+/* decode latent[256,T] -> audio[2, T*4096]; the seq's first token sits at absolute
+ * rope position pos0 (= 0 for a monolithic decode, = A*17 for the window [A,B)). */
+static void med_decode_slice(const aria_sa3_dec_medium *m, float *audio,
+                             const float *latent, int T, int pos0) {
     const int D = MED_D;
     int N = T * MED_SEG;                  /* full token sequence length */
 
@@ -155,10 +173,10 @@ void aria_sa3_dec_medium_forward(const aria_sa3_dec_medium *m, float *audio, con
     }
     free(proj);
 
-    /* rope; sliding-window attention (band half-width [17,17]) computed directly */
+    /* rope (absolute pos0 offset); sliding-window attention (band half-width [17,17]) */
     float *rc = malloc((size_t)N * (TAAE_ROT / 2) * sizeof(float));
     float *rs = malloc((size_t)N * (TAAE_ROT / 2) * sizeof(float));
-    aria_rope_freqs(rc, rs, N, TAAE_ROT, 10000.0f);
+    med_rope_freqs_at(rc, rs, N, pos0);
 
     /* 4. 12 blocks over the full sequence; blocks with (depth-i) < 8 are sinusoidal */
     aria_arena ar;
@@ -185,4 +203,49 @@ void aria_sa3_dec_medium_forward(const aria_sa3_dec_medium *m, float *audio, con
     free(feat);
     aria_unpatch_stereo(audio, mapped, Lt);   /* [2, Lt*256] = [2, T*4096] */
     free(mapped);
+}
+
+/* latent[256,T] -> audio[2, T*4096] */
+void aria_sa3_dec_medium_forward(const aria_sa3_dec_medium *m, float *audio, const float *latent, int T) {
+    med_decode_slice(m, audio, latent, T, 0);
+}
+
+/* ---- E16.1 windowed decode (medium) ----------------------------------------
+ * Medium mixes frames ONLY through 12 blocks of sliding-window (banded) attention,
+ * half-width win=17 TOKENS per block. Everything else (proj, extract, WNConv1d k1,
+ * unpatch) is per-frame. After 12 blocks a token has spread +/-12*17 = +/-204 tokens;
+ * at 17 tokens/frame that is +/-12 latent frames -- the exact receptive field.
+ *   Recomputing each window over its whole slice, block b corrupts tokens within
+ *   b*17 of the window edge (their band hits the slice clamp instead of the true
+ *   neighbour), so after 12 blocks the outer 204 tokens = 12 frames of each edge are
+ *   wrong. Keeping only [start,end) with a 12-frame halo discards them.
+ *   RoPE is translation-covariant but not bit-exact under a position shift, so each
+ *   window's rope is generated at its ABSOLUTE offset (A*17); band attention over an
+ *   interior token then reuses identical q/k/v as the monolithic decode. At the true
+ *   edges (A=0 / B=T) the slice clamp equals the monolithic clamp, so no halo needed.
+ *   => H = 12 latent frames; frame alignment is arbitrary (band + absolute rope).
+ *      Byte-identical output; peak arena O(window) (taae_med_block_floats(N=wf*17)). */
+#define MED_WIN_HALO 12   /* latent frames = 12 blocks * 17-token band / 17 tokens/frame */
+
+void aria_sa3_dec_medium_forward_windowed(const aria_sa3_dec_medium *m, float *audio,
+                                          const float *latent, int T, int window_frames) {
+    int W = window_frames > 0 ? window_frames : 86;   /* ~8 s at 44.1 kHz / 4096 */
+    const int H = MED_WIN_HALO;
+    int maxwf = W + 2 * H;
+    float *lat_slice = malloc((size_t)256 * maxwf * sizeof(float));
+    float *aud_slice = malloc((size_t)2 * maxwf * 4096 * sizeof(float));
+    for (int start = 0; start < T; start += W) {
+        int end = start + W; if (end > T) end = T;
+        int A = start - H; if (A < 0) A = 0;      /* any frame aligns (band + absolute rope) */
+        int B = end + H;   if (B > T) B = T;
+        int wf = B - A;
+        for (int c = 0; c < 256; c++)
+            memcpy(lat_slice + (size_t)c * wf, latent + (size_t)c * T + A, (size_t)wf * sizeof(float));
+        med_decode_slice(m, aud_slice, lat_slice, wf, A * MED_SEG);   /* audio[2, wf*4096] */
+        for (int c = 0; c < 2; c++)
+            memcpy(audio + (size_t)c * T * 4096 + (size_t)start * 4096,
+                   aud_slice + (size_t)c * wf * 4096 + (size_t)(start - A) * 4096,
+                   (size_t)(end - start) * 4096 * sizeof(float));
+    }
+    free(lat_slice); free(aud_slice);
 }
