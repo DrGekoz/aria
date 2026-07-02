@@ -12,6 +12,7 @@
 #include "aria_sa3_dec.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <mma.h>
 #include <cublas_v2.h>
 #include <cstdio>
 #include <cstdlib>
@@ -1406,10 +1407,131 @@ __global__ void k_extract_dytrope(float *out, const float *src, float alpha,
     out[(size_t)hs * hd + d] = res;
 }
 
-/* sliding-window self-attention (Nq=Nk=N), fused band kernel: one warp per query */
+/* E17: tensor-core sliding-window attention. One warp per (head, 16-query tile) instead
+ * of per-query. The union band of a 16-query tile is [q0-W, q0+15+W] (<= 2W+1+15 keys);
+ * padded to ABW_KP=64 it tiles cleanly for wmma 16x16x16. Q/K/V staged fp16 in shared,
+ * QK^T and AV on tensor cores (fp32 accumulate), softmax fp32 over the exact per-row band
+ * -- same key set/masking as the scalar k_attn_band, so numerically it differs only by the
+ * fp16 rounding of Q/K/V/P (the same precision the DiT/FF GEMMs already run at). Requires
+ * D==64 and 2W+1+15 <= 64 (medium: W=17 -> 50); the host falls back to the scalar kernel
+ * otherwise (and on pre-Volta, where wmma is unavailable). */
+#define ABW_QB 16   /* queries per tile (one wmma M-tile) */
+#define ABW_KP 64   /* padded band width: multiple of 16, >= (2W+1)+(ABW_QB-1) */
+
+__global__ void k_attn_band_wmma(float *out, const float *q, const float *k, const float *v,
+                                 int H, int N, int D, float scale, int W) {
+#if __CUDA_ARCH__ >= 700
+    using namespace nvcuda::wmma;
+    int nqb = (N + ABW_QB - 1) / ABW_QB;
+    int h = blockIdx.x / nqb, qb = blockIdx.x % nqb;
+    if (h >= H) return;
+    int q0 = qb * ABW_QB, kstart = q0 - W, lane = threadIdx.x;
+
+    __shared__ __half sQ[ABW_QB * 64];
+    __shared__ __half sK[ABW_KP * 64];
+    __shared__ __half sV[ABW_KP * 64];
+    __shared__ float  sS[ABW_QB * ABW_KP];
+    __shared__ __half sP[ABW_QB * ABW_KP];
+    __shared__ float  sO[ABW_QB * 64];
+
+    const float *qb_ = q + (size_t)h * N * 64;
+    const float *kb_ = k + (size_t)h * N * 64;
+    const float *vb_ = v + (size_t)h * N * 64;
+
+    for (int idx = lane; idx < ABW_QB * 64; idx += 32) {   /* Q tile [16,64], pad rows -> 0 */
+        int r = idx >> 6, c = idx & 63, qg = q0 + r;
+        sQ[idx] = qg < N ? __float2half(qb_[(size_t)qg * 64 + c]) : (__half)0;
+    }
+    for (int idx = lane; idx < ABW_KP * 64; idx += 32) {   /* K/V band [64,64], OOB keys -> 0 */
+        int r = idx >> 6, c = idx & 63, kg = kstart + r, ok = kg >= 0 && kg < N;
+        sK[idx] = ok ? __float2half(kb_[(size_t)kg * 64 + c]) : (__half)0;
+        sV[idx] = ok ? __float2half(vb_[(size_t)kg * 64 + c]) : (__half)0;
+    }
+    __syncwarp();
+
+    for (int nt = 0; nt < ABW_KP / 16; nt++) {             /* sS[16,64] = Q @ K^T (fp32 acc) */
+        fragment<accumulator, 16, 16, 16, float> acc;
+        fill_fragment(acc, 0.0f);
+        for (int kt = 0; kt < 4; kt++) {                   /* contract over D=64 */
+            fragment<matrix_a, 16, 16, 16, __half, row_major> a;
+            fragment<matrix_b, 16, 16, 16, __half, col_major> b;
+            load_matrix_sync(a, sQ + kt * 16, 64);
+            load_matrix_sync(b, sK + nt * 16 * 64 + kt * 16, 64);
+            mma_sync(acc, a, b, acc);
+        }
+        store_matrix_sync(sS + nt * 16, acc, ABW_KP, mem_row_major);
+    }
+    __syncwarp();
+
+    if (lane < ABW_QB) {                                   /* fp32 softmax over the row's band */
+        int r = lane, lo = r, hi = r + 2 * W;              /* relative band: kj in [r, r+2W] */
+        float mx = -INFINITY;
+        for (int kj = lo; kj <= hi; kj++) {
+            int kg = kstart + kj; if (kg < 0 || kg >= N) continue;
+            float s = sS[r * ABW_KP + kj] * scale; sS[r * ABW_KP + kj] = s;
+            mx = fmaxf(mx, s);
+        }
+        float sum = 0.0f;
+        for (int kj = lo; kj <= hi; kj++) {
+            int kg = kstart + kj; if (kg < 0 || kg >= N) continue;
+            float e = __expf(sS[r * ABW_KP + kj] - mx); sS[r * ABW_KP + kj] = e; sum += e;
+        }
+        float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+        for (int kj = 0; kj < ABW_KP; kj++) {
+            int kg = kstart + kj;
+            float p = (kj >= lo && kj <= hi && kg >= 0 && kg < N) ? sS[r * ABW_KP + kj] * inv : 0.0f;
+            sP[r * ABW_KP + kj] = __float2half(p);
+        }
+    }
+    __syncwarp();
+
+    for (int nt = 0; nt < 4; nt++) {                       /* sO[16,64] = P @ V (fp32 acc) */
+        fragment<accumulator, 16, 16, 16, float> acc;
+        fill_fragment(acc, 0.0f);
+        for (int kt = 0; kt < ABW_KP / 16; kt++) {         /* contract over the 64 band keys */
+            fragment<matrix_a, 16, 16, 16, __half, row_major> a;
+            fragment<matrix_b, 16, 16, 16, __half, row_major> b;
+            load_matrix_sync(a, sP + kt * 16, ABW_KP);
+            load_matrix_sync(b, sV + kt * 16 * 64 + nt * 16, 64);
+            mma_sync(acc, a, b, acc);
+        }
+        store_matrix_sync(sO + nt * 16, acc, 64, mem_row_major);
+    }
+    __syncwarp();
+
+    for (int idx = lane; idx < ABW_QB * 64; idx += 32) {
+        int r = idx >> 6, c = idx & 63, qg = q0 + r;
+        if (qg < N) out[((size_t)h * N + qg) * 64 + c] = sO[idx];
+    }
+#else
+    (void)out; (void)q; (void)k; (void)v; (void)H; (void)N; (void)D; (void)scale; (void)W;
+#endif
+}
+
+/* Volta+ (tensor cores) gate for the wmma band path; ARIA_BAND_SCALAR=1 forces the scalar
+ * kernel (A/B the two on one binary). Cached -- cudaGetDeviceProperties is not free. */
+static int band_use_tc(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("ARIA_BAND_SCALAR");
+        if (e && e[0] && e[0] != '0') return (v = 0);
+        cudaDeviceProp p;
+        v = (cudaGetDeviceProperties(&p, 0) == cudaSuccess && p.major >= 7) ? 1 : 0;
+    }
+    return v;
+}
+
+/* sliding-window self-attention (Nq=Nk=N): tensor-core tile kernel where supported,
+ * else the fused warp-per-query scalar kernel. */
 static void attn_dev_band(float *out, const float *q, const float *k, const float *v,
                           int H, int N, int D, int W) {
-    k_attn_band<<<H * N, 32>>>(out, q, k, v, H, N, D, 1.0f / sqrtf((float)D), W);
+    float scale = 1.0f / sqrtf((float)D);
+    if (band_use_tc() && D == 64 && (2 * W + 1) + (ABW_QB - 1) <= ABW_KP) {
+        int nqb = (N + ABW_QB - 1) / ABW_QB;
+        k_attn_band_wmma<<<H * nqb, 32>>>(out, q, k, v, H, N, D, scale, W);
+        return;
+    }
+    k_attn_band<<<H * N, 32>>>(out, q, k, v, H, N, D, scale, W);
 }
 
 struct aria_cuda_dec_medium {
