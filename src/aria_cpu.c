@@ -65,6 +65,25 @@ static inline double aria_sumsq_f(const float *x, int dim) {
     for (; i < dim; i++) ss += (double)x[i] * x[i];
     return ss;
 }
+#elif defined(__ARM_NEON)
+#include <arm_neon.h>
+#define ARIA_NEON 1
+/* sum of x[i]^2 accumulated in double (2-wide f64x2 NEON), matching the AVX2/scalar
+ * double reduction the RMS norms rely on, within float tolerance. AArch64 f64 NEON. */
+static inline double aria_sumsq_f(const float *x, int dim) {
+    float64x2_t a0 = vdupq_n_f64(0.0), a1 = vdupq_n_f64(0.0);
+    int i = 0;
+    for (; i + 4 <= dim; i += 4) {
+        float32x4_t xv = vld1q_f32(x + i);
+        float64x2_t xl = vcvt_f64_f32(vget_low_f32(xv));
+        float64x2_t xh = vcvt_f64_f32(vget_high_f32(xv));
+        a0 = vfmaq_f64(a0, xl, xl);
+        a1 = vfmaq_f64(a1, xh, xh);
+    }
+    double ss = vaddvq_f64(a0) + vaddvq_f64(a1);
+    for (; i < dim; i++) ss += (double)x[i] * x[i];
+    return ss;
+}
 #else
 /* scalar sum of x[i]^2 in double -- matches the AVX2 double-accumulation reduction
  * (used by the RMS norms) within float tolerance when built without AVX2/FMA. */
@@ -118,15 +137,27 @@ static inline void aria_microkernel(float *y, const float *x, const float *W, co
             y[(size_t)(m + i) * N + (n + j)] = s;
         }
 }
+#endif  /* ARIA_AVX2 dot-product microkernel */
 
+#if defined(ARIA_AVX2) || defined(ARIA_NEON)
 /* ---- packed outer-product GEMM (BLIS-style) ----
  * A (x) is packed once into k-major MR-panels; each NR-panel of B (W) is packed on
  * the fly. The microkernel does pure outer products (broadcast A, fma into NR-wide B
  * accumulators) -- no horizontal sums, fully contiguous reads -- beating the
  * dot-product kernel's ~235 GFLOP/s ceiling on the SA3 shapes. Each output is a
- * sequential-k accumulation (within parity tolerance of the reference). */
+ * sequential-k accumulation (within parity tolerance of the reference). The packing
+ * layer is ISA-agnostic; only the microkernel differs (AVX2 6x16 ymm / NEON 6x16 q). */
+#if defined(ARIA_AVX2)
 #define PMR 6
 #define PNR 16
+#elif defined(ARIA_NEON)
+#ifndef PMR
+#define PMR 6
+#endif
+#ifndef PNR
+#define PNR 16
+#endif
+#endif
 static void pack_a_panel(float *dst, const float *x, int m0, int M, int K) {
     for (int i = 0; i < PMR; i++) {
         int m = m0 + i;
@@ -141,6 +172,7 @@ static void pack_b_panel(float *dst, const float *W, int n0, int N, int pc, int 
         else       { for (int k = 0; k < kc; k++) dst[k * PNR + j] = 0.0f; }
     }
 }
+#if defined(ARIA_AVX2)
 /* K-blocked microkernel: accumulates a KC-slice into y (C in memory across K-blocks).
  * full-N tile (n0+PNR<=N), edge-M guarded; bias added on the last K-block. */
 static inline void ukern_acc(float *y, int N, const float *Ap, const float *Bp, int kc,
@@ -202,6 +234,72 @@ static inline void ukern_6x16(float *y, int N, const float *Ap, const float *Bp,
         }
     }
 }
+#elif defined(ARIA_NEON)
+/* NEON port of the two microkernels above. Same PMR x PNR register tile (6x16 =
+ * 24 float32x4 accumulators, + PNR/4 B-vecs + 1 broadcast A ~= 29 of 32 q-regs),
+ * same pure outer product (vld1q_dup broadcast of A, vfmaq into PNR-wide B
+ * accumulators), same sequential-k accumulation order as the AVX2 path. */
+#define NBV (PNR / 4)
+static inline void ukern_acc(float *y, int N, const float *Ap, const float *Bp, int kc,
+                             const float *bias, int m0, int n0, int M, int first, int last) {
+    float32x4_t c[PMR][NBV];
+    int em = m0 + PMR > M;
+    for (int i = 0; i < PMR; i++) {
+        if (first || (em && m0 + i >= M)) { for (int j = 0; j < NBV; j++) c[i][j] = vdupq_n_f32(0.0f); }
+        else { float *yr = y + (size_t)(m0 + i) * N + n0; for (int j = 0; j < NBV; j++) c[i][j] = vld1q_f32(yr + 4 * j); }
+    }
+    for (int k = 0; k < kc; k++) {
+        float32x4_t bb[NBV];
+        for (int j = 0; j < NBV; j++) bb[j] = vld1q_f32(Bp + (size_t)k * PNR + 4 * j);
+        const float *ap = Ap + (size_t)k * PMR;
+        for (int i = 0; i < PMR; i++) {
+            float32x4_t a = vld1q_dup_f32(ap + i);
+            for (int j = 0; j < NBV; j++) c[i][j] = vfmaq_f32(c[i][j], a, bb[j]);
+        }
+    }
+    if (last && bias)
+        for (int i = 0; i < PMR; i++)
+            for (int j = 0; j < NBV; j++) c[i][j] = vaddq_f32(c[i][j], vld1q_f32(bias + n0 + 4 * j));
+    for (int i = 0; i < PMR && m0 + i < M; i++) {
+        float *yr = y + (size_t)(m0 + i) * N + n0;
+        for (int j = 0; j < NBV; j++) vst1q_f32(yr + 4 * j, c[i][j]);
+    }
+}
+static inline void ukern_6x16(float *y, int N, const float *Ap, const float *Bp, int K,
+                              const float *bias, int m0, int n0, int M) {
+    float32x4_t c[PMR][NBV];
+    for (int i = 0; i < PMR; i++) for (int j = 0; j < NBV; j++) c[i][j] = vdupq_n_f32(0.0f);
+    for (int k = 0; k < K; k++) {
+        float32x4_t bb[NBV];
+        for (int j = 0; j < NBV; j++) bb[j] = vld1q_f32(Bp + (size_t)k * PNR + 4 * j);
+        const float *ap = Ap + (size_t)k * PMR;
+        for (int i = 0; i < PMR; i++) {
+            float32x4_t a = vld1q_dup_f32(ap + i);
+            for (int j = 0; j < NBV; j++) c[i][j] = vfmaq_f32(c[i][j], a, bb[j]);
+        }
+    }
+    if (n0 + PNR <= N && m0 + PMR <= M) {                 /* full tile: vector store */
+        for (int i = 0; i < PMR; i++) {
+            float *yr = y + (size_t)(m0 + i) * N + n0;
+            for (int j = 0; j < NBV; j++) {
+                float32x4_t o = c[i][j];
+                if (bias) o = vaddq_f32(o, vld1q_f32(bias + n0 + 4 * j));
+                vst1q_f32(yr + 4 * j, o);
+            }
+        }
+    } else {                                              /* edge tile: scalar store */
+        float t[PNR];
+        for (int i = 0; i < PMR && m0 + i < M; i++) {
+            for (int j = 0; j < NBV; j++) vst1q_f32(t + 4 * j, c[i][j]);
+            float *yr = y + (size_t)(m0 + i) * N;
+            for (int j = 0; j < PNR; j++) {
+                int n = n0 + j;
+                if (n < N) yr[n] = t[j] + (bias ? bias[n] : 0.0f);
+            }
+        }
+    }
+}
+#endif  /* ARIA_AVX2 / ARIA_NEON microkernel */
 static void aria_linear_packed(float *y, const float *x, const float *W, const float *b,
                                int M, int K, int N) {
     static __thread float *Abuf = NULL; static __thread size_t Acap = 0;
@@ -250,17 +348,20 @@ static void aria_linear_packed(float *y, const float *x, const float *W, const f
             for (int n = Nfull; n < N; n++)
                 y[(size_t)m * N + n] = aria_dot(x + (size_t)m * K, W + (size_t)n * K, K) + (b ? b[n] : 0.0f);
 }
-#endif
+#endif  /* packed GEMM (ARIA_AVX2 || ARIA_NEON) */
 
 void aria_linear(float *y, const float *x, const float *W, const float *b,
                  int M, int K, int N) {
-#ifdef ARIA_AVX2
+#if defined(ARIA_AVX2) || defined(ARIA_NEON)
     /* packed outer-product GEMM amortizes A-packing over the M*N*K work; for tiny
-     * GEMMs the packing/alloc overhead isn't worth it, so use the dot-product kernel. */
+     * GEMMs the packing/alloc overhead isn't worth it, so use the dot-product (AVX2)
+     * or scalar (NEON/other) kernel below. */
     if ((size_t)M * N * K >= (1u << 18)) {
         aria_linear_packed(y, x, W, b, M, K, N);
         return;
     }
+#endif
+#ifdef ARIA_AVX2
     {
         const int MR = ARIA_MR, NR = ARIA_NR;
         int Mfull = M - (M % MR);
@@ -347,6 +448,18 @@ void aria_rmsnorm(float *y, const float *x, const float *weight,
                 _mm256_storeu_ps(yr + i, _mm256_mul_ps(_mm256_loadu_ps(xr + i), vi));
             for (; i < dim; i++) yr[i] = xr[i] * inv;
         }
+#elif defined(ARIA_NEON)
+        float32x4_t vi = vdupq_n_f32(inv);
+        int i = 0;
+        if (weight) {
+            for (; i + 4 <= dim; i += 4)
+                vst1q_f32(yr + i, vmulq_f32(vmulq_f32(vld1q_f32(xr + i), vi), vld1q_f32(weight + i)));
+            for (; i < dim; i++) yr[i] = xr[i] * inv * weight[i];
+        } else {
+            for (; i + 4 <= dim; i += 4)
+                vst1q_f32(yr + i, vmulq_f32(vld1q_f32(xr + i), vi));
+            for (; i < dim; i++) yr[i] = xr[i] * inv;
+        }
 #else
         if (weight) { for (int i = 0; i < dim; i++) yr[i] = xr[i] * inv * weight[i]; }
         else        { for (int i = 0; i < dim; i++) yr[i] = xr[i] * inv; }
@@ -386,6 +499,14 @@ void aria_gemma_rmsnorm(float *y, const float *x, const float *weight,
         for (; i + 8 <= dim; i += 8)
             _mm256_storeu_ps(yr + i, _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(xr + i), vi),
                                                    _mm256_add_ps(one, _mm256_loadu_ps(weight + i))));
+        for (; i < dim; i++) yr[i] = xr[i] * inv * (1.0f + weight[i]);
+#elif defined(ARIA_NEON)
+        const float32x4_t one = vdupq_n_f32(1.0f);
+        float32x4_t vi = vdupq_n_f32(inv);
+        int i = 0;
+        for (; i + 4 <= dim; i += 4)
+            vst1q_f32(yr + i, vmulq_f32(vmulq_f32(vld1q_f32(xr + i), vi),
+                                        vaddq_f32(one, vld1q_f32(weight + i))));
         for (; i < dim; i++) yr[i] = xr[i] * inv * (1.0f + weight[i]);
 #else
         for (int i = 0; i < dim; i++) yr[i] = xr[i] * inv * (1.0f + weight[i]);
