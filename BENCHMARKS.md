@@ -177,6 +177,23 @@ while steering**: the steer kernels are recorded into the graph and read a devic
 effective scale (0 outside the step window → bit-exact no-op) refreshed per step like
 `dx`/`dgcond`; steered graph-vs-inline output is byte-identical (full + windowed).
 
+## Raspberry Pi 5 (edge target, E15)
+
+First measured deployment on the paper's edge device — **Raspberry Pi 5, 4× Cortex-A76,
+8 GB**, small-music fp32, 8-step, CPU only (`make ARCHFLAGS="-mcpu=native"`), windowed
+decode (E16.1) active:
+
+| build | 10 s clip | 4 s clip | GEMM GFLOP/s | peak RSS |
+|---|---|---|---|---|
+| scalar / gcc autovec | 50.5 s | 29.9 s | 34 (K-blk 12.9) | ~1.9 GB |
+| **NEON (E15.2, 20ef680)** | **28.4 s** | 16.6 s | **58** (K-blk 52.6) | ~1.9 GB |
+
+≈ **0.35× realtime** for a 10 s stereo clip on a $80 board; NEON-vs-scalar parity 3.8e-5
+(fp reordering), full test suite green on ARM. q8 on this CPU is a *footprint* lever only
+(scalar dequant GEMM is ~3.5× slower than fp32+NEON). The pre-E16.1 baseline was 78 s /
+2.5 GB — windowed decode + NEON together took the Pi from 78 → 28.4 s and bounded decode
+memory. Remaining levers: q8 dequant-GEMM NEON port, threads-vs-thermals tuning.
+
 ## Takeaways
 
 - **GPU memory:** aria's footprint is consistently smaller (−27 to −47 %) — a bump

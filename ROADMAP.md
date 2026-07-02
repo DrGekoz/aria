@@ -264,15 +264,16 @@ hold mode, raw-f32 stdout piping with a writer thread; GPU continuation; RTF
 The intro claims SA3 fits a Pi 5-class device; nothing has been measured on ARM.
 **Blocker first:** aria_cpu.c does not even compile without AVX2.
 
-- ⬜ **E15.1** **P0** Non-AVX2 build fix: `aria_rmsnorm`/`aria_gemma_rmsnorm` (and
-  friends) use `__m256`/AVX2-only helpers with no scalar guard, and the Makefile
-  hardcodes `-mavx2 -mfma`. Add scalar fallbacks + a `CPU_ARCH` Makefile knob.
-  Verify: `make` succeeds on ARM (or x86 with `-mno-avx2`) and `make test` passes.
-- ⬜ **E15.2** **P1** NEON kernels: port the 3 hot paths behind `__ARM_NEON` —
-  (1) the 6×16 packed outer-product GEMM microkernel → `float32x4_t` tiles (the
-  packing layer is ISA-agnostic, reuse as-is), (2) `aria_linear_q8/q4` dequant-GEMM
-  (NEON int8 widening + `vfmaq`), (3) attention inner loops + rmsnorm. Scalar path
-  stays as fallback. Verify: parity vs scalar; GEMM GFLOP/s benchmark on Pi 5.
+- ✅ **E15.1** **P0** Non-AVX2 build fix (99e4755): scalar fallbacks for
+  sumsq/rmsnorm/gemma_rmsnorm + `ARCHFLAGS` Makefile knob (default byte-identical).
+  `-mno-avx2` builds 0-ymm and passes the suite; **builds + passes green on the
+  Raspberry Pi 5** (`ARCHFLAGS="-mcpu=native"`).
+- ✅ **E15.2** **P1** NEON kernels (20ef680): 6×16 outer-product microkernel
+  (`vld1q_dup`+`vfmaq`, packing layer reused verbatim) + fp64-accum sumsq/rmsnorm.
+  Pi 5: GEMM 34→58 GFLOP/s, 10 s clip 50.5→28.4 s (1.78×; DiT 1.90×), parity vs
+  scalar 3.8e-5, x86 byte-unchanged. Attention left to autovec (<15 % post-port).
+  Follow-up **E15.2b**: q8/q4 dequant-GEMM NEON port (q8 is 3.5× slower than fp32
+  on the Pi today — footprint-only until then).
 - ⬜ **E15.3** **P2** Params-on-disk residency (`--params-disk`): per-DiT-block
   fault-in from mmap + `MADV_DONTNEED` after use → peak RAM = one block + arena
   (medium on an 8 GB Pi). aria already has both primitives. Verify: medium
@@ -281,9 +282,10 @@ The intro claims SA3 fits a Pi 5-class device; nothing has been measured on ARM.
   allocations (the `peak` field already exists), then allocate exactly peak —
   replaces static worst-case sizing; per-(seq_len, model) cache. Verify: RSS drop;
   no mid-run growth.
-- ⬜ **E15.5** **P1** Pi 5 measurement for the paper: small (+ medium q4) 10 s gen
-  wall-clock + RSS on a Raspberry Pi 5 8 GB; replaces the paper's
-  `\tbd{measured Pi 5 latency}`. deps: E15.1 (+E15.2 for a usable number).
+- ✅ **E15.5** **P1** Pi 5 measurement (see BENCHMARKS.md): small-music fp32 10 s clip
+  **28.4 s wall (≈0.35× realtime), ~1.9 GB peak RSS** on a Pi 5 8 GB (NEON + windowed
+  decode); full test suite green on ARM. Paper `\tbd` replaced. medium-on-Pi (q4 +
+  E15.3 params-on-disk) still open.
 
 ## E16 — Long-form decode (the 60 s gap; sd.cpp import)
 
