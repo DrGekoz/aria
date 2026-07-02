@@ -47,11 +47,17 @@ void aria_pingpong(float *x, int n, const float *sigmas, int steps,
                    aria_denoiser_fn denoise, void *ctx,
                    aria_rng *rng, const float *injected_noise);
 
-/* Same, plus an optional progress callback invoked after each completed step
- * (step+1, total=steps). progress may be NULL. */
+/* Same, plus optional post-step hooks (both may be NULL):
+ *  - progress(step+1, total): invoked after each completed step, for UI.
+ *  - post_step(step, x, n): invoked after each step's pingpong update, with the
+ *    updated latent x[n] and the 0-based step index -- the host-side hook the E12.2
+ *    latent-steer arm uses to nudge x between denoise steps (works for CPU and CUDA
+ *    since x lives on the host in this loop). Fires for the last step too, so the
+ *    nudge survives to the decoder. */
 void aria_pingpong_cb(float *x, int n, const float *sigmas, int steps,
                       aria_denoiser_fn denoise, void *ctx,
                       aria_rng *rng, const float *injected_noise,
-                      void (*progress)(int step, int total, void *user), void *user);
+                      void (*progress)(int step, int total, void *user), void *user,
+                      void (*post_step)(int step, float *x, int n, void *puser), void *puser);
 
 #endif /* ARIA_SAMPLER_H */

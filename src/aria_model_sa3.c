@@ -222,6 +222,79 @@ static float *sa3_build_inpaint_local(aria_ctx *ctx, sa3_state *st,
     return local;
 }
 
+/* ---------------- E12.2 / E12.4 host-side steering ----------------
+ * Two sites whose activations live on the host around the DiT calls, so one
+ * elementwise op steers them identically on CPU and CUDA. Both mirror the residual
+ * arm (aria_sa3_dit.c): ADD = a += scale*dir; PROJECT = a -= scale*(a.u) u with unit
+ * u = dir/||dir|| (dir_norm2 precomputed). scale==0 / out-of-window is a bit-exact
+ * no-op (the loop body is skipped, so the buffer is untouched). */
+
+/* LATENT site (E12.2), dim 256: the diffusion latent x[C,T] (channel-major, x[c*T+t]),
+ * steered from the sampler's post_step hook AFTER each in-window step's pingpong update
+ * and BEFORE the next DiT call (aria_sampler.c) -- the SAME-latent nudge that persists
+ * into the next step's input and, on the last in-window step, into the decoder. ADD
+ * broadcasts dir[c] over all T frames; PROJECT removes/amplifies the direction per
+ * frame (the column across channels). The step index is the pingpong update it follows,
+ * so a latent steer at step i first perturbs the DiT input at step i+1. */
+typedef struct { const aria_steer_set *steer; int C, T; } sa3_latent_ctx;
+static void sa3_steer_latent(int step, float *x_CT, int n, void *user) {
+    (void)n;   /* == C*T */
+    const sa3_latent_ctx *lc = user;
+    const aria_steer_set *steer = lc->steer;
+    if (!steer) return;
+    int C = lc->C, T = lc->T;
+    for (int s = 0; s < steer->n; s++) {
+        const aria_steer *st = &steer->items[s];
+        if (st->site != ARIA_STEER_LATENT) continue;
+        if (st->scale == 0.0f || step < st->step_lo || step > st->step_hi) continue;
+        int d = st->dim < C ? st->dim : C;
+        if (st->op == ARIA_STEER_PROJECT) {
+            float inv = st->dir_norm2 > 0.0f ? 1.0f / st->dir_norm2 : 0.0f;
+            for (int t = 0; t < T; t++) {
+                float dot = 0.0f;
+                for (int c = 0; c < d; c++) dot += st->dir[c] * x_CT[(size_t)c * T + t];
+                float k = st->scale * dot * inv;
+                for (int c = 0; c < d; c++) x_CT[(size_t)c * T + t] -= k * st->dir[c];
+            }
+        } else {
+            for (int c = 0; c < d; c++) {
+                float add = st->scale * st->dir[c];
+                for (int t = 0; t < T; t++) x_CT[(size_t)c * T + t] += add;
+            }
+        }
+    }
+}
+
+/* COND/text site (E12.4), dim 768: the prompt embedding [n_tok, ED] (token-major),
+ * steered on EVERY prompt-embedding token row BEFORE to_cond_embed / the cross-attn K/V
+ * projection, once per generation. There is no step window (step_lo/hi ignored) and no
+ * layer (layer ignored) for this site. The appended seconds_total conditioner token is
+ * NOT a prompt row and is left untouched (we steer `prompt`, not the assembled `cross`).
+ * `prompt` MUST be the caller's private copy -- never the per-process cached_emb. */
+static void sa3_steer_cond(const aria_steer_set *steer, float *prompt, int n_tok, int ed) {
+    if (!steer) return;
+    for (int s = 0; s < steer->n; s++) {
+        const aria_steer *st = &steer->items[s];
+        if (st->site != ARIA_STEER_COND || st->scale == 0.0f) continue;
+        int d = st->dim < ed ? st->dim : ed;
+        if (st->op == ARIA_STEER_PROJECT) {
+            float inv = st->dir_norm2 > 0.0f ? 1.0f / st->dir_norm2 : 0.0f;
+            for (int i = 0; i < n_tok; i++) {
+                float *row = prompt + (size_t)i * ed;
+                float dot = 0.0f;
+                for (int c = 0; c < d; c++) dot += st->dir[c] * row[c];
+                float k = st->scale * dot * inv;
+                for (int c = 0; c < d; c++) row[c] -= k * st->dir[c];
+            }
+        } else {
+            for (int i = 0; i < n_tok; i++) {
+                float *row = prompt + (size_t)i * ed;
+                for (int c = 0; c < d; c++) row[c] += st->scale * st->dir[c];
+            }
+        }
+    }
+}
+
 static int sa3_generate(aria_ctx *ctx, void *state,
                         const aria_gen_params *p, aria_audio **out) {
     sa3_state *st = state;
@@ -254,6 +327,10 @@ static int sa3_generate(aria_ctx *ctx, void *state,
         have_pe = 1;
     }
     /* else: unconditional (zeros) */
+
+    /* E12.4: cond/text steer on this private prompt copy (never the cache), before
+     * to_cond_embed. No step window / layer for this site. */
+    sa3_steer_cond(p->steer, prompt, N_PROMPT, ED);
 
     /* seconds_total embedding [768] -> cross token + global cond */
     float sec_emb[768];
@@ -376,7 +453,10 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     }
 #endif
     double t1 = sa3_now();
-    aria_pingpong_cb(x, n, sched, steps, sa3_denoise, &dc, &rng, NULL, p->progress, p->progress_user);
+    /* E12.2: latent steer hooks the sampler between steps (host x[256,T], CPU+GPU). */
+    sa3_latent_ctx lc = { p->steer, st->cfg.io_channels, T };
+    aria_pingpong_cb(x, n, sched, steps, sa3_denoise, &dc, &rng, NULL,
+                     p->progress, p->progress_user, sa3_steer_latent, &lc);
     double t2 = sa3_now();
 #ifdef ARIA_CUDA
     free(dc.gcond);   /* the device handle persists on st; only gcond is per-call */

@@ -220,11 +220,8 @@ static int parse_steer_spec(const char *spec, aria_steer *it) {
     }
     aria_steer_site s;
     if      (!strcmp(site, "residual")) s = ARIA_STEER_RESIDUAL;
-    else if (!strcmp(site, "latent") || !strcmp(site, "cond")) {
-        /* parsed but NOT applied anywhere yet (E12.2/E12.4) -- reject instead of silently no-oping */
-        fprintf(stderr, "--steer site '%s' is not implemented yet (only 'residual' is wired)\n", site);
-        return 1;
-    }
+    else if (!strcmp(site, "latent"))   s = ARIA_STEER_LATENT;   /* E12.2 host-side (CPU+GPU) */
+    else if (!strcmp(site, "cond"))     s = ARIA_STEER_COND;     /* E12.4 host-side (CPU+GPU) */
     else { fprintf(stderr, "unknown --steer site '%s' (residual|latent|cond)\n", site); return 1; }
     aria_steer_op o = ARIA_STEER_ADD;
     if (op) {

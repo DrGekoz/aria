@@ -143,7 +143,8 @@ void aria_logsnr_schedule(float *out, int steps, float sigma_max,
 void aria_pingpong_cb(float *x, int n, const float *sigmas, int steps,
                       aria_denoiser_fn denoise, void *ctx,
                       aria_rng *rng, const float *injected_noise,
-                      void (*progress)(int step, int total, void *user), void *user) {
+                      void (*progress)(int step, int total, void *user), void *user,
+                      void (*post_step)(int step, float *x, int n, void *puser), void *puser) {
     float *v = malloc((size_t)n * sizeof(float));
     float *denoised = malloc((size_t)n * sizeof(float));
     /* draw step noise as a whole vector (matches torch randn_like; identical
@@ -157,6 +158,9 @@ void aria_pingpong_cb(float *x, int n, const float *sigmas, int steps,
         if (injected_noise) noise = injected_noise + (size_t)i * n;
         else { aria_rng_randn(rng, noisebuf, n); noise = noisebuf; }
         for (int j = 0; j < n; j++) x[j] = (1.0f - tn) * denoised[j] + tn * noise[j];
+        /* E12.2: latent steer AFTER this step's update, BEFORE the next DiT call
+         * (and for i==steps-1, before decode). Bit-exact no-op when unused. */
+        if (post_step) post_step(i, x, n, puser);
         if (progress) progress(i + 1, steps, user);
     }
     free(v);
@@ -167,5 +171,5 @@ void aria_pingpong_cb(float *x, int n, const float *sigmas, int steps,
 void aria_pingpong(float *x, int n, const float *sigmas, int steps,
                    aria_denoiser_fn denoise, void *ctx,
                    aria_rng *rng, const float *injected_noise) {
-    aria_pingpong_cb(x, n, sigmas, steps, denoise, ctx, rng, injected_noise, NULL, NULL);
+    aria_pingpong_cb(x, n, sigmas, steps, denoise, ctx, rng, injected_noise, NULL, NULL, NULL, NULL);
 }
