@@ -47,6 +47,7 @@ typedef struct {
     const char *steer_specs[16]; int n_steer;   /* E12: repeatable --steer site:layer:dir.atns:scale:lo-hi */
     const char *batch_file;                 /* E13: --batch jobs TSV (resident multi-gen) */
     const char *lora_spec;                  /* E12.9: --lora file.safetensors[:alpha] */
+    const char *steer_ramp;                 /* E14: --steer-ramp lo:hi[:tri] (stream chunks) */
 } cli_config;
 
 static cli_config cli_defaults(void) {
@@ -62,7 +63,7 @@ enum {   /* keys: short flags use their ASCII char; long-only options use ids pa
     K_SEED=256, K_DEVICE, K_BENCH, K_UNCOND, K_PEMB, K_INFO, K_LIST,
     K_INPAINT, K_CONTINUE, K_FROM, K_TO, K_PREC, K_LOADQ, K_RNG,
     K_STREAM, K_CHUNK, K_CTX, K_CHUNKS, K_HOLD, K_WAVRT, K_HPSS, K_STEER,
-    K_BATCH, K_LORA,
+    K_BATCH, K_LORA, K_STEERRAMP,
 };
 typedef enum { A_NONE, A_ONE, A_TWO, A_OPT } argkind;  /* flag / 1 arg / 2 args / optional 1 arg */
 typedef struct {
@@ -100,6 +101,7 @@ static const opt_spec OPTS[] = {
     {K_CTX,      "context",       0,  A_ONE,  "<sec>",      "stream",   "rolling context seconds (default 6)"},
     {K_CHUNKS,   "chunks",        0,  A_ONE,  "<n>",        "stream",   "number of chunks (default 8)"},
     {K_HOLD,     "hold",          0,  A_NONE, NULL,         "stream",   "hold a steady HPSS drum loop"},
+    {K_STEERRAMP,"steer-ramp",    0,  A_ONE,  "<lo:hi[:tri]>","stream",  "ramp the first --steer scale across chunks (tri = up-then-down)"},
 
     {K_INFO,     "info",          0,  A_NONE, NULL,         "inspect",  "print model info and exit"},
     {K_LIST,     "list-tensors",  0,  A_OPT,  "[prefix]",   "inspect",  "list tensors (optional name prefix)"},
@@ -151,6 +153,7 @@ static int cli_apply(int key, char **a, cli_config *c) {
         c->steer_specs[c->n_steer++] = a[0]; break;
     case K_BATCH:  c->batch_file = a[0]; break;
     case K_LORA:   c->lora_spec = a[0]; c->do_generate = 1; break;
+    case K_STEERRAMP: c->steer_ramp = a[0]; break;
     case K_INFO:   c->do_info = 1; break;
     case K_LIST:   c->do_list = 1; if (a[0]) c->list_prefix = a[0]; break;
     case K_WAVRT:  c->util = 1; c->util_a = a[0]; c->util_b = a[1]; break;
@@ -502,7 +505,8 @@ static void stream_flush(const aria_audio *outp, const float *held, int64_t held
  * continuation) — crossfaded onto the output. Each step re-reads the prompt (live
  * re-steering on a TTY). `emit_s` is the --chunk value. */
 static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float context_s,
-                      int n_chunks, int hold, const char *out_path) {
+                      int n_chunks, int hold, const char *out_path,
+                      aria_steer *ramp_target, float ramp_lo, float ramp_hi, int ramp_tri) {
     int sr = aria_sample_rate(ctx), ch = aria_audio_channels(ctx);
     const float skip_s = 1.5f, tail_s = 3.0f, xfade_s = 0.25f;   /* seam / fade / crossfade */
     int64_t ctx_fr = (int64_t)(context_s * sr), xf_fr = (int64_t)(xfade_s * sr);
@@ -543,6 +547,15 @@ static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float con
         p->seconds_total = win_s;
         p->init_audio_mem = (i == 0) ? NULL : context;
         p->inpaint_continue = (i == 0) ? 0 : 1;
+        if (ramp_target && n_chunks > 1) {
+            /* E14: live steering ramp -- linear lo->hi over the chunks, or triangular
+             * (lo->hi->lo) with 'tri'. The steer set points at this item, so the new
+             * scale flows into the next generate (device path re-uploads per request). */
+            float t = (float)i / (float)(n_chunks - 1);
+            float u = ramp_tri ? (t <= 0.5f ? 2.0f * t : 2.0f * (1.0f - t)) : t;
+            ramp_target->scale = ramp_lo + (ramp_hi - ramp_lo) * u;
+            fprintf(stderr, "[stream] chunk %d steer scale %.3f\n", i + 1, ramp_target->scale);
+        }
 
         aria_audio *win = NULL;
         struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -635,7 +648,25 @@ int main(int argc, char **argv) {
         p.prompt = cfg.prompt; p.steps = cfg.steps; p.seed = cfg.seed;
         p.precision = cfg.precision; p.device = cfg.device;  /* GPU continuation supported (sm_70+) */
         p.rng_torch = cfg.rng_torch;
-        rc = cmd_stream(ctx, &p, cfg.stream_chunk, cfg.stream_context, cfg.stream_chunks, cfg.stream_hold, cfg.out_path);
+        aria_steer steer_items[16]; aria_steer_set steer_set = {0};
+        aria_steer *ramp_target = NULL; float ramp_lo = 0, ramp_hi = 0; int ramp_tri = 0;
+        if (cfg.n_steer > 0) {
+            if (build_steer_set(&cfg, steer_items, &steer_set) != 0) { aria_free(ctx); return 1; }
+            p.steer = &steer_set;
+            if (cfg.steer_ramp) {
+                char rb[64]; snprintf(rb, sizeof rb, "%s", cfg.steer_ramp);
+                char *lo = strtok(rb, ":"), *hi = strtok(NULL, ":"), *m = strtok(NULL, ":");
+                if (!lo || !hi) { fprintf(stderr, "bad --steer-ramp (want lo:hi[:tri])\n"); aria_free(ctx); return 1; }
+                ramp_lo = (float)atof(lo); ramp_hi = (float)atof(hi);
+                ramp_tri = m && !strcmp(m, "tri");
+                ramp_target = &steer_items[0];
+            }
+        } else if (cfg.steer_ramp) {
+            fprintf(stderr, "--steer-ramp needs a --steer\n"); aria_free(ctx); return 1;
+        }
+        rc = cmd_stream(ctx, &p, cfg.stream_chunk, cfg.stream_context, cfg.stream_chunks, cfg.stream_hold, cfg.out_path,
+                        ramp_target, ramp_lo, ramp_hi, ramp_tri);
+        free_steer_set(&steer_set);
     } else if (cfg.do_list) {
         aria_list_tensors(ctx, cfg.list_prefix);
     } else if (cfg.batch_file) {
