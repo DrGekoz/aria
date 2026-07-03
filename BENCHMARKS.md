@@ -130,6 +130,43 @@ ideal free-GEMM fusion ceiling 1.18×→1.53× (crossover S≈315/473), much of 
 Verdict: a 3–8× GEMM penalty vs a ≤1.53× ceiling on compute-bound kernels → **not worth it**;
 cuBLAS+graph+glue-fusion is at/near the roofline. The crossover analysis is the paper result.
 
+**fp16-emit attention epilogue (exact, landed).** The extract-head kernels
+(`k_extract_normrope`, `k_extract_heads_h`) now emit fp16 q/k/v directly and the cross-K/V
+request cache is stored fp16 (converted once per request, not per step), so `attn_dev_h`
+consumes fp16 with zero per-call conversion passes. `__float2half` at the producer is the
+same RTNE value the old fp32-store + convert pass produced → **output byte-identical**
+(small + medium 60 s, graph and inline). 60 s warm: small DiT 0.41 → **0.40 s**, medium DiT
+1.04 → **0.97 s** (−7 %); VRAM −50/−64 MB (small/medium).
+
+**W8A8 int8 tensor-core GEMMs (`ARIA_W8A8=1` + `--precision q8`).** The q8 block weights are
+already packed int8+scale in VRAM; instead of dequantizing to fp16 per GEMM, the activations
+are quantized per-token (row absmax, symmetric, mirrors `aria_q8_quant`) and the 6 per-step
+block GEMMs run **int8×int8 → int32 IMMA** (2× fp16 tensor throughput on sm_86), dequantized
+in place in the fp32 output (`y = acc·sx[m]·sw[n] + b`). q8 flips from the *slowest* GPU mode
+(dequant overhead) to the **fastest**; cross-K/V stays fp16 (fidelity-sensitive), attention
+QK/AV stays fp16. Graph-capturable (graph-vs-inline byte-identical). 60 s warm, RTX 3070:
+
+| mode | small 60 s | medium 60 s | GPU VRAM (med) |
+|---|---|---|---|
+| fp16 (default, exact) | 0.58 s (DiT 0.40) | 1.49 s (DiT 0.97) | 4.46 GB |
+| q8, fp16-dequant (old) | 0.62 s (DiT 0.47) | 1.62 s (DiT 1.11) | 3.40 GB |
+| **q8 W8A8** | **0.48 s (DiT 0.30)** | **1.26 s (DiT 0.75)** | 3.40 GB |
+
+vs stable-audio-tools at 60 s: small 0.48 vs 0.41 (gap 1.46× → **1.17×**), medium 1.26 vs
+1.32 — **aria now beats SAT on long-audio medium** (was 1.31× behind at the last audit).
+10 s small: DiT 0.12 → 0.08 s. Fidelity (single-step `-s 1` probe, isolates one DiT call):
+medium q8-dequant 3.2 % → W8A8 7.3 % velocity-class error — between q8 and the supported
+q4's 9.3 %, i.e. a legitimate point on the existing precision dial (opt-in, off by default).
+
+**Banded DiT self-attention: measured and REJECTED.** Per-layer softmax mass at 60 s
+(S=710, small-music, CPU instrumentation): the 64 memory tokens absorb 17–53 % of every
+audio query's attention, and even memory-prefix + a ±256 band (79 % of all keys) covers only
+**86–96 %** of the mass depending on layer (±128: 70–92 %). The DiT's self-attention is
+genuinely global — unlike the medium *decoder*'s architectural ±17 window — so a windowed
+approximation would discard 4–30 % of attention mass per layer and was not wired in. This is
+the flash-attention counterpoint: the only remaining long-audio attention lever is a real
+fused-softmax kernel (cuDNN-class), not sparsity.
+
 ## Streaming / continuation on GPU (small-music, 8 steps, RTX 3070)
 
 Continue/inpaint used to be gated to the CPU DiT (the local-additive inpaint cond was
