@@ -536,6 +536,11 @@ static __half *da_alloc_half(darena *a, size_t nh) {
     a->used = off + nh * sizeof(__half);
     return (__half *)(a->base + off);
 }
+static int8_t *da_alloc_i8(darena *a, size_t nb) {
+    size_t off = (a->used + 63) & ~((size_t)63);
+    a->used = off + nb;
+    return (int8_t *)(a->base + off);
+}
 static size_t da_save(darena *a) { return a->used; }
 static void da_restore(darena *a, size_t m) { a->used = m; }
 
@@ -638,6 +643,7 @@ struct aria_cuda_dit {
     int depth, ed, H, hd, inner, io_ch, n_mem, rot;
     int differential;         /* medium: differential self+cross attention */
     aria_dtype precision;     /* block GEMM weight precision (fp32->fp16 / q8 / q4) */
+    int w8a8;                 /* Q8: run int8-activation IMMA GEMMs (ARIA_W8A8=1) */
     __half *dqbuf;            /* dequant scratch: largest weight, reused per GEMM */
     __half *preprocess, *postprocess, *project_in, *project_out;
     float *memory_tokens;
@@ -685,11 +691,61 @@ static void gemm_f16w(cublasHandle_t cb, darena *ar, float *y, const float *x, c
     da_restore(ar, mark);
 }
 
+/* ---- W8A8 (E-int8, opt-in via ARIA_W8A8=1 with --precision q8): int8 tensor-core
+ * GEMMs. The Q8 weights are ALREADY packed int8 + per-row scale in VRAM; instead of
+ * dequantizing them to fp16 per GEMM, quantize the activations per-token (row absmax,
+ * symmetric, mirrors aria_q8_quant) and run int8 x int8 -> int32 IMMA (2x fp16 tensor
+ * throughput on sm_86, and the dequant pass is gone). The int32 accumulator lands in
+ * the caller's fp32 buffer and is dequantized IN PLACE (y = acc*sx[m]*sw[n] + b). */
+__global__ void k_quant_act_q8(int8_t *qx, float *sx, const float *x, int M, int K) {
+    int m = blockIdx.x; if (m >= M) return;
+    const float *row = x + (size_t)m * K;
+    __shared__ float red[RED_TH];
+    float mx = 0.0f;
+    for (int i = threadIdx.x; i < K; i += blockDim.x) mx = fmaxf(mx, fabsf(row[i]));
+    red[threadIdx.x] = mx; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]); __syncthreads(); }
+    float amax = red[0];
+    if (threadIdx.x == 0) sx[m] = amax > 0.0f ? amax / 127.0f : 0.0f;
+    float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+    int8_t *qr = qx + (size_t)m * K;
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        int v = __float2int_rn(row[i] * inv);
+        qr[i] = (int8_t)(v < -127 ? -127 : (v > 127 ? 127 : v));
+    }
+}
+/* in-place int32 -> fp32 dequant epilogue: y holds the raw int32 accumulators. */
+__global__ void k_deq_i32(float *y, const float *sx, const float *sw, const float *b, int M, int N) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)M * N) return;
+    int m = (int)(idx / N), n = (int)(idx % N);
+    int32_t acc = ((const int32_t *)y)[idx];
+    y[idx] = (float)acc * sx[m] * sw[n] + (b ? b[n] : 0.0f);
+}
+static void gemm_w8a8(cublasHandle_t cb, darena *ar, float *y, const float *x,
+                      const int8_t *Wq, const float *sw, const float *b, int M, int K, int N) {
+    const int ione = 1, izero = 0;
+    size_t mark = da_save(ar);
+    int8_t *xq = da_alloc_i8(ar, (size_t)M * K);
+    float *sx = da_alloc(ar, M);
+    k_quant_act_q8<<<M, RED_TH>>>(xq, sx, x, M, K);
+    cublasGemmEx(cb, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &ione,
+                 Wq, CUDA_R_8I, K, xq, CUDA_R_8I, K, &izero,
+                 y, CUDA_R_32I, N, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT);
+    k_deq_i32<<<nblocks((size_t)M * N), THREADS>>>(y, sx, sw, b, M, N);
+    da_restore(ar, mark);
+}
+
 /* GEMM with a (possibly quantized) weight: dequant Q8/Q4 into the reused fp16
  * scratch, then the fp16 tensor-core path. dt==F32 uses the fp16 weight directly.
+ * Q8 + w8a8 skips the dequant entirely (int8 IMMA, see gemm_w8a8 above).
  * Stream-ordered, so reusing h->dqbuf across calls in a block is safe. */
 static void gemm_dqw(aria_cuda_dit *h, float *y, const float *x, const dqw *w, const float *b, int M) {
     if (w->dt == ARIA_F32) { gemm_f16w(h->cublas, &h->arena, y, x, w->f16, b, M, w->K, w->N); return; }
+    if (w->dt == ARIA_Q8 && h->w8a8) {
+        gemm_w8a8(h->cublas, &h->arena, y, x, (const int8_t *)w->q, w->scale, b, M, w->K, w->N);
+        return;
+    }
     size_t nk = (size_t)w->N * w->K;
     if (w->dt == ARIA_Q8)
         k_dequant_q8<<<nblocks(nk), THREADS>>>(h->dqbuf, (const int8_t *)w->q, w->scale, w->N, w->K);
@@ -811,6 +867,11 @@ extern "C" aria_cuda_dit *aria_cuda_dit_create(const aria_sa3_dit_view *v, aria_
     h->depth = v->depth; h->ed = ed; h->H = v->num_heads; h->hd = v->head_dim;
     h->inner = inner; h->io_ch = v->io_ch; h->n_mem = v->n_mem; h->rot = v->rot_dim;
     h->precision = precision; h->differential = v->differential;
+    /* W8A8 (opt-in): int8-activation IMMA GEMMs for the Q8 block weights. Measured
+     * single-step fidelity: q8-dequant 3.2% -> W8A8 7.3% velocity-class error
+     * (medium; between q8 and the supported q4's 9.3%) for the fastest GPU mode. */
+    h->w8a8 = (precision == ARIA_Q8) && getenv("ARIA_W8A8") != NULL;
+    if (h->w8a8) fprintf(stderr, "[aria] DiT: W8A8 int8 tensor-core GEMMs (ARIA_W8A8)\n");
     if (cublasCreate(&h->cublas) != CUBLAS_STATUS_SUCCESS) { free(h); return NULL; }
     /* --default-stream per-thread makes every <<<>>> launch use the (capturable) per-thread
      * stream; pin cuBLAS to it too so GEMMs and kernels share one stream. A fixed workspace
@@ -901,7 +962,8 @@ extern "C" void aria_cuda_dit_set_request(aria_cuda_dit *h, const aria_sa3_dit_r
      * before the fp16 cache), borrowed from this arena below. */
     size_t block_floats = (size_t)6 * ed + (h->differential ? 32 : 24) * (size_t)S * ed
                           + 2 * (size_t)H * S * (S > n_cond ? S : n_cond) + 2 * (size_t)S * ed
-                          + 6 * (size_t)n_cond * ed;
+                          + 6 * (size_t)n_cond * ed
+                          + (h->w8a8 ? ((size_t)S * h->inner) / 4 + S + 64 : 0);  /* int8 act + sx */
     size_t step_floats = (size_t)S * ed + 8 * (size_t)T * C + 8 * (size_t)ed;
     h->arena.cap = (block_floats + step_floats + (1u << 20)) * sizeof(float);
     h->arena.used = 0;
