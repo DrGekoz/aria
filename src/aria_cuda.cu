@@ -443,6 +443,11 @@ __global__ void k_add_bias(float *y, const float *b, int M, int N) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < (size_t)M * N) y[i] += b[i % N];
 }
+/* y[r*L + t] += b[r]  (channel-major row-broadcast: the decoders' mapping-conv bias) */
+__global__ void k_add_bias_rows(float *y, const float *b, int rows, int L) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < (size_t)rows * L) y[i] += b[i / L];
+}
 
 /* ---- glue kernels (device pointers) ---- */
 __global__ void k_add(float *y, const float *a, const float *b, size_t n) {
@@ -1224,7 +1229,7 @@ struct dec_blk_dev {
 struct aria_cuda_dec {
     float running_std;
     __half *proj_w; const float *proj_b, *new_tokens, *mapping_b;
-    float *mapping_w;       /* fp32 (k_conv1d) */
+    float *mapping_w;       /* fp32, repacked as 3 contiguous [DC_OUT, DC_D] GEMM taps */
     dec_blk_dev blocks[6];
     float *rcos, *rsin;
     cublasHandle_t cublas;
@@ -1308,7 +1313,18 @@ extern "C" aria_cuda_dec *aria_cuda_dec_create(const aria_sa3_dec_view *v) {
     h->proj_w     = upload_f16(v->proj_w, (size_t)DC_D * 256);
     h->proj_b     = upload_f32(v->proj_b, DC_D);
     h->new_tokens = upload_f32(v->new_tokens, DC_D);
-    h->mapping_w  = upload_f32(v->mapping_w, (size_t)DC_OUT * DC_D * 3);
+    /* repack the folded mapping-conv weight [DC_OUT, DC_D, 3] (tap-fastest) into 3
+     * contiguous [DC_OUT, DC_D] tap matrices so the conv runs as accumulated GEMMs. */
+    {
+        size_t wsz = (size_t)DC_OUT * DC_D;
+        float *taps = (float *)malloc(3 * wsz * sizeof(float));
+        for (int o = 0; o < DC_OUT; o++)
+            for (int i = 0; i < DC_D; i++)
+                for (int k = 0; k < 3; k++)
+                    taps[(size_t)k * wsz + (size_t)o * DC_D + i] = v->mapping_w[((size_t)o * DC_D + i) * 3 + k];
+        h->mapping_w = upload_f32(taps, 3 * wsz);
+        free(taps);
+    }
     h->mapping_b  = upload_f32(v->mapping_b, DC_OUT);
     int ok = h->proj_w && h->proj_b && h->new_tokens && h->mapping_w && h->mapping_b;
     for (int i = 0; i < 6 && ok; i++) {
@@ -1369,7 +1385,23 @@ extern "C" void aria_cuda_dec_forward(aria_cuda_dec *h, float *audio, const floa
     float *feat = da_alloc(&ar, (size_t)D * Lout);
     k_extract_feat<<<nblocks((size_t)D * Lout), THREADS>>>(feat, seq, D, Lout);
     float *mapped = da_alloc(&ar, (size_t)DC_OUT * Lout);
-    k_conv1d<<<nblocks((size_t)DC_OUT * Lout), THREADS>>>(mapped, feat, h->mapping_w, h->mapping_b, D, DC_OUT, 3, 1, Lout);
+    /* mapping conv (K=3, pad=1) as 3 accumulated Sgemms over the repacked taps:
+     * mapped[o,t] = b[o] + sum_k Wk[o,:] . feat[:, t+k-1]  (k=1 full range seeds with
+     * beta=0; k=0/2 accumulate on the t>=1 / t<Lout-1 sub-ranges = the pad-1 zeros).
+     * Row-major via the col-major identity C^T = feat^T @ Wk^T. Same fp32 dot products
+     * as k_conv1d, cuBLAS reduction order -- was the top decode kernel (29 ms @ 60 s). */
+    {
+        const float onef = 1.0f, zerof = 0.0f;
+        size_t wsz = (size_t)DC_OUT * DC_D;
+        const float *wk0 = h->mapping_w, *wk1 = h->mapping_w + wsz, *wk2 = h->mapping_w + 2 * wsz;
+        cublasSgemm(h->cublas, CUBLAS_OP_N, CUBLAS_OP_N, Lout, DC_OUT, D,
+                    &onef, feat, Lout, wk1, D, &zerof, mapped, Lout);
+        cublasSgemm(h->cublas, CUBLAS_OP_N, CUBLAS_OP_N, Lout - 1, DC_OUT, D,
+                    &onef, feat, Lout, wk0, D, &onef, mapped + 1, Lout);
+        cublasSgemm(h->cublas, CUBLAS_OP_N, CUBLAS_OP_N, Lout - 1, DC_OUT, D,
+                    &onef, feat + 1, Lout, wk2, D, &onef, mapped, Lout);
+        k_add_bias_rows<<<nblocks((size_t)DC_OUT * Lout), THREADS>>>(mapped, h->mapping_b, DC_OUT, Lout);
+    }
     float *dec = da_alloc(&ar, (size_t)DC_OUT * Lt);
     CK(cudaMemcpy2D(dec, (size_t)Lt * sizeof(float), mapped, (size_t)Lout * sizeof(float),
                     (size_t)Lt * sizeof(float), DC_OUT, cudaMemcpyDeviceToDevice));
@@ -1768,7 +1800,15 @@ extern "C" void aria_cuda_dec_medium_forward(aria_cuda_dec_medium *h, float *aud
     float *feat = da_alloc(&ar, (size_t)D * Lt);
     k_extract_feat<<<nblocks((size_t)D * Lt), THREADS>>>(feat, seq, D, Lt);
     float *mapped = da_alloc(&ar, (size_t)MD_OUT * Lt);
-    k_conv1d<<<nblocks((size_t)MD_OUT * Lt), THREADS>>>(mapped, feat, h->mapping_w, h->mapping_b, D, MD_OUT, 1, 0, Lt);
+    /* the K=1 mapping conv IS a GEMM: mapped[MD_OUT, Lt] = W[MD_OUT, D] @ feat[D, Lt] + b.
+     * Row-major via the col-major identity C^T = feat^T @ W^T. Same fp32 dot products as
+     * k_conv1d, cuBLAS reduction order -- was a 42 ms single kernel at 60 s. */
+    {
+        const float onef = 1.0f, zerof = 0.0f;
+        cublasSgemm(h->cublas, CUBLAS_OP_N, CUBLAS_OP_N, Lt, MD_OUT, D,
+                    &onef, feat, Lt, h->mapping_w, D, &zerof, mapped, Lt);
+        k_add_bias_rows<<<nblocks((size_t)MD_OUT * Lt), THREADS>>>(mapped, h->mapping_b, MD_OUT, Lt);
+    }
     float *d_audio = da_alloc(&ar, (size_t)2 * Lt * 256);
     k_unpatch<<<nblocks((size_t)2 * Lt * 256), THREADS>>>(d_audio, mapped, Lt);
     CK(cudaGetLastError());
