@@ -322,8 +322,10 @@ __global__ void k_rope(float *x, const float *c, const float *s, int H, int N, i
 /* fused extract-head + per-head rmsnorm(weight w) + RoPE -> head-major out[h,s,:hd].
  * Replaces a k_extract_heads + k_rmsnorm + k_rope chain (saves two [H,S,hd] HBM
  * round-trips + two launches per q/k). One block per (h,s) row, hd threads (hd<=64).
- * rcos==NULL skips RoPE (cross-attn q). */
-__global__ void k_extract_normrope(float *out, const float *src, const float *w,
+ * rcos==NULL skips RoPE (cross-attn q). Emits fp16 directly (all consumers are the
+ * tensor-core attention): __float2half(res) here is the same RTNE value the old
+ * fp32-store + k_f32_to_f16 pass produced, one [H,S,hd] round-trip less. */
+__global__ void k_extract_normrope(__half *out, const float *src, const float *w,
                                    const float *rcos, const float *rsin,
                                    int S, int H, int hd, int stride, int off, int rot, float eps) {
     int hs = blockIdx.x; if (hs >= H * S) return;
@@ -339,7 +341,7 @@ __global__ void k_extract_normrope(float *out, const float *src, const float *w,
     if (rcos == NULL || d >= rot)  res = vec[d];
     else if (d < rh) res = vec[d] * rcos[(size_t)s * rh + d]      - vec[d + rh] * rsin[(size_t)s * rh + d];
     else { int i = d - rh; res = vec[d] * rcos[(size_t)s * rh + i] + vec[i] * rsin[(size_t)s * rh + i]; }
-    out[(size_t)hs * hd + d] = res;
+    out[(size_t)hs * hd + d] = __float2half(res);
 }
 extern "C" void aria_cuda_rope_apply(float *x, const float *cos_t, const float *sin_t,
                                      int H, int N, int D, int rot_dim) {
@@ -499,6 +501,14 @@ __global__ void k_extract_heads(float *dst, const float *src, int S, int H, int 
     int d = (int)(idx % hd), s = (int)((idx / hd) % S), h = (int)(idx / ((size_t)hd * S));
     dst[idx] = src[(size_t)s * stride + off + (size_t)h * hd + d];
 }
+/* fp16-emitting variant (DiT attention v: consumer is the tensor-core AV GEMM;
+ * same RTNE bits as extract-fp32 + k_f32_to_f16, one round-trip less). */
+__global__ void k_extract_heads_h(__half *dst, const float *src, int S, int H, int hd, int stride, int off) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;   /* (h*S+s)*hd+d */
+    if (idx >= (size_t)H * S * hd) return;
+    int d = (int)(idx % hd), s = (int)((idx / hd) % S), h = (int)(idx / ((size_t)hd * S));
+    dst[idx] = __float2half(src[(size_t)s * stride + off + (size_t)h * hd + d]);
+}
 __global__ void k_merge_heads(float *dst, const float *src, int S, int H, int hd) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;   /* src (h*S+s)*hd+d */
     if (idx >= (size_t)H * S * hd) return;
@@ -530,41 +540,41 @@ static size_t da_save(darena *a) { return a->used; }
 static void da_restore(darena *a, size_t m) { a->used = m; }
 
 /* multi-head SDPA, all heads batched (scale 1/sqrt(D)). scores holds [H,Nq,Nk].
- * fp16=1: q/k/v converted to fp16 in arena scratch and the QK^T/AV run on tensor
- * cores (fp16->fp32 scores, fp32 softmax, fp16 AV) -- ~2-4x the fp32 sgemm path, used
- * for the DiT (the dominant attention). fp16=0: the original fp32 cublasSgemm path,
- * kept for the cheap small-music decoder chunks where fp16 would only cost accuracy. */
+ * The original fp32 cublasSgemm path, kept for the cheap small-music decoder
+ * chunks where fp16 would only cost accuracy. */
 static void attn_dev(cublasHandle_t cb, darena *ar, float *out, const float *q, const float *k,
-                     const float *v, int H, int Nq, int Nk, int D, float *scores, int fp16) {
+                     const float *v, int H, int Nq, int Nk, int D, float *scores) {
+    (void)ar;
+    const float scale = 1.0f / sqrtf((float)D), one = 1.0f, zero = 0.0f;
+    /* 1/sqrt(D) folded into the QK^T alpha (cuBLAS applies alpha to the accumulated
+     * product -- same op/order as the old separate k_scale pass, one S*S*H pass less). */
+    cublasSgemmStridedBatched(cb, CUBLAS_OP_T, CUBLAS_OP_N, Nk, Nq, D,
+        &scale, k, D, (long long)Nk * D, q, D, (long long)Nq * D,
+        &zero, scores, Nk, (long long)Nq * Nk, H);
+    k_softmax<<<H * Nq, RED_TH>>>(scores, H * Nq, Nk, NULL);
+    cublasSgemmStridedBatched(cb, CUBLAS_OP_N, CUBLAS_OP_N, D, Nq, Nk,
+        &one, v, D, (long long)Nk * D, scores, Nk, (long long)Nq * Nk,
+        &zero, out, D, (long long)Nq * D, H);
+}
+/* fp16-input SDPA for the DiT (the dominant attention): q/k/v are ALREADY fp16
+ * (emitted by k_extract_normrope / k_extract_heads_h, or the request's cached
+ * cross K/V), so the per-call k_f32_to_f16 passes are gone. QK^T/AV run on tensor
+ * cores (fp16->fp32 scores, fp32 softmax, fp16 AV) -- same bits as the old
+ * convert-per-call path. */
+static void attn_dev_h(cublasHandle_t cb, darena *ar, float *out, const __half *q, const __half *k,
+                       const __half *v, int H, int Nq, int Nk, int D, float *scores) {
     const float scale = 1.0f / sqrtf((float)D), one = 1.0f, zero = 0.0f;
     size_t ns = (size_t)H * Nq * Nk;
-    if (!fp16) {
-        /* 1/sqrt(D) folded into the QK^T alpha (cuBLAS applies alpha to the accumulated
-         * product -- same op/order as the old separate k_scale pass, one S*S*H pass less). */
-        cublasSgemmStridedBatched(cb, CUBLAS_OP_T, CUBLAS_OP_N, Nk, Nq, D,
-            &scale, k, D, (long long)Nk * D, q, D, (long long)Nq * D,
-            &zero, scores, Nk, (long long)Nq * Nk, H);
-        k_softmax<<<H * Nq, RED_TH>>>(scores, H * Nq, Nk, NULL);
-        cublasSgemmStridedBatched(cb, CUBLAS_OP_N, CUBLAS_OP_N, D, Nq, Nk,
-            &one, v, D, (long long)Nk * D, scores, Nk, (long long)Nq * Nk,
-            &zero, out, D, (long long)Nq * D, H);
-        return;
-    }
-    size_t nq = (size_t)H * Nq * D, nk = (size_t)H * Nk * D;
     size_t mark = da_save(ar);
-    __half *qh = da_alloc_half(ar, nq), *kh = da_alloc_half(ar, nk);
-    __half *vh = da_alloc_half(ar, nk), *sh = da_alloc_half(ar, ns);
-    k_f32_to_f16<<<nblocks(nq), THREADS>>>(qh, q, nq);
-    k_f32_to_f16<<<nblocks(nk), THREADS>>>(kh, k, nk);
-    k_f32_to_f16<<<nblocks(nk), THREADS>>>(vh, v, nk);
+    __half *sh = da_alloc_half(ar, ns);
     /* alpha = 1/sqrt(D) folded into QK^T (drops the k_scale S*S*H pass); softmax writes the
      * fp16 probabilities for the AV GEMM directly (drops the k_f32_to_f16 S*S*H pass). */
     cublasGemmStridedBatchedEx(cb, CUBLAS_OP_T, CUBLAS_OP_N, Nk, Nq, D,
-        &scale, kh, CUDA_R_16F, D, (long long)Nk * D, qh, CUDA_R_16F, D, (long long)Nq * D,
+        &scale, k, CUDA_R_16F, D, (long long)Nk * D, q, CUDA_R_16F, D, (long long)Nq * D,
         &zero, scores, CUDA_R_32F, Nk, (long long)Nq * Nk, H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
     k_softmax_f16<<<H * Nq, RED_TH>>>(scores, sh, H * Nq, Nk);
     cublasGemmStridedBatchedEx(cb, CUBLAS_OP_N, CUBLAS_OP_N, D, Nq, Nk,
-        &one, vh, CUDA_R_16F, D, (long long)Nk * D, sh, CUDA_R_16F, Nk, (long long)Nq * Nk,
+        &one, v, CUDA_R_16F, D, (long long)Nk * D, sh, CUDA_R_16F, Nk, (long long)Nq * Nk,
         &zero, out, CUDA_R_32F, D, (long long)Nq * D, H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
     da_restore(ar, mark);
 }
@@ -636,7 +646,7 @@ struct aria_cuda_dit {
     /* per-request */
     int T, S, n_cond, have_req;
     float *dx, *dv, *dgcond, *rope_cos, *rope_sin;
-    float **cross_k, **cross_v, **cross_kd;
+    __half **cross_k, **cross_v, **cross_kd;   /* cached per request, stored fp16 (attn input) */
     float **local_emb; int has_local;   /* [depth] each [S, ed]; inpaint local-additive cond */
     const aria_steer_set *steer;        /* E12: host steer set (borrowed); residual dirs uploaded below */
     float **d_steer_dir; int cur_step;  /* [n_steer] device copies of each steer's [dim] direction */
@@ -701,13 +711,16 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     float *hh = da_alloc(ar, (size_t)S * dim);   /* no residual buffer: seq is preserved across each
                                                   * sub-layer (norm writes to hh), so the add is in-place */
     float *o = da_alloc(ar, (size_t)S * dim), *merged = da_alloc(ar, (size_t)S * dim);
-    float *qh = da_alloc(ar, (size_t)H * S * hd), *kh = da_alloc(ar, (size_t)H * S * hd);
-    float *vh = da_alloc(ar, (size_t)H * S * hd), *ao = da_alloc(ar, (size_t)H * S * hd);
+    /* q/k/v are fp16 end-to-end (producers emit fp16, attn_dev_h consumes it) */
+    __half *qh = da_alloc_half(ar, (size_t)H * S * hd), *kh = da_alloc_half(ar, (size_t)H * S * hd);
+    __half *vh = da_alloc_half(ar, (size_t)H * S * hd);
+    float *ao = da_alloc(ar, (size_t)H * S * hd);
     float *scores = da_alloc(ar, (size_t)H * S * (S > Sc ? S : Sc));   /* all heads (batched attn) */
     int diff = h->differential, nHShd = (int)nblocks((size_t)H * S * hd);
     size_t nHSd = (size_t)H * S * hd;
-    float *qdh = NULL, *kdh = NULL, *aod = NULL;   /* differential: q/k_diff + 2nd attn out */
-    if (diff) { qdh = da_alloc(ar, nHSd); kdh = da_alloc(ar, nHSd); aod = da_alloc(ar, nHSd); }
+    __half *qdh = NULL, *kdh = NULL;               /* differential: q/k_diff */
+    float *aod = NULL;                             /* differential: 2nd attn out */
+    if (diff) { qdh = da_alloc_half(ar, nHSd); kdh = da_alloc_half(ar, nHSd); aod = da_alloc(ar, nHSd); }
 
     /* self-attention (differential medium: out = attn(q,k,v) - attn(qd,kd,v)) */
     k_rmsnorm_adaln<<<S, RED_TH>>>(hh, seq, w->pre_norm, scale_self, shift_self, S, dim, 1e-5f);
@@ -716,28 +729,28 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     gemm_dqw(h, qkv, hh, &w->sa_to_qkv, NULL, S);
     k_extract_normrope<<<H * S, hd>>>(qh, qkv, w->sa_q_norm, h->rope_cos, h->rope_sin, S, H, hd, nq * dim, 0, rot, 1e-6f);
     k_extract_normrope<<<H * S, hd>>>(kh, qkv, w->sa_k_norm, h->rope_cos, h->rope_sin, S, H, hd, nq * dim, dim, rot, 1e-6f);
-    k_extract_heads<<<nHShd, THREADS>>>(vh, qkv, S, H, hd, nq * dim, 2 * dim);
-    attn_dev(h->cublas, ar, ao, qh, kh, vh, H, S, S, hd, scores, 1);
+    k_extract_heads_h<<<nHShd, THREADS>>>(vh, qkv, S, H, hd, nq * dim, 2 * dim);
+    attn_dev_h(h->cublas, ar, ao, qh, kh, vh, H, S, S, hd, scores);
     if (diff) {
         k_extract_normrope<<<H * S, hd>>>(qdh, qkv, w->sa_q_norm, h->rope_cos, h->rope_sin, S, H, hd, nq * dim, 3 * dim, rot, 1e-6f);
         k_extract_normrope<<<H * S, hd>>>(kdh, qkv, w->sa_k_norm, h->rope_cos, h->rope_sin, S, H, hd, nq * dim, 4 * dim, rot, 1e-6f);
-        attn_dev(h->cublas, ar, aod, qdh, kdh, vh, H, S, S, hd, scores, 1);
+        attn_dev_h(h->cublas, ar, aod, qdh, kdh, vh, H, S, S, hd, scores);
         k_sub<<<nblocks(nHSd), THREADS>>>(ao, aod, nHSd);
     }
     k_merge_heads<<<nHShd, THREADS>>>(merged, ao, S, H, hd);
     gemm_dqw(h, o, merged, &w->sa_to_out, NULL, S);
     k_gate_add<<<nSd, THREADS>>>(seq, seq, o, gate_self, S, dim);
 
-    /* cross-attention (cached K/V; differential: q_diff + cross_kd) */
+    /* cross-attention (cached fp16 K/V; differential: q_diff + cross_kd) */
     k_rmsnorm<<<S, RED_TH>>>(hh, seq, w->cross_norm, S, dim, 1e-5f, 0);
     int ncq = diff ? 2 : 1;
     float *q = da_alloc(ar, (size_t)S * ncq * dim);
     gemm_dqw(h, q, hh, &w->ca_to_q, NULL, S);
     k_extract_normrope<<<H * S, hd>>>(qh, q, w->ca_q_norm, NULL, NULL, S, H, hd, ncq * dim, 0, rot, 1e-6f);
-    attn_dev(h->cublas, ar, ao, qh, h->cross_k[blk], h->cross_v[blk], H, S, Sc, hd, scores, 1);
+    attn_dev_h(h->cublas, ar, ao, qh, h->cross_k[blk], h->cross_v[blk], H, S, Sc, hd, scores);
     if (diff) {
         k_extract_normrope<<<H * S, hd>>>(qdh, q, w->ca_q_norm, NULL, NULL, S, H, hd, ncq * dim, dim, rot, 1e-6f);
-        attn_dev(h->cublas, ar, aod, qdh, h->cross_kd[blk], h->cross_v[blk], H, S, Sc, hd, scores, 1);
+        attn_dev_h(h->cublas, ar, aod, qdh, h->cross_kd[blk], h->cross_v[blk], H, S, Sc, hd, scores);
         k_sub<<<nblocks(nHSd), THREADS>>>(ao, aod, nHSd);
     }
     k_merge_heads<<<nHShd, THREADS>>>(merged, ao, S, H, hd);
@@ -883,9 +896,12 @@ extern "C" void aria_cuda_dit_set_request(aria_cuda_dit *h, const aria_sa3_dit_r
     /* device arena: one block's peak + step buffers (mirrors the CPU sizing;
      * differential needs ~32*S*ed for the extra 5-way qkv + q/k_diff + 2nd attn).
      * Allocated before the cross-K/V projection, which borrows it for GEMM scratch. */
-    /* +S*ed + H*S*max(S,n_cond): fp16 q/k/v + scores scratch for tensor-core attn_dev */
+    /* +S*ed + H*S*max(S,n_cond): fp16 q/k/v + scores scratch for tensor-core attn_dev.
+     * +6*n_cond*ed: cross-K/V projection scratch (kv [n_cond,nkv*ed] + 3 fp32 temps
+     * before the fp16 cache), borrowed from this arena below. */
     size_t block_floats = (size_t)6 * ed + (h->differential ? 32 : 24) * (size_t)S * ed
-                          + 2 * (size_t)H * S * (S > n_cond ? S : n_cond) + 2 * (size_t)S * ed;
+                          + 2 * (size_t)H * S * (S > n_cond ? S : n_cond) + 2 * (size_t)S * ed
+                          + 6 * (size_t)n_cond * ed;
     size_t step_floats = (size_t)S * ed + 8 * (size_t)T * C + 8 * (size_t)ed;
     h->arena.cap = (block_floats + step_floats + (1u << 20)) * sizeof(float);
     h->arena.used = 0;
@@ -893,38 +909,45 @@ extern "C" void aria_cuda_dit_set_request(aria_cuda_dit *h, const aria_sa3_dit_r
 
     int nkv = h->differential ? 3 : 2;
     size_t khv = (size_t)H * n_cond * hd;
-    h->cross_k = (float **)calloc(h->depth, sizeof(float *));
-    h->cross_v = (float **)calloc(h->depth, sizeof(float *));
-    h->cross_kd = h->differential ? (float **)calloc(h->depth, sizeof(float *)) : NULL;
+    h->cross_k = (__half **)calloc(h->depth, sizeof(__half *));
+    h->cross_v = (__half **)calloc(h->depth, sizeof(__half *));
+    h->cross_kd = h->differential ? (__half **)calloc(h->depth, sizeof(__half *)) : NULL;
     if (rv->cross_ed) {
         /* project cross K/V on the device from cross_ed [n_cond, ed], once per
-         * request (was a per-request CPU GEMM + 24-block upload before). */
+         * request (was a per-request CPU GEMM + 24-block upload before). Cached as
+         * fp16 (the attention input dtype): converting once here produces the same
+         * RTNE bits attn_dev used to produce per step, 2*depth*steps passes less. */
         float *ced = upload_f32(rv->cross_ed, (size_t)n_cond * ed);
         for (int b = 0; b < h->depth; b++) {
             blk_dev *w = &h->blocks[b];
-            cudaMalloc(&h->cross_k[b], khv * sizeof(float));
-            cudaMalloc(&h->cross_v[b], khv * sizeof(float));
-            if (h->cross_kd) cudaMalloc(&h->cross_kd[b], khv * sizeof(float));
+            cudaMalloc(&h->cross_k[b], khv * sizeof(__half));
+            cudaMalloc(&h->cross_v[b], khv * sizeof(__half));
+            if (h->cross_kd) cudaMalloc(&h->cross_kd[b], khv * sizeof(__half));
             size_t mark = da_save(&h->arena);
             float *kv = da_alloc(&h->arena, (size_t)n_cond * nkv * ed);     /* [n_cond, nkv*ed] */
+            float *tk = da_alloc(&h->arena, khv), *tv = da_alloc(&h->arena, khv);
+            float *tkd = h->cross_kd ? da_alloc(&h->arena, khv) : NULL;
             gemm_dqw(h, kv, ced, &w->ca_to_kv, NULL, n_cond);
-            k_extract_heads<<<nblocks(khv), THREADS>>>(h->cross_k[b], kv, n_cond, H, hd, nkv * ed, 0);
+            k_extract_heads<<<nblocks(khv), THREADS>>>(tk, kv, n_cond, H, hd, nkv * ed, 0);
             if (h->cross_kd) {   /* chunk order: k, k_diff, v */
-                k_extract_heads<<<nblocks(khv), THREADS>>>(h->cross_kd[b], kv, n_cond, H, hd, nkv * ed, ed);
-                k_extract_heads<<<nblocks(khv), THREADS>>>(h->cross_v[b],  kv, n_cond, H, hd, nkv * ed, 2 * ed);
-                k_rmsnorm<<<H * n_cond, RED_TH>>>(h->cross_kd[b], h->cross_kd[b], w->ca_k_norm, H * n_cond, hd, 1e-6f, 0);
+                k_extract_heads<<<nblocks(khv), THREADS>>>(tkd, kv, n_cond, H, hd, nkv * ed, ed);
+                k_extract_heads<<<nblocks(khv), THREADS>>>(tv,  kv, n_cond, H, hd, nkv * ed, 2 * ed);
+                k_rmsnorm<<<H * n_cond, RED_TH>>>(tkd, tkd, w->ca_k_norm, H * n_cond, hd, 1e-6f, 0);
+                k_f32_to_f16<<<nblocks(khv), THREADS>>>(h->cross_kd[b], tkd, khv);
             } else {
-                k_extract_heads<<<nblocks(khv), THREADS>>>(h->cross_v[b], kv, n_cond, H, hd, nkv * ed, ed);
+                k_extract_heads<<<nblocks(khv), THREADS>>>(tv, kv, n_cond, H, hd, nkv * ed, ed);
             }
-            k_rmsnorm<<<H * n_cond, RED_TH>>>(h->cross_k[b], h->cross_k[b], w->ca_k_norm, H * n_cond, hd, 1e-6f, 0);
+            k_rmsnorm<<<H * n_cond, RED_TH>>>(tk, tk, w->ca_k_norm, H * n_cond, hd, 1e-6f, 0);
+            k_f32_to_f16<<<nblocks(khv), THREADS>>>(h->cross_k[b], tk, khv);
+            k_f32_to_f16<<<nblocks(khv), THREADS>>>(h->cross_v[b], tv, khv);
             da_restore(&h->arena, mark);
         }
         cudaFree(ced);
     } else {
         for (int b = 0; b < h->depth; b++) {   /* legacy: CPU-projected K/V uploaded */
-            h->cross_k[b] = upload_f32(rv->cross_k[b], khv);
-            h->cross_v[b] = upload_f32(rv->cross_v[b], khv);
-            if (h->cross_kd) h->cross_kd[b] = upload_f32(rv->cross_kd[b], khv);
+            h->cross_k[b] = upload_f16(rv->cross_k[b], khv);
+            h->cross_v[b] = upload_f16(rv->cross_v[b], khv);
+            if (h->cross_kd) h->cross_kd[b] = upload_f16(rv->cross_kd[b], khv);
         }
     }
     /* continue/inpaint: upload the per-block, CPU-projected local-additive cond [S, ed]
@@ -1176,8 +1199,8 @@ static void taae_block_dev(aria_cuda_dec *h, float *seq, int B, const dec_blk_de
     k_rope<<<nblocks(bhs), THREADS>>>(qd, h->rcos, h->rsin, B * H, S, hd, DC_ROT);
     k_rope<<<nblocks(bhs), THREADS>>>(k,  h->rcos, h->rsin, B * H, S, hd, DC_ROT);
     k_rope<<<nblocks(bhs), THREADS>>>(kd, h->rcos, h->rsin, B * H, S, hd, DC_ROT);
-    attn_dev(h->cublas, ar, ob, q,  k,  v, B * H, S, S, hd, scores, 0);
-    attn_dev(h->cublas, ar, od, qd, kd, v, B * H, S, S, hd, scores, 0);
+    attn_dev(h->cublas, ar, ob, q,  k,  v, B * H, S, S, hd, scores);
+    attn_dev(h->cublas, ar, od, qd, kd, v, B * H, S, S, hd, scores);
     k_subtract<<<nblocks((size_t)NH), THREADS>>>(ob, od, (size_t)NH);
     k_merge_heads_b<<<nblocks((size_t)NH), THREADS>>>(merged, ob, B, S, H, hd);
     gemm_f16w(h->cublas, ar, o, merged, w->to_out, NULL, N, D, D);
