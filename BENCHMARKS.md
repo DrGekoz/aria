@@ -148,15 +148,25 @@ QK/AV stays fp16. Graph-capturable (graph-vs-inline byte-identical). 60 s warm, 
 
 | mode | small 60 s | medium 60 s | GPU VRAM (med) |
 |---|---|---|---|
-| fp16 (default, exact) | 0.58 s (DiT 0.40) | 1.49 s (DiT 0.97) | 4.46 GB |
+| fp16 (default, exact) | 0.55 s (DiT 0.40 + dec 0.13) | 1.43 s (DiT 0.96 + dec 0.43) | 4.46 GB |
 | q8, fp16-dequant (old) | 0.62 s (DiT 0.47) | 1.62 s (DiT 1.11) | 3.40 GB |
-| **q8 W8A8** | **0.48 s (DiT 0.30)** | **1.26 s (DiT 0.75)** | 3.40 GB |
+| **q8 W8A8** | **0.46 s (DiT 0.30)** | **1.24 s (DiT 0.75)** | 3.40 GB |
 
-vs stable-audio-tools at 60 s: small 0.48 vs 0.41 (gap 1.46× → **1.17×**), medium 1.26 vs
-1.32 — **aria now beats SAT on long-audio medium** (was 1.31× behind at the last audit).
-10 s small: DiT 0.12 → 0.08 s. Fidelity (single-step `-s 1` probe, isolates one DiT call):
-medium q8-dequant 3.2 % → W8A8 7.3 % velocity-class error — between q8 and the supported
-q4's 9.3 %, i.e. a legitimate point on the existing precision dial (opt-in, off by default).
+(with the decoder mapping-conv-as-GEMM: decode small 0.16 → **0.13 s**, medium 0.48 →
+**0.44 s**, audio rel 7e-7 — the fp32 conv ran as a naive kernel, 29/42 ms at 60 s.)
+vs stable-audio-tools at 60 s: small 0.46 vs 0.41 (gap 1.46× → **1.12×**), medium 1.24 vs
+1.32 — **aria now beats SAT on long-audio medium** (was 1.31× behind at the last audit);
+fp16-exact is at ≈ parity (1.43 vs 1.32, 1.08×). 10 s small DiT 0.12 → 0.08 s.
+Fidelity (single-step `-s 1` probe, isolates one DiT call): medium q8-dequant 3.2 % →
+W8A8 7.3 % velocity-class error — between q8 and the supported q4's 9.3 %, i.e. a
+legitimate point on the existing precision dial (opt-in, off by default).
+
+**W8A8 on the CPU (NEON sdot, E15.2c).** The same `ARIA_W8A8` knob routes the CPU q8
+block GEMMs through per-token int8 activations + exact-int32 sdot accumulation
+(`aria_linear_q8a8`; sdot / vmull / scalar paths are bit-identical). **Pi 5, 10 s
+small-music: q8 DiT 57.3 → 22.8 s (2.5×), total 67.5 → 32.6 s** — q8 flips from the
+slowest CPU mode to the fastest (fp32 measured 44.3 s in the same session; the box ran
+soft-thermal-limited, so absolute numbers are conservative).
 
 **Banded DiT self-attention: measured and REJECTED.** Per-layer softmax mass at 60 s
 (S=710, small-music, CPU instrumentation): the 64 memory tokens absorb 17–53 % of every
@@ -226,6 +236,7 @@ decode (E16.1) active:
 | **small fp32, NEON (E15.2)** | **28.4 s** | ~1.9 GB |
 | small q8, scalar dequant | 276 s | 2.9 GB |
 | small q8, **NEON dequant (E15.2b)** | **67.1 s** (4.1×) | 2.9 GB |
+| small q8, **W8A8 NEON sdot (E15.2c)** | **32.6 s** (2.1× over dequant; DiT 57.3→22.8 s) | 2.9 GB |
 | **medium q4, NEON** | **242 s** | **6.79 GB — fits the 8 GB board** |
 
 (small fp32 NEON: 4 s clip 16.6 s; GEMM 34 → 58 GFLOP/s, K-blocked 12.9 → 52.6.)

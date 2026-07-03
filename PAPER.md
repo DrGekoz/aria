@@ -46,9 +46,16 @@ is only **S ≈ 710 tokens**. At that length the LLM staples are wrong:
   hand-rolled flash. nsys: the softmax FA-2 would remove is only **~9 %** of GPU time.
 - **KV-cache is irrelevant** (diffusion is non-autoregressive; every step is a full
   bidirectional pass).
+- **Sparse/windowed attention doesn't transfer either — DiT attention is global.**
+  Measured per-layer softmax mass at 60 s (S=710): the 64 memory tokens absorb
+  **17–53 %** of every audio query's attention, and memory-prefix + a ±256 band
+  (79 % of all keys) still covers only **86–96 %** of the mass (±128: 70–92 %).
+  Unlike the decoder's architectural ±17 window (exact, O(N·35)), windowing the DiT
+  would discard 4–30 % of attention mass per layer — rejected on measurement.
 
-  → *Negative result with a mechanism:* flash/KV-cache are tuned for the O(S²)-memory-
-  bound, long-context LLM regime; audio diffusion lives below the crossover.
+  → *Negative result with a mechanism:* flash/KV-cache/sliding-window are tuned for
+  the O(S²)-memory-bound, long-context LLM regime; audio diffusion lives below the
+  crossover, and its attention, while cheap, is global.
 
 ### B2. The bottleneck is the FFN GEMMs + a "long tail" of glue + the AE decoder
 nsys breakdown of the medium GPU DiT: **GEMMs ~41 %**, attention softmax ~9 %, and a
@@ -56,7 +63,15 @@ nsys breakdown of the medium GPU DiT: **GEMMs ~41 %**, attention softmax ~9 %, a
 ~9 %, rmsnorm ~7 %, RoPE ~5 %, extract/merge-heads, adaLN/gate). We fused the biggest —
 extract-head + per-head qk-rmsnorm + RoPE into one kernel (`k_extract_normrope`), plus
 rmsnorm+adaLN and gate+residual-add — for **medium GPU DiT 1.45 → 1.28 s (−12 %)**,
-parity unchanged. The long tail, not attention, is the GPU lever.
+parity unchanged. The long tail, not attention, is the GPU lever. Two later steps
+confirm it: (a) emitting fp16 straight from the producer kernels + caching the cross-
+K/V rounding per request (byte-identical) and running the mapping conv as a GEMM
+(rel 7e-7) took medium to **1.43 s**; (b) the GEMMs themselves are the only lever
+left — **W8A8** (per-token int8 activations onto the already-packed q8 weights,
+int8×int8 IMMA, `ARIA_W8A8=1`) cuts the medium DiT 0.96 → 0.75 s at a measured
+single-step velocity-class error of **7.3 %** (between q8's 3.2 % and the supported
+q4's 9.3 %), and on the Pi 5 cuts the q8 DiT **57.3 → 22.8 s (2.5×, NEON sdot)** —
+making q8 the *fastest* mode on both targets instead of the slowest.
 
 ### B3. A from-scratch C runtime *beats* the optimized framework for long audio
 The reference implements the medium decoder's ±17 sliding window as a **dense O(N²)**
@@ -74,7 +89,8 @@ novelty is the *re-derivation of priorities*, not any single kernel.
 | backend | aria 60 s | SAT 60 s | verdict |
 |---|---|---|---|
 | CPU (20 thr) | 55.9 s | 108.4 s | aria 1.94× faster |
-| GPU (fp16) | 2.07 s (DiT 1.28 + dec 0.78) | 1.32 s | SAT 1.57× faster |
+| GPU (fp16, exact) | 1.43 s (DiT 0.96 + dec 0.43) | 1.32 s | ≈ parity (SAT 1.08×) |
+| GPU (q8 W8A8) | **1.24 s** (DiT 0.75 + dec 0.44) | 1.32 s | **aria 1.06× faster** |
 
 GPU DiT kernel mix (nsys): GEMM ~41 %, long-tail glue ~32 %, softmax ~9 %, decoder band
 + conv ~14 %. ~14 k kernel launches/gen (launch-heavy).
@@ -201,7 +217,7 @@ with live prompting"** — distinct from the AR-codec-LM approach of Magenta/Lyr
 not (to our knowledge) demonstrated for audio. It rides on aria's existing inpaint path.
 
 **Latency budget (why it's real-time):** aria GPU does ~0.034 s of compute per second of
-audio (60 s in 2.07 s). A 2 s emit on a ~12 s window (matching Magenta's 10 s context)
+audio (60 s in 1.43 s). A 2 s emit on a ~12 s window (matching Magenta's 10 s context)
 costs ~0.4 s GPU → **~5× real-time (RTF ≈ 5)**, vs Magenta RT's RTF 1.8 on an H100 — the
 diffusion core is *cheaper per chunk* on far smaller hardware (a few denoise steps over a
 256-d latent), trading the open coherence question below. Smaller windows lower latency
