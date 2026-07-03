@@ -84,6 +84,11 @@ int main(void) {
             aria_linear_q8(yq, x, q, scale, NULL, M, K, N);
             snprintf(tag, sizeof(tag), "q8 gemm relerr[%dx%d]", N, K);
             check_le(tag, gemm_relerr(yq, yref, M * N), 0.03f);
+            /* W8A8: int8 activations on the same weights (adds per-row activation
+             * quantization error on top of q8's -- looser threshold) */
+            aria_linear_q8a8(yq, x, q, scale, NULL, M, K, N);
+            snprintf(tag, sizeof(tag), "w8a8 gemm relerr[%dx%d]", N, K);
+            check_le(tag, gemm_relerr(yq, yref, M * N), 0.06f);
             free(q); free(scale); free(Wd); free(yq);
         }
         /* ---- Q4 ---- */
@@ -112,6 +117,8 @@ int main(void) {
         aria_q8_quant(q, scale, W, N, K);
         aria_linear_q8(yq, x, q, scale, b, Mb, K, N);
         check_le("q8 gemm+bias relerr", gemm_relerr(yq, yref, Mb * N), 0.03f);
+        aria_linear_q8a8(yq, x, q, scale, b, Mb, K, N);
+        check_le("w8a8 gemm+bias relerr", gemm_relerr(yq, yref, Mb * N), 0.06f);
     }
 
     /* E9.2: aria_qweight serialization round-trip must be bit-identical */

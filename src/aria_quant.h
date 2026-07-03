@@ -42,6 +42,11 @@ void aria_q8_quant(int8_t *q, float *scale, const float *W, int N, int K);
 /* dequant-on-use GEMM: y[M,N] = x[M,K] @ dequant(q,scale)^T + b. b may be NULL. */
 void aria_linear_q8(float *y, const float *x, const int8_t *q, const float *scale,
                     const float *b, int M, int K, int N);
+/* W8A8 GEMM (opt-in, ARIA_W8A8=1): activations quantized per row (symmetric int8,
+ * absmax/127, mirrors the GPU path), int8xint8 dot in exact int32 (NEON sdot when
+ * available), y = acc*sx[m]*scale[n] + b. Faster + ~q4-class fidelity vs q8. */
+void aria_linear_q8a8(float *y, const float *x, const int8_t *q, const float *scale,
+                      const float *b, int M, int K, int N);
 
 /* ---- Q4: per-block asymmetric int4 (block = ARIA_Q4_BLOCK), 2 nibbles/byte,
  *      2 floats per block [min, scale] ---- */

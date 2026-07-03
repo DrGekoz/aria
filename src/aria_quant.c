@@ -105,6 +105,85 @@ void aria_linear_q8(float *y, const float *x, const int8_t *q, const float *scal
     }
 }
 
+/* ---- W8A8 (E15.2c): int8 activations x int8 weights, exact int32 accumulation ----
+ * The activation row is quantized like a q8 weight row (symmetric absmax/127,
+ * round-to-nearest -- mirrors the GPU k_quant_act_q8 exactly), then the dot runs in
+ * integer math: int32 accumulation is exact (|acc| <= 127*127*K < 2^31 for K < 133k),
+ * so the NEON sdot path and the scalar path are BIT-IDENTICAL. Opt-in via ARIA_W8A8
+ * (checked in aria_linear_qw): trades ~q4-class fidelity for the fastest CPU q8 mode
+ * (no per-element widening, 1/4 the fp32 weight traffic). */
+
+/* per-thread activation scratch (same pattern as aria_cpu.c grow_tls) */
+static int8_t *q8a8_tls(size_t need) {
+    static __thread int8_t *buf = NULL; static __thread size_t cap = 0;
+    if (need > cap) { free(buf); buf = (int8_t *)malloc(need); cap = buf ? need : 0; }
+    return buf;
+}
+
+void aria_linear_q8a8(float *y, const float *x, const int8_t *q, const float *scale,
+                      const float *b, int M, int K, int N) {
+    int8_t *xq = q8a8_tls((size_t)M * K + (size_t)M * sizeof(float) + 64);
+    float *sx = (float *)(void *)(xq + (((size_t)M * K + 63) & ~(size_t)63));
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int m = 0; m < M; m++) {   /* quantize the activation rows (symmetric int8) */
+        const float *xr = x + (size_t)m * K;
+        int8_t *qr = xq + (size_t)m * K;
+        float amax = 0.0f;
+        for (int k = 0; k < K; k++) { float a = fabsf(xr[k]); if (a > amax) amax = a; }
+        sx[m] = amax / 127.0f;
+        if (amax > 0.0f) {
+            float inv = 127.0f / amax;
+            for (int k = 0; k < K; k++) qr[k] = (int8_t)clampi((int)lrintf(xr[k] * inv), -127, 127);
+        } else {
+            memset(qr, 0, (size_t)K);
+        }
+    }
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int m = 0; m < M; m++) {
+        const int8_t *xr = xq + (size_t)m * K;
+        float *yr = y + (size_t)m * N;
+        float sm = sx[m];
+        for (int n = 0; n < N; n++) {
+            const int8_t *qn = q + (size_t)n * K;
+            int32_t acc;
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+            int32x4_t a0 = vdupq_n_s32(0), a1 = vdupq_n_s32(0);
+            int32x4_t a2 = vdupq_n_s32(0), a3 = vdupq_n_s32(0);
+            int k = 0;
+            for (; k + 64 <= K; k += 64) {   /* 4x sdot: 64 int8 MACs/iter */
+                a0 = vdotq_s32(a0, vld1q_s8(xr + k),      vld1q_s8(qn + k));
+                a1 = vdotq_s32(a1, vld1q_s8(xr + k + 16), vld1q_s8(qn + k + 16));
+                a2 = vdotq_s32(a2, vld1q_s8(xr + k + 32), vld1q_s8(qn + k + 32));
+                a3 = vdotq_s32(a3, vld1q_s8(xr + k + 48), vld1q_s8(qn + k + 48));
+            }
+            for (; k + 16 <= K; k += 16) a0 = vdotq_s32(a0, vld1q_s8(xr + k), vld1q_s8(qn + k));
+            acc = vaddvq_s32(vaddq_s32(vaddq_s32(a0, a1), vaddq_s32(a2, a3)));
+            for (; k < K; k++) acc += (int32_t)xr[k] * qn[k];
+#elif defined(__ARM_NEON)
+            /* no-dotprod NEON: int8xint8 -> int16 (vmull), pairwise-add into int32.
+             * Still exact integer math == the scalar/sdot result. */
+            int32x4_t a0 = vdupq_n_s32(0), a1 = vdupq_n_s32(0);
+            int k = 0;
+            for (; k + 16 <= K; k += 16) {
+                int8x16_t xv = vld1q_s8(xr + k), qv = vld1q_s8(qn + k);
+                a0 = vpadalq_s16(a0, vmull_s8(vget_low_s8(xv),  vget_low_s8(qv)));
+                a1 = vpadalq_s16(a1, vmull_s8(vget_high_s8(xv), vget_high_s8(qv)));
+            }
+            acc = vaddvq_s32(vaddq_s32(a0, a1));
+            for (; k < K; k++) acc += (int32_t)xr[k] * qn[k];
+#else
+            acc = 0;
+            for (int k = 0; k < K; k++) acc += (int32_t)xr[k] * qn[k];
+#endif
+            yr[n] = (float)acc * sm * scale[n] + (b ? b[n] : 0.0f);
+        }
+    }
+}
+
 /* ---- Q4 (block asymmetric / zero-point; 2 nibbles/byte; per block [min,scale]) ----
  * nibble in [0,15]; W ~= min + nib*scale, scale = (max-min)/15. Affine quant fits
  * skewed weight blocks far better than symmetric int4. */
@@ -162,7 +241,12 @@ void aria_qweight_free(aria_qweight *w) {
 }
 
 void aria_linear_qw(float *y, const float *x, const aria_qweight *w, const float *b, int M) {
-    if (w->dt == ARIA_Q8)      aria_linear_q8(y, x, (const int8_t *)w->q, w->scale, b, M, w->K, w->N);
+    static int w8a8 = -1;   /* opt-in int8-activation path, same env knob as the GPU */
+    if (w8a8 < 0) w8a8 = getenv("ARIA_W8A8") != NULL;
+    if (w->dt == ARIA_Q8) {
+        if (w8a8) aria_linear_q8a8(y, x, (const int8_t *)w->q, w->scale, b, M, w->K, w->N);
+        else      aria_linear_q8(y, x, (const int8_t *)w->q, w->scale, b, M, w->K, w->N);
+    }
     else if (w->dt == ARIA_Q4) aria_linear_q4(y, x, (const uint8_t *)w->q, w->scale, b, M, w->K, w->N);
     else                       aria_linear(y, x, w->f32, b, M, w->K, w->N);
 }
