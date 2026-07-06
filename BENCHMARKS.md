@@ -258,6 +258,33 @@ monolithic decode would have blown the 8 GB budget). NEON-vs-scalar parity 3.8e-
 test suite green on ARM. Remaining levers: E15.3 params-on-disk (headroom below 6.8 GB),
 sdot int8 path, threads-vs-thermals tuning.
 
+## Generation-speed optimization pass (2026-07, audit-driven)
+
+Eight measured levers from a multi-lens code audit. Each is byte-/parity-gated; the
+default (fp16 GPU / fp32 CPU, 8 steps) is untouched unless noted.
+
+| # | lever | where | measured | gate |
+|---|---|---|---|---|
+| A1 | `--fast` = 6 steps | sampler | ~25 % off every DiT-bound path (med GPU 1.43→1.19, CPU 60 s 55.9→44, Pi q8 32.6→27) | wav2taste: 8→6 drift < seed noise on both tiers |
+| A2 | GPU micro-pack (softmax writeback drop, FF-bias fold, fp16-emit producers) | `aria_cuda.cu` | 60 s exact: small 0.55→0.49, **medium 1.43→1.28 (beats SAT 1.38)**; W8A8 med 1.24→1.17 | fp16 byte-identical (graph+inline) |
+| A3 | warm-request reuse + 8-way T5 LRU | `aria_cuda.cu`, model | per-request setup 0.03→0.01 s; batch/sweeps skip graph rebuild + re-encode | bench/batch byte-identical |
+| A4 | CPU glue pack (parallelize+vectorize glue, collapse(head,qblock), conv-interchange, `OMP_WAIT_POLICY=active`) | `aria_cpu.c`, `aria_sa3_dit.c` | i9 small 60 s CPU 16.3→11.3 s; SAT gap 1.47×→1.09×; Pi small 10 s 39.2→28.4 s | CPU + GPU byte-identical |
+| B2 | fp16/bf16 CPU storage **+ overlay source-release** | `aria_quant.c`, `aria_sa3_dit.c` | Pi peak RSS fp32 1913 → fp16 1199 (−37 %) → **q8 835 MB (−56 %)**; i9 W8A8 2426→982 MB | fp16 rel 5.5e-3; W8A8/GPU byte-identical; unit-tested |
+| B3 | opt-in decoder q8 (`ARIA_DEC_Q8`, ARM sdot) | `aria_taae.c`, decoders | **ARM-only**: Pi small decode 5.03→3.54 s (1.4×); **x86 is a 2× loss** (packed-fp32 wins) → do not enable on x86 | rel 9.0 % small / 2.7 % med (q4-class); off by default |
+| B4 | x86 AVX2 int8 GEMM (maddubs W8A8 + widening q8) | `aria_quant.c` | i9 W8A8 DiT 5.11→1.99 s (2.6×), q8-dequant 27→3.6 s (7.5×) vs scalar; fp32 still fastest x86 mode | W8A8 byte-identical (exact int32); unit-tested |
+| B5 | streaming partial-emit range decode (E14.1) | decoders, model, `--stream` | Pi small-music continuation decode **5.22→1.67 s (3.1×)**; i9 medium 3.5→2.3 s (wider halo) | emitted audio byte-identical x86 **and** ARM; `ARIA_NO_RANGE` A/B |
+
+The **overlay source-release** (B2) is the sleeper win: every CPU overlay (q8/q4/fp16)
+was previously a footprint *add* (packed copy + still-resident fp32 mmap); `MADV_DONTNEED`
+of the six big DiT block matrices after the overlay copies them makes it a *replace*,
+so q8 on the Pi drops from RAM-negative to the smallest footprint. Two levers stay
+opt-in because they lose on the wrong hardware: **W8A8** (`ARIA_W8A8`) is a CPU win only on
+ARM sdot / a GPU win everywhere; **decoder q8** (`ARIA_DEC_Q8`) is ARM-only and carries a
+q4-class fidelity cost on the final audio, so it is never on by default. Deferred with a
+reason: a **cuDNN FlashAttention-2 build flag** (`FLASH=cudnn`, long-audio GPU only —
+libcudnn dependency, must be graph-captured) and the **GPU-IMMA decoder** (device decode
+already 0.13–0.44 s; 2 structs × 9 sites for a marginal, fidelity-risky gain).
+
 ## Takeaways
 
 - **GPU memory:** aria's footprint is consistently smaller (−27 to −47 %) — a bump

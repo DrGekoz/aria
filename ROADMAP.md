@@ -330,12 +330,37 @@ chunk boundaries → seam-free chunked decode with O(window) memory).
   `sd_tensor_merge_2d` / `get_tile_sizes` analogs) for stream joins and E16.1
   window policy.
 
+## E19 — Generation-speed optimization pass (2026-07, audit-driven, LANDED)
+
+Eight measured levers from a multi-lens code audit; all byte-/parity-gated, default path
+untouched. Full numbers in BENCHMARKS.md ("Generation-speed optimization pass").
+- ✅ **A1** `--fast` = 6 steps (wav2taste-calibrated: 8→6 drift < seed noise, both tiers).
+- ✅ **A2** GPU micro-pack (softmax-writeback drop + FF-bias fold + fp16-emit producers —
+  **supersedes E17.1**); medium 60 s 1.43→1.28 s exact, byte-identical.
+- ✅ **A3** warm-request reuse (skip graph/cross-K/V/arena rebuild on unchanged shape) +
+  8-way T5 embed LRU; per-request setup 0.03→0.01 s.
+- ✅ **A4** CPU glue pack (parallelize+vectorize glue, collapse(head,qblock), conv
+  interchange, `OMP_WAIT_POLICY=active`); i9 small 60 s 16.3→11.3 s, byte-identical.
+- ✅ **B2** fp16/bf16 CPU storage **+ overlay source-release** (`MADV_DONTNEED` the DiT
+  block source after the overlay copies it — makes every CPU overlay a RAM *replace* not
+  *add*; **closes the E15.3 params-on-disk motivation** for the DiT weights). Pi q8 peak
+  RSS −56 %.
+- ✅ **B3** opt-in decoder q8 (`ARIA_DEC_Q8`, ARM sdot): Pi small decode 5.0→3.5 s; **x86
+  is a 2× loss** (packed-fp32 wins) and fidelity is q4-class → off by default.
+- ✅ **B4** x86 AVX2 int8 GEMM (maddubs W8A8 + widening q8): W8A8 DiT 5.1→2.0 s vs scalar
+  (fp32 still fastest x86 mode).
+- ✅ **B5** streaming partial-emit range decode (**E14.1 done**): Pi small continuation
+  decode 5.2→1.7 s (3.1×), emitted audio byte-identical (x86 + ARM).
+- ⬜ **Deferred, with reason:** `FLASH=cudnn` FA-2 build flag (long-audio GPU only;
+  libcudnn dep, must be graph-captured); GPU-IMMA decoder (device decode already
+  0.13–0.44 s, marginal + fidelity-risky); a register-blocked ARM int8 decoder microkernel
+  (would turn B3's x86 loss / modest ARM win into a real win).
+
 ## E17 — GPU perf backlog (consolidated, post-42962e0)
 
-- ⬜ **E17.1** **P1** Producer kernels emit fp16: `k_rmsnorm_adaln`, `k_ff_silugate`,
-  `k_merge_heads`, `k_extract_normrope` write fp32 that the next GEMM/attention
-  re-converts (`k_f32_to_f16`, ~6 % of GPU time). Emit `__half` directly where the
-  consumer is fp16. Verify: byte-identical (RTNE preserved) or documented tol.
+- ✅ **E17.1** **DONE (A2)** Producer kernels emit fp16: `k_rmsnorm_adaln`, `k_ff_silugate`,
+  `k_merge_heads`, `k_extract_normrope` now emit `__half` straight into the consumer GEMM/
+  attention (the `k_f32_to_f16` passes are gone). Byte-identical (RTNE preserved).
 - ⬜ **E17.2** **P2** On-device pingpong sampler: the per-step latent D2H→host
   pingpong→H2D round-trip + host RNG can move device-side (host keeps the
   schedule); removes 2 transfers/step and the host sync. Verify: parity vs host
