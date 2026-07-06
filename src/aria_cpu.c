@@ -172,6 +172,26 @@ static void pack_b_panel(float *dst, const float *W, int n0, int N, int pc, int 
         else       { for (int k = 0; k < kc; k++) dst[k * PNR + j] = 0.0f; }
     }
 }
+/* B2: half-precision B-source packing -- fp16 (IEEE) or bf16 weights are widened to
+ * f32 WHILE packing, so the microkernel stays the fp32 packed kernel and the weight
+ * stream from memory halves. Widening happens once per (panel, K-block), amortized
+ * exactly like the fp32 copy the pack already did. */
+static void pack_b_panel_h(float *dst, const uint16_t *W, int n0, int N, int pc, int kc, int K, int bf16) {
+    for (int j = 0; j < PNR; j++) {
+        int n = n0 + j;
+        if (n < N) {
+            const uint16_t *wr = W + (size_t)n * K + pc;
+            if (bf16) {
+                for (int k = 0; k < kc; k++) {
+                    union { uint32_t u; float f; } v; v.u = (uint32_t)wr[k] << 16;
+                    dst[k * PNR + j] = v.f;
+                }
+            } else {
+                for (int k = 0; k < kc; k++) dst[k * PNR + j] = aria_half_to_float(wr[k]);
+            }
+        } else for (int k = 0; k < kc; k++) dst[k * PNR + j] = 0.0f;
+    }
+}
 #if defined(ARIA_AVX2)
 /* K-blocked microkernel: accumulates a KC-slice into y (C in memory across K-blocks).
  * full-N tile (n0+PNR<=N), edge-M guarded; bias added on the last K-block. */
@@ -348,7 +368,83 @@ static void aria_linear_packed(float *y, const float *x, const float *W, const f
             for (int n = Nfull; n < N; n++)
                 y[(size_t)m * N + n] = aria_dot(x + (size_t)m * K, W + (size_t)n * K, K) + (b ? b[n] : 0.0f);
 }
+/* B2: half-source packed driver -- identical blocking to aria_linear_packed, the only
+ * difference is pack_b_panel_h widening the fp16/bf16 weights while packing. */
+static void aria_linear_packed_h(float *y, const float *x, const uint16_t *W, int bf16,
+                                 const float *b, int M, int K, int N) {
+    static __thread float *Abuf = NULL; static __thread size_t Acap = 0;
+    int np_m = (M + PMR - 1) / PMR, np_n = (N + PNR - 1) / PNR;
+    float *Ap = grow_tls(&Abuf, &Acap, (size_t)np_m * PMR * K);
+    if (!Ap) return;
+    for (int p = 0; p < np_m; p++) pack_a_panel(Ap + (size_t)p * PMR * K, x, p * PMR, M, K);
+    const int KC = 1024, kblk = (K > 2048), Nfull = (N / PNR) * PNR;
+    #ifdef _OPENMP
+    #pragma omp parallel
+    #endif
+    {
+        static __thread float *Bbuf = NULL; static __thread size_t Bcap = 0;
+        float *Bp = grow_tls(&Bbuf, &Bcap, (size_t)PNR * (kblk ? KC : K));
+        if (Bp && !kblk) {
+            #ifdef _OPENMP
+            #pragma omp for schedule(dynamic)
+            #endif
+            for (int pn = 0; pn < np_n; pn++) {
+                int n0 = pn * PNR;
+                pack_b_panel_h(Bp, W, n0, N, 0, K, K, bf16);
+                for (int pm = 0; pm < np_m; pm++)
+                    ukern_6x16(y, N, Ap + (size_t)pm * PMR * K, Bp, K, b, pm * PMR, n0, M);
+            }
+        } else if (Bp) {
+            #ifdef _OPENMP
+            #pragma omp for schedule(dynamic)
+            #endif
+            for (int pn = 0; pn < Nfull / PNR; pn++) {
+                int n0 = pn * PNR;
+                for (int pc = 0; pc < K; pc += KC) {
+                    int kc = pc + KC <= K ? KC : K - pc;
+                    pack_b_panel_h(Bp, W, n0, N, pc, kc, K, bf16);
+                    for (int pm = 0; pm < np_m; pm++)
+                        ukern_acc(y, N, Ap + (size_t)pm * PMR * K + pc * PMR, Bp, kc, b,
+                                  pm * PMR, n0, M, pc == 0, pc + kc >= K);
+                }
+            }
+        }
+    }
+    if (kblk && Nfull < N)
+        for (int m = 0; m < M; m++)
+            for (int n = Nfull; n < N; n++) {
+                const uint16_t *wr = W + (size_t)n * K;
+                float acc = 0.0f;
+                for (int k = 0; k < K; k++)
+                    acc += x[(size_t)m * K + k] * (bf16 ? aria_bf16_to_float(wr[k]) : aria_half_to_float(wr[k]));
+                y[(size_t)m * N + n] = acc + (b ? b[n] : 0.0f);
+            }
+}
 #endif  /* packed GEMM (ARIA_AVX2 || ARIA_NEON) */
+
+void aria_linear_hw(float *y, const float *x, const uint16_t *W, int bf16,
+                    const float *b, int M, int K, int N) {
+#if defined(ARIA_AVX2) || defined(ARIA_NEON)
+    if ((size_t)M * N * K >= (1u << 18)) {
+        aria_linear_packed_h(y, x, W, bf16, b, M, K, N);
+        return;
+    }
+#endif
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int m = 0; m < M; m++) {   /* small-GEMM fallback: widen-on-the-fly dot */
+        const float *xr = x + (size_t)m * K;
+        float *yr = y + (size_t)m * N;
+        for (int n = 0; n < N; n++) {
+            const uint16_t *wr = W + (size_t)n * K;
+            float acc = 0.0f;
+            for (int k = 0; k < K; k++)
+                acc += xr[k] * (bf16 ? aria_bf16_to_float(wr[k]) : aria_half_to_float(wr[k]));
+            yr[n] = acc + (b ? b[n] : 0.0f);
+        }
+    }
+}
 
 void aria_linear(float *y, const float *x, const float *W, const float *b,
                  int M, int K, int N) {

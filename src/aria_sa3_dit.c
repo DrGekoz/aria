@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <sys/mman.h>   /* B2: MADV_DONTNEED the mmap'd source once the overlay copies it */
+#include <unistd.h>
 
 static inline float sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }
 
@@ -446,6 +448,22 @@ static void dit_free_bq(aria_sa3_dit *m) {
 
 /* (Re)build the quantized weight overlay for the block GEMMs. dt==F32 drops the
  * overlay (back to the zero-copy mmap path). Idempotent: no-op if dt unchanged. */
+/* B2: drop the mmap'd fp32 source of a block weight now that the overlay (q8/q4/fp16/
+ * bf16) holds its own copy and the CPU hot path reads the overlay, not this tensor.
+ * Only the fully-interior pages are advised away, so a page shared with an adjacent
+ * still-needed tensor (a norm gamma, a bias) is never touched; the source is file-
+ * backed and never written, so a stray later read (e.g. a GPU get_view on the same
+ * resident model) just re-faults from disk. This is what turns the CPU overlay from
+ * a footprint ADD (source + copy resident) into the promised footprint REPLACE. */
+static void dit_release_source(const void *p, size_t bytes) {
+    if (!p || !bytes) return;
+    long pg = sysconf(_SC_PAGESIZE);
+    if (pg <= 0) return;
+    uintptr_t a = (uintptr_t)p, lo = (a + (uintptr_t)pg - 1) & ~((uintptr_t)pg - 1);
+    uintptr_t hi = (a + bytes) & ~((uintptr_t)pg - 1);
+    if (hi > lo) madvise((void *)lo, (size_t)(hi - lo), MADV_DONTNEED);
+}
+
 void aria_sa3_dit_quantize(aria_sa3_dit *m, aria_dtype dt) {
     if (!m || dt == m->precision) return;
     dit_free_bq(m);
@@ -469,6 +487,15 @@ void aria_sa3_dit_quantize(aria_sa3_dit *m, aria_dtype dt) {
         aria_qweight_set(&q->ca_to_out, w->ca_to_out, ed, ed, adt);
         aria_qweight_set(&q->ff_in_w,   w->ff_in_w,   2 * inner, ed, dt);
         aria_qweight_set(&q->ff_out_w,  w->ff_out_w,  ed, inner, dt);
+        /* the overlay owns its copy now: reclaim the fp32 mmap source of the six big
+         * GEMM matrices (ca_to_kv stays f32 -- projected per request -- so it is NOT
+         * released; norms/biases are tiny and shared-page, left resident). */
+        dit_release_source(w->sa_to_qkv, (size_t)nq * ed * ed * sizeof(float));
+        dit_release_source(w->sa_to_out, (size_t)ed * ed * sizeof(float));
+        dit_release_source(w->ca_to_q,   (size_t)ncq * ed * ed * sizeof(float));
+        dit_release_source(w->ca_to_out, (size_t)ed * ed * sizeof(float));
+        dit_release_source(w->ff_in_w,   (size_t)2 * inner * ed * sizeof(float));
+        dit_release_source(w->ff_out_w,  (size_t)ed * inner * sizeof(float));
     }
 }
 

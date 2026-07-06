@@ -380,7 +380,12 @@ static int sa3_generate(aria_ctx *ctx, void *state,
      * in VRAM + dequantized there, so the host path stays fp32 (fast); the CPU
      * dequant overlay is built only when the DiT actually runs on the CPU. fp16/bf16
      * are not yet a distinct CPU format -> fp32 there. */
-    aria_dtype prec = (p->precision == ARIA_Q8 || p->precision == ARIA_Q4) ? p->precision : ARIA_F32;
+    /* B2: fp16/bf16 are now real CPU storage formats (half the DiT weight stream +
+     * resident RAM; fp32 compute via pack-time widening). On the GPU they map to the
+     * existing fp16 device storage as before. */
+    aria_dtype prec = (p->precision == ARIA_Q8 || p->precision == ARIA_Q4 ||
+                       p->precision == ARIA_F16 || p->precision == ARIA_BF16)
+                      ? p->precision : ARIA_F32;
     int quant = (prec != ARIA_F32);
 
     /* E9.2: a pre-quantized DiT overlay (.aria from aria-quantize) -> CPU path,

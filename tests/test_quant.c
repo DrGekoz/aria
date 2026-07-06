@@ -102,6 +102,23 @@ int main(void) {
             check_le(tag, gemm_relerr(yq, yref, M * N), 0.12f);
             free(q); free(scale); free(yq);
         }
+        /* ---- B2: fp16 / bf16 storage GEMM (fp32 compute, so error is the weight-store
+         * rounding only: fp16 ~2^-11 rel, bf16 ~2^-8 rel per element) ---- */
+        for (int bf16 = 0; bf16 < 2; bf16++) {
+            aria_qweight hw;
+            aria_qweight_set(&hw, W, N, K, bf16 ? ARIA_BF16 : ARIA_F16);
+            float *yq = malloc((size_t)M * N * sizeof(float));
+            aria_linear_hw(yq, x, (const uint16_t *)hw.q, bf16, NULL, M, K, N);
+            snprintf(tag, sizeof(tag), "%s gemm relerr[%dx%d]", bf16 ? "bf16" : "fp16", N, K);
+            check_le(tag, gemm_relerr(yq, yref, M * N), bf16 ? 0.02f : 0.004f);
+            /* qw dispatch must route dt==F16/BF16 through the same kernel (bit-identical) */
+            float *yd = malloc((size_t)M * N * sizeof(float));
+            aria_linear_qw(yd, x, &hw, NULL, M);
+            int same = 1;
+            for (int i = 0; i < M * N; i++) if (yd[i] != yq[i]) { same = 0; break; }
+            if (!same) { printf("FAIL %s: linear_qw != linear_hw\n", bf16 ? "bf16" : "fp16"); fails++; }
+            aria_qweight_free(&hw); free(yq); free(yd);
+        }
         free(W); free(x); free(yref);
     }
 

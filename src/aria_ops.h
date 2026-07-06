@@ -13,11 +13,66 @@
 #ifndef ARIA_OPS_H
 #define ARIA_OPS_H
 
+#include <stdint.h>
+
+/* ---- half-precision storage helpers (B2) ---- */
+
+/* IEEE fp16 <-> fp32, scalar, RTNE on the way down. Storage-only: all compute stays
+ * fp32 (the packed GEMM widens while packing weight panels). */
+static inline float aria_half_to_float(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1Fu, man = h & 0x3FFu, f;
+    if (exp == 0) {
+        if (man == 0) f = sign;
+        else {  /* subnormal: renormalize */
+            int e = 0;
+            while (!(man & 0x400u)) { man <<= 1; e++; }
+            f = sign | ((uint32_t)(113 - e) << 23) | ((man & 0x3FFu) << 13);
+        }
+    } else if (exp == 31) f = sign | 0x7F800000u | (man << 13);
+    else f = sign | ((exp + 112u) << 23) | (man << 13);
+    union { uint32_t u; float fl; } v; v.u = f; return v.fl;
+}
+static inline uint16_t aria_float_to_half(float x) {
+    union { float fl; uint32_t u; } v; v.fl = x;
+    uint32_t sign = (v.u >> 16) & 0x8000u;
+    int32_t exp = (int32_t)((v.u >> 23) & 0xFFu) - 127 + 15;
+    uint32_t man = v.u & 0x7FFFFFu;
+    if (exp >= 31) return (uint16_t)(sign | (((v.u >> 23) & 0xFF) == 0xFF && man
+                                            ? 0x7E00u : 0x7C00u));   /* inf/nan */
+    if (exp <= 0) {   /* subnormal or zero: shift with RTNE */
+        if (exp < -10) return (uint16_t)sign;
+        man |= 0x800000u;
+        int shift = 14 - exp;
+        uint32_t q = man >> shift, rem = man & ((1u << shift) - 1), half = 1u << (shift - 1);
+        if (rem > half || (rem == half && (q & 1))) q++;
+        return (uint16_t)(sign | q);
+    }
+    uint32_t q = man >> 13, rem = man & 0x1FFFu;
+    uint16_t out = (uint16_t)(sign | ((uint32_t)exp << 10) | q);
+    if (rem > 0x1000u || (rem == 0x1000u && (out & 1))) out++;   /* RTNE (may carry into exp) */
+    return out;
+}
+static inline float aria_bf16_to_float(uint16_t h) {
+    union { uint32_t u; float fl; } v; v.u = (uint32_t)h << 16; return v.fl;
+}
+static inline uint16_t aria_float_to_bf16(float x) {   /* RTNE on bit 16 */
+    union { float fl; uint32_t u; } v; v.fl = x;
+    uint32_t lsb = (v.u >> 16) & 1u;
+    return (uint16_t)((v.u + 0x7FFFu + lsb) >> 16);
+}
+
 /* ---- linear algebra ---- */
 
 /* y[M,N] = x[M,K] @ W^T + b ; W is [N,K] (PyTorch Linear weight), b is [N] or NULL. */
 void aria_linear(float *y, const float *x, const float *W, const float *b,
                  int M, int K, int N);
+
+/* B2: as aria_linear but W stored as fp16 (bf16=0) or bf16 (bf16=1) uint16; widened
+ * to f32 while packing weight panels -- the compute path is the same packed kernel,
+ * the weight memory stream halves. */
+void aria_linear_hw(float *y, const float *x, const uint16_t *W, int bf16,
+                    const float *b, int M, int K, int N);
 
 /* C[M,N] = A[M,K] @ B[K,N] (both row-major). */
 void aria_matmul(float *C, const float *A, const float *B, int M, int K, int N);

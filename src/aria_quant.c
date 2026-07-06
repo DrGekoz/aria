@@ -286,8 +286,20 @@ void aria_qweight_set(aria_qweight *w, const float *W, int N, int K, aria_dtype 
         w->q = malloc(aria_q4_qbytes(N, K));
         w->scale = malloc(aria_q4_nscale(N, K) * sizeof(float));
         aria_q4_quant((uint8_t *)w->q, w->scale, W, N, K);
+    } else if (dt == ARIA_F16 || dt == ARIA_BF16) {
+        /* B2: half-precision STORAGE, fp32 compute -- the packed GEMM widens the
+         * weight panels while packing, so the weight memory stream halves. */
+        uint16_t *h = malloc((size_t)N * K * sizeof(uint16_t));
+        w->q = h;
+        if (h) {
+            #ifdef _OPENMP
+            #pragma omp parallel for schedule(static)
+            #endif
+            for (size_t i = 0; i < (size_t)N * K; i++)
+                h[i] = (dt == ARIA_BF16) ? aria_float_to_bf16(W[i]) : aria_float_to_half(W[i]);
+        } else { w->dt = ARIA_F32; w->f32 = W; }   /* OOM: fall back to borrowing f32 */
     } else {
-        w->dt = ARIA_F32;   /* fp16/bf16 not yet a CPU storage format -> borrow f32 */
+        w->dt = ARIA_F32;
         w->f32 = W;
     }
 }
@@ -306,12 +318,15 @@ void aria_linear_qw(float *y, const float *x, const aria_qweight *w, const float
         else      aria_linear_q8(y, x, (const int8_t *)w->q, w->scale, b, M, w->K, w->N);
     }
     else if (w->dt == ARIA_Q4) aria_linear_q4(y, x, (const uint8_t *)w->q, w->scale, b, M, w->K, w->N);
+    else if (w->dt == ARIA_F16 || w->dt == ARIA_BF16)
+        aria_linear_hw(y, x, (const uint16_t *)w->q, w->dt == ARIA_BF16, b, M, w->K, w->N);
     else                       aria_linear(y, x, w->f32, b, M, w->K, w->N);
 }
 
 size_t aria_qweight_bytes(const aria_qweight *w) {
     if (w->dt == ARIA_Q8) return aria_q8_qbytes(w->N, w->K) + aria_q8_nscale(w->N, w->K) * sizeof(float);
     if (w->dt == ARIA_Q4) return aria_q4_qbytes(w->N, w->K) + aria_q4_nscale(w->N, w->K) * sizeof(float);
+    if (w->dt == ARIA_F16 || w->dt == ARIA_BF16) return (size_t)w->N * w->K * sizeof(uint16_t);
     return (size_t)w->N * w->K * sizeof(float);
 }
 
