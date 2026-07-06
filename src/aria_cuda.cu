@@ -16,6 +16,7 @@
 #include <cublas_v2.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #define CK(call) do {                                                        \
     cudaError_t err_ = (call);                                               \
@@ -747,6 +748,13 @@ struct aria_cuda_dit {
      * arena offsets), replay per denoise step -> kills per-step kernel-launch overhead. */
     cudaGraphExec_t graph_exec; cudaGraph_t graph;
     int graph_ready, graph_failed; void *cublas_ws;
+    /* A3 warm-request reuse: a host copy of the request-defining inputs. When the next
+     * set_request matches (same S/T/n_cond, no local cond, identical cross_ed bytes,
+     * identical steer topology+dirs), the whole teardown/rebuild -- graph re-instantiate,
+     * cross-K/V reprojection, arena cudaMalloc churn -- is skipped. Benches, batch jobs
+     * with a repeated prompt, and steering sweeps (scales live OUTSIDE the graph) hit. */
+    float *saved_ced; int saved_ced_n;      /* [n_cond*ed] host copy, NULL = nothing saved */
+    aria_steer *saved_steer_items; float *saved_steer_dirs; int saved_steer_n;
 };
 
 /* a[i] -= b[i] (differential attention combine on the device) */
@@ -1108,9 +1116,43 @@ static void free_request(aria_cuda_dit *h) {
     h->d_steer_scale = NULL; h->h_steer_scale = NULL;
     h->dx = h->dv = h->dgcond = NULL;
     h->rope_cos = h->rope_sin = NULL; h->arena.base = NULL; h->have_req = 0;
+    free(h->saved_ced); h->saved_ced = NULL; h->saved_ced_n = 0;   /* A3 warm-hit snapshot */
+    free(h->saved_steer_items); free(h->saved_steer_dirs);
+    h->saved_steer_items = NULL; h->saved_steer_dirs = NULL; h->saved_steer_n = 0;
+}
+
+/* A3: does the incoming request match the resident one bit-for-bit in everything the
+ * device caches/graph baked in? Shape + no local cond + identical cross_ed bytes +
+ * identical steer topology AND dir values (scales are per-step device state, outside
+ * the graph, so they may differ freely -- the steering-sweep case). */
+static int request_compatible(const aria_cuda_dit *h, const aria_sa3_dit_req_view *rv) {
+    if (!h->have_req || !h->saved_ced || !rv->cross_ed) return 0;
+    if (h->S != rv->S || h->T != rv->T || h->n_cond != rv->n_cond) return 0;
+    if (h->has_local || rv->has_local) return 0;
+    int n_new = (rv->steer && rv->steer->n > 0) ? rv->steer->n : 0;
+    if (n_new != h->saved_steer_n) return 0;
+    if (memcmp(h->saved_ced, rv->cross_ed, (size_t)rv->n_cond * h->ed * sizeof(float)) != 0) return 0;
+    const float *dirs = h->saved_steer_dirs;
+    for (int s = 0; s < n_new; s++) {
+        const aria_steer *a = &rv->steer->items[s], *b = &h->saved_steer_items[s];
+        if (a->site != b->site || a->layer != b->layer || a->dim != b->dim || a->op != b->op) return 0;
+        if (a->dir && b->dim > 0) {
+            if (memcmp(dirs, a->dir, (size_t)a->dim * sizeof(float)) != 0) return 0;
+            dirs += a->dim;
+        }
+    }
+    return 1;
 }
 
 extern "C" void aria_cuda_dit_set_request(aria_cuda_dit *h, const aria_sa3_dit_req_view *rv) {
+    if (request_compatible(h, rv)) {
+        /* warm hit: keep the graph, cross-K/V cache, arena and steer-dir uploads;
+         * refresh only the borrowed host pointer (the caller's old steer set may be
+         * freed) and the step counter. dx/dgcond are re-uploaded per step anyway. */
+        h->steer = (rv->steer && rv->steer->n > 0) ? rv->steer : NULL;
+        h->cur_step = 0;
+        return;
+    }
     free_request(h);   /* persistent weights, fresh per-request caches */
     int ed = h->ed, C = h->io_ch, S = rv->S, T = rv->T, H = h->H, hd = h->hd, n_cond = rv->n_cond, rh = h->rot / 2;
     h->T = T; h->S = S; h->n_cond = n_cond;
@@ -1205,6 +1247,29 @@ extern "C" void aria_cuda_dit_set_request(aria_cuda_dit *h, const aria_sa3_dit_r
                 cudaFree(h->d_steer_scale); h->d_steer_scale = NULL; h->h_steer_scale = NULL;
             }
         } else h->d_steer_scale = NULL;
+    }
+    /* A3: snapshot the request-defining inputs so the NEXT set_request can detect a
+     * warm hit (request_compatible) and skip this whole teardown/rebuild. */
+    if (rv->cross_ed && !rv->has_local) {
+        h->saved_ced_n = n_cond * ed;
+        h->saved_ced = (float *)malloc((size_t)h->saved_ced_n * sizeof(float));
+        if (h->saved_ced) memcpy(h->saved_ced, rv->cross_ed, (size_t)h->saved_ced_n * sizeof(float));
+        h->saved_steer_n = h->steer ? h->steer->n : 0;
+        if (h->saved_steer_n > 0) {
+            size_t dtot = 0;
+            for (int s = 0; s < h->saved_steer_n; s++)
+                if (h->steer->items[s].dir) dtot += (size_t)h->steer->items[s].dim;
+            h->saved_steer_items = (aria_steer *)malloc((size_t)h->saved_steer_n * sizeof(aria_steer));
+            h->saved_steer_dirs = dtot ? (float *)malloc(dtot * sizeof(float)) : NULL;
+            float *dp = h->saved_steer_dirs;
+            for (int s = 0; s < h->saved_steer_n && h->saved_steer_items; s++) {
+                h->saved_steer_items[s] = h->steer->items[s];
+                if (h->steer->items[s].dir && dp) {
+                    memcpy(dp, h->steer->items[s].dir, (size_t)h->steer->items[s].dim * sizeof(float));
+                    dp += h->steer->items[s].dim;
+                }
+            }
+        }
     }
     h->have_req = 1;
 }
