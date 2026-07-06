@@ -101,11 +101,18 @@ aria_sa3_dec_medium *aria_sa3_dec_medium_load(safetensors_file_t *sf) {
         m->mapping_w = fw;
     }
     if (m->failed) { aria_sa3_dec_medium_free(m); return NULL; }
+    /* B3 (opt-in): quantize the medium decoder block GEMMs (ARIA_DEC_Q8). Same fidelity
+     * caveat as the small decoder -- final-audio GEMMs, gate before relying on it. */
+    const char *dq = getenv("ARIA_DEC_Q8");
+    aria_dtype ddt;
+    if (dq && aria_dtype_parse(dq[0] == '1' ? "q8" : dq, &ddt) == 0 && ddt != ARIA_F32)
+        for (int i = 0; i < MED_DEPTH; i++) taae_block_quantize(&m->blocks[i], MED_D, MED_INNER, ddt);
     return m;
 }
 
 void aria_sa3_dec_medium_free(aria_sa3_dec_medium *m) {
     if (!m) return;
+    for (int i = 0; i < MED_DEPTH; i++) taae_block_overlay_free(&m->blocks[i]);
     free(m->mapping_w);
     free(m);
 }

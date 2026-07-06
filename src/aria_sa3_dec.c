@@ -261,11 +261,19 @@ aria_sa3_dec *aria_sa3_dec_load(safetensors_file_t *sf) {
     }
 
     if (m->failed) { aria_sa3_dec_free(m); return NULL; }
+    /* B3 (opt-in): quantize the decoder block GEMMs (ARIA_DEC_Q8=q8|fp16|bf16). q8 uses
+     * the CPU sdot/AVX2 int8 path; source is released. Fidelity-gate before relying on it
+     * -- the decoder is the final audio reconstruction, no error-correction downstream. */
+    const char *dq = getenv("ARIA_DEC_Q8");
+    aria_dtype ddt;
+    if (dq && aria_dtype_parse(dq[0] == '1' ? "q8" : dq, &ddt) == 0 && ddt != ARIA_F32)
+        for (int i = 0; i < 6; i++) taae_block_quantize(&m->blocks[i], TAAE_D, TAAE_INNER, ddt);
     return m;
 }
 
 void aria_sa3_dec_free(aria_sa3_dec *m) {
     if (!m) return;
+    for (int i = 0; i < 6; i++) taae_block_overlay_free(&m->blocks[i]);
     free(m->mapping_w);   /* the folded conv weight is the only owned buffer */
     free(m);
 }

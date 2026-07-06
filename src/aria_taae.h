@@ -14,6 +14,7 @@
 
 #include <stddef.h>
 #include "aria_arena.h"
+#include "aria_quant.h"   /* B3: optional q8/fp16 decoder-weight overlay */
 
 #define TAAE_D     768   /* transformer model dim */
 #define TAAE_H     12    /* heads */
@@ -33,7 +34,18 @@ typedef struct {
     float ff_alpha;   const float *ff_gamma, *ff_beta;
     const float *ff_in_w, *ff_in_b;      /* [4608,768],[4608] */
     const float *ff_out_w, *ff_out_b;    /* [768,2304],[768] */
+    /* B3 (opt-in, ARIA_DEC_Q8): quantized/half overlay of the 4 big GEMM matrices.
+     * qon=0 -> the fp32 mmap pointers above are used (default). When on, the block
+     * forward dispatches through aria_linear_qw (q8 sdot/AVX2 on ARM/x86, or fp16). */
+    int qon;
+    aria_qweight q_to_qkv, q_to_out, q_ff_in_w, q_ff_out_w;
 } taae_block_w;
+
+/* B3: build/free the decoder-block overlay (dt = ARIA_Q8/F16/BF16) for the 4 big
+ * GEMM matrices; releases the fp32 mmap source (page-aligned) once copied. `dim`/
+ * `inner` are the block's runtime dims (small: TAAE_D/TAAE_INNER; medium: 1536/...). */
+void taae_block_quantize(taae_block_w *w, int dim, int inner, aria_dtype dt);
+void taae_block_overlay_free(taae_block_w *w);
 
 /* run one block in place on xc[N,768]; rope tables rcos/rsin[N,16]. All scratch
  * is drawn from `ar` (save/restore-scoped) so the hot path never malloc/frees. */
