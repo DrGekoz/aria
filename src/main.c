@@ -45,6 +45,7 @@ typedef struct {
     aria_device device;
     aria_dtype precision;
     int do_info, do_list, do_generate, do_stream, inpaint_continue, stream_hold, rng_torch;
+    int steps_set, fast;                    /* A1: --fast = 6-step preset unless -s is explicit */
     int util;                               /* 0 none / 1 wav-roundtrip / 2 hpss-test */
     const char *steer_specs[16]; int n_steer;   /* E12: repeatable --steer site:layer:dir.atns:scale:lo-hi */
     const char *batch_file;                 /* E13: --batch jobs TSV (resident multi-gen) */
@@ -65,7 +66,7 @@ enum {   /* keys: short flags use their ASCII char; long-only options use ids pa
     K_SEED=256, K_DEVICE, K_BENCH, K_UNCOND, K_PEMB, K_INFO, K_LIST,
     K_INPAINT, K_CONTINUE, K_FROM, K_TO, K_PREC, K_LOADQ, K_RNG,
     K_STREAM, K_CHUNK, K_CTX, K_CHUNKS, K_HOLD, K_WAVRT, K_HPSS, K_STEER,
-    K_BATCH, K_LORA, K_STEERRAMP, K_ANCHOR, K_EVOLVE,
+    K_BATCH, K_LORA, K_STEERRAMP, K_ANCHOR, K_EVOLVE, K_FAST,
 };
 typedef enum { A_NONE, A_ONE, A_TWO, A_OPT } argkind;  /* flag / 1 arg / 2 args / optional 1 arg */
 typedef struct {
@@ -83,6 +84,7 @@ static const opt_spec OPTS[] = {
     {K_UNCOND,   "uncond",        0,  A_NONE, NULL,         "generate", "unconditional generation"},
     {K_DUR,      "",             'd', A_ONE,  "<sec>",      "generate", "duration in seconds (default 15)"},
     {K_STEPS,    "",             's', A_ONE,  "<n>",        "generate", "denoise steps (default 8)"},
+    {K_FAST,     "fast",          0,  A_NONE, NULL,         "generate", "fast preset: 6 steps (calibrated: taste-drift < seed noise; overridden by -s)"},
     {K_SEED,     "seed",          0,  A_ONE,  "<n>",        "generate", "RNG seed (default random)"},
     {K_DEVICE,   "device",        0,  A_ONE,  "<dev>",      "generate", "cpu | cuda | auto (default auto)"},
     {K_PREC,     "precision",     0,  A_ONE,  "<p>",        "generate", "fp32 | fp16 | bf16 | q8 | q4 (q8/q4 force CPU)"},
@@ -124,7 +126,8 @@ static int cli_apply(int key, char **a, cli_config *c) {
     case K_PEMB:   c->prompt_embed = a[0]; c->do_generate = 1; break;
     case K_UNCOND: c->do_generate = 1; break;
     case K_DUR:    c->seconds = (float)atof(a[0]); break;
-    case K_STEPS:  c->steps = atoi(a[0]); break;
+    case K_STEPS:  c->steps = atoi(a[0]); c->steps_set = 1; break;
+    case K_FAST:   c->fast = 1; break;
     case K_SEED:   c->seed = atoll(a[0]); break;
     case K_BENCH:  c->bench = atoi(a[0]); if (c->bench < 1) c->bench = 1; break;
     case K_DEVICE:
@@ -213,6 +216,7 @@ static int cli_parse(int argc, char **argv, cli_config *c) {
         if (o->arg == A_OPT && i + 1 < argc && argv[i + 1][0] != '-') args[0] = argv[++i];
         if (cli_apply(o->key, args, c)) return 1;
     }
+    if (c->fast && !c->steps_set) c->steps = 6;   /* A1: preset unless -s was explicit (order-independent) */
     return 0;
 }
 
