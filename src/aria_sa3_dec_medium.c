@@ -249,3 +249,27 @@ void aria_sa3_dec_medium_forward_windowed(const aria_sa3_dec_medium *m, float *a
     }
     free(lat_slice); free(aud_slice);
 }
+
+/* B5 (E14.1): decode ONLY latent frames [rStart, rEnd) of the medium latent into
+ * out_audio (full [2, T*4096] buffer; rest untouched). One haloed window; keep region
+ * byte-identical to the same span of the full/windowed decode (H = MED_WIN_HALO). */
+void aria_sa3_dec_medium_forward_range(const aria_sa3_dec_medium *m, float *audio,
+                                       const float *latent, int T, int rStart, int rEnd) {
+    if (rStart < 0) rStart = 0;
+    if (rEnd > T) rEnd = T;
+    if (rEnd <= rStart) return;
+    const int H = MED_WIN_HALO;
+    int A = rStart - H; if (A < 0) A = 0;
+    int B = rEnd + H;   if (B > T) B = T;
+    int wf = B - A;
+    float *lat_slice = malloc((size_t)256 * wf * sizeof(float));
+    float *aud_slice = malloc((size_t)2 * wf * 4096 * sizeof(float));
+    for (int c = 0; c < 256; c++)
+        memcpy(lat_slice + (size_t)c * wf, latent + (size_t)c * T + A, (size_t)wf * sizeof(float));
+    med_decode_slice(m, aud_slice, lat_slice, wf, A * MED_SEG);
+    for (int c = 0; c < 2; c++)
+        memcpy(audio + (size_t)c * T * 4096 + (size_t)rStart * 4096,
+               aud_slice + (size_t)c * wf * 4096 + (size_t)(rStart - A) * 4096,
+               (size_t)(rEnd - rStart) * 4096 * sizeof(float));
+    free(lat_slice); free(aud_slice);
+}

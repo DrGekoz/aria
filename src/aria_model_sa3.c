@@ -491,18 +491,32 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     if (we && we[0]) win_s = atof(we);
     int win_frames = win_s > 0 ? (int)lround(win_s * st->sample_rate / st->cfg.downsampling_ratio) : 0;
     int windowed = win_frames > 0 && T > win_frames;   /* only when there's >1 window */
-    float *audio = malloc((size_t)2 * T * 4096 * sizeof(float));
+    /* B5 (E14.1): partial-emit range decode -- decode only [decode_from_s, decode_to_s)
+     * of the audio (the CPU decoders; the GPU path stays monolithic). The buffer is
+     * zeroed so the undecoded remainder is silence (the streaming caller discards it). */
+    int rStart = 0, rEnd = T, range = 0;
+    if (p->decode_to_s > p->decode_from_s && p->decode_to_s > 0.0f && !getenv("ARIA_NO_RANGE")) {
+        rStart = (int)((double)p->decode_from_s * st->sample_rate / st->cfg.downsampling_ratio);
+        rEnd   = (int)ceil((double)p->decode_to_s * st->sample_rate / st->cfg.downsampling_ratio);
+        if (rStart < 0) rStart = 0;
+        if (rEnd > T) rEnd = T;
+        range = rEnd - rStart < T;
+    }
+    float *audio = range ? calloc((size_t)2 * T * 4096, sizeof(float))
+                         : malloc((size_t)2 * T * 4096 * sizeof(float));
 #ifdef ARIA_CUDA
-    if (st->cdec_med)  aria_cuda_dec_medium_forward(st->cdec_med, audio, x, T);
+    if (st->cdec_med)  aria_cuda_dec_medium_forward(st->cdec_med, audio, x, T);   /* device: monolithic */
     else if (st->cdec) aria_cuda_dec_forward(st->cdec, audio, x, T);
     else
 #endif
     if (st->is_medium) {
-        if (windowed) aria_sa3_dec_medium_forward_windowed(st->dec_med, audio, x, T, win_frames);
-        else          aria_sa3_dec_medium_forward(st->dec_med, audio, x, T);
+        if (range)         aria_sa3_dec_medium_forward_range(st->dec_med, audio, x, T, rStart, rEnd);
+        else if (windowed) aria_sa3_dec_medium_forward_windowed(st->dec_med, audio, x, T, win_frames);
+        else               aria_sa3_dec_medium_forward(st->dec_med, audio, x, T);
     } else {
-        if (windowed) aria_sa3_dec_forward_windowed(st->dec, audio, x, T, win_frames);
-        else          aria_sa3_dec_forward(st->dec, audio, x, T);
+        if (range)         aria_sa3_dec_forward_range(st->dec, audio, x, T, rStart, rEnd);
+        else if (windowed) aria_sa3_dec_forward_windowed(st->dec, audio, x, T, win_frames);
+        else               aria_sa3_dec_forward(st->dec, audio, x, T);
     }
 #ifdef ARIA_CUDA
     /* once the DiT+decoder are device-resident, the host F32 weights aren't read on

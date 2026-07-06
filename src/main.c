@@ -576,6 +576,12 @@ static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float con
         p->seconds_total = win_s;
         p->init_audio_mem = (i == 0) ? NULL : context;
         p->inpaint_continue = (i == 0) ? 0 : 1;
+        /* B5 (E14.1): decode only the region we actually emit (+ the maxlag search room
+         * + a small halo margin), not the whole win_s window. CPU decoders only; the
+         * GPU decode is already fast + monolithic and ignores this. */
+        p->decode_from_s = (float)emit_start / sr - 0.25f;
+        p->decode_to_s   = (float)(emit_start + emit_len + maxlag) / sr + 0.25f;
+        if (p->decode_from_s < 0.0f) p->decode_from_s = 0.0f;
         if (ramp_target && n_chunks > 1) {
             /* E14: live steering ramp -- linear lo->hi over the chunks, or triangular
              * (lo->hi->lo) with 'tri'. The steer set points at this item, so the new

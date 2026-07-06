@@ -57,9 +57,16 @@ typedef struct {
                                        * Used by the streaming loop to avoid temp WAVs. */
     const aria_steer_set *steer;      /* optional activation steering (E12); NULL = none */
     const aria_lora_adapter *lora;    /* optional runtime LoRA adapter (E12.9, CPU); NULL = none */
+    /* B5 (E14.1) partial-emit decode: only [decode_from_s, decode_to_s) of the audio
+     * is decoded (the rest of the returned buffer is silence). The full DiT still runs
+     * (every latent frame is needed for coherence); only the AE decoder is restricted,
+     * with a halo so the kept span is byte-identical to a full decode. Used by --stream
+     * to decode ~2 s per chunk instead of the whole ~12.5 s window. 0/0 = full decode.
+     * CPU decoders only; the device decoder ignores it (already fast, monolithic). */
+    float decode_from_s, decode_to_s;
 } aria_gen_params;
 
-#define ARIA_GEN_PARAMS_DEFAULT { NULL, NULL, 15.0f, 8, 1.0f, 0, ARIA_DEVICE_AUTO, ARIA_F32, NULL, NULL, 0.0f, 0.0f, 0, NULL, NULL, 0, NULL, NULL, NULL }
+#define ARIA_GEN_PARAMS_DEFAULT { NULL, NULL, 15.0f, 8, 1.0f, 0, ARIA_DEVICE_AUTO, ARIA_F32, NULL, NULL, 0.0f, 0.0f, 0, NULL, NULL, 0, NULL, NULL, NULL, 0.0f, 0.0f }
 
 /* Load a model from a directory containing model_config.json + model.safetensors.
  * Returns NULL on error (see aria_last_error()). */

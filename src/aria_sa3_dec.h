@@ -50,6 +50,16 @@ void aria_sa3_dec_forward_windowed(const aria_sa3_dec *m, float *out_audio,
 void aria_sa3_dec_medium_forward_windowed(const aria_sa3_dec_medium *m, float *audio,
                                           const float *latent, int T, int window_frames);
 
+/* ---- B5 (E14.1) partial-emit range decode ----
+ * Decode ONLY latent frames [rStart, rEnd) into out_audio (the full [2,T*4096]
+ * buffer; other frames left untouched). One haloed window -> the kept span is
+ * byte-identical to the same span of the full/windowed decode. For --stream:
+ * decode only the emitted chunk instead of the whole rolling window. */
+void aria_sa3_dec_forward_range(const aria_sa3_dec *m, float *out_audio,
+                                const float *latent, int T, int rStart, int rEnd);
+void aria_sa3_dec_medium_forward_range(const aria_sa3_dec_medium *m, float *audio,
+                                       const float *latent, int T, int rStart, int rEnd);
+
 /* ---- stage entry points (staged parity) ---- */
 void aria_sa3_softnorm_decode(const aria_sa3_dec *m, float *z, const float *latent, int T); /* z[256,T] */
 void aria_sa3_same_decode(const aria_sa3_dec *m, float *dec, const float *z, int T);        /* dec[512,T*16] */

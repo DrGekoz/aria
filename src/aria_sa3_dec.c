@@ -162,6 +162,32 @@ void aria_sa3_dec_forward_windowed(const aria_sa3_dec *m, float *out_audio,
     free(lat_slice); free(aud_slice);
 }
 
+/* B5 (E14.1): decode ONLY latent frames [rStart, rEnd) into out_audio (the full
+ * [2, T*4096] buffer; the rest is left untouched by this call). One haloed window --
+ * the keep region is byte-identical to the same span of a full/windowed decode, the
+ * halo derivation is identical to aria_sa3_dec_forward_windowed above. Lets --stream
+ * decode ~one emit chunk instead of the whole rolling window. */
+void aria_sa3_dec_forward_range(const aria_sa3_dec *m, float *out_audio,
+                                const float *latent, int T, int rStart, int rEnd) {
+    if (rStart < 0) rStart = 0;
+    if (rEnd > T) rEnd = T;
+    if (rEnd <= rStart) return;
+    const int H = DEC_WIN_HALO;
+    int A = rStart - H; if (A < 0) A = 0; A -= (A & 1);
+    int B = rEnd + H;   if (B > T) B = T; else if (B & 1) B++;
+    int wf = B - A;
+    float *lat_slice = malloc((size_t)256 * wf * sizeof(float));
+    float *aud_slice = malloc((size_t)2 * wf * 4096 * sizeof(float));
+    for (int c = 0; c < 256; c++)
+        memcpy(lat_slice + (size_t)c * wf, latent + (size_t)c * T + A, (size_t)wf * sizeof(float));
+    aria_sa3_dec_forward(m, aud_slice, lat_slice, wf);
+    for (int c = 0; c < 2; c++)
+        memcpy(out_audio + (size_t)c * T * 4096 + (size_t)rStart * 4096,
+               aud_slice + (size_t)c * wf * 4096 + (size_t)(rStart - A) * 4096,
+               (size_t)(rEnd - rStart) * 4096 * sizeof(float));
+    free(lat_slice); free(aud_slice);
+}
+
 void aria_sa3_dec_block_test(const aria_sa3_dec *m, int idx, float *xc, int N) {
     float *rcos = malloc((size_t)N * (DEC_ROT / 2) * sizeof(float));
     float *rsin = malloc((size_t)N * (DEC_ROT / 2) * sizeof(float));
