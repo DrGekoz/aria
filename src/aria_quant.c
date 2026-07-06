@@ -21,6 +21,28 @@
  * so the math is identical to the scalar dequant path (relerr matches, not the
  * int8xint8 vdotq_s32 route which would need activation quantization and raise the
  * error above the scalar tolerance). AArch64 horizontal reduce via vaddvq. */
+#elif defined(__AVX2__)
+#include <immintrin.h>
+/* B4: x86 was scalar for every quant GEMM (the NEON branches above are ARM-only), so
+ * q8 -- and especially W8A8 -- ran SLOWER than the packed fp32 kernel on x86. Two
+ * AVX2 paths fix that: (1) q8 widening (cvtepi8->cvtdq2ps->fma, same fp32 math class
+ * as the NEON widening); (2) q8a8 int8xint8 via the maddubs sign trick --
+ * maddubs(|x|, sign(w,x)) pairs into int16 (max 127*127*2 = 32258 < 32767: safe
+ * because BOTH sides clamp to +-127) then madd(.,1) into exact int32, bit-identical
+ * to the scalar/NEON-sdot accumulation. */
+static inline int32_t aria_avx2_hsum_i32(__m256i v) {
+    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x4E));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0xB1));
+    return _mm_cvtsi128_si32(s);
+}
+static inline float aria_avx2_hsum_f32(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v), hi = _mm256_extractf128_ps(v, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+    lo = _mm_add_ss(lo, _mm_shuffle_ps(lo, lo, 0x1));
+    return _mm_cvtss_f32(lo);
+}
 #endif
 
 const char *aria_dtype_name(aria_dtype dt) {
@@ -95,6 +117,19 @@ void aria_linear_q8(float *y, const float *x, const int8_t *q, const float *scal
                 a3 = vfmaq_f32(a3, vld1q_f32(xr + k + 12), vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi))));
             }
             acc = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+            for (; k < K; k++) acc += xr[k] * (float)qn[k];
+#elif defined(__AVX2__)
+            /* widen 16 int8 weights/iter to f32, fma with x (B4; mirrors the NEON path) */
+            __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+            int k = 0;
+            for (; k + 16 <= K; k += 16) {
+                __m128i q16 = _mm_loadu_si128((const __m128i *)(qn + k));
+                __m256i w0 = _mm256_cvtepi8_epi32(q16);
+                __m256i w1 = _mm256_cvtepi8_epi32(_mm_srli_si128(q16, 8));
+                a0 = _mm256_fmadd_ps(_mm256_loadu_ps(xr + k),     _mm256_cvtepi32_ps(w0), a0);
+                a1 = _mm256_fmadd_ps(_mm256_loadu_ps(xr + k + 8), _mm256_cvtepi32_ps(w1), a1);
+            }
+            acc = aria_avx2_hsum_f32(_mm256_add_ps(a0, a1));
             for (; k < K; k++) acc += xr[k] * (float)qn[k];
 #else
             acc = 0.0f;
@@ -174,6 +209,29 @@ void aria_linear_q8a8(float *y, const float *x, const int8_t *q, const float *sc
                 a1 = vpadalq_s16(a1, vmull_s8(vget_high_s8(xv), vget_high_s8(qv)));
             }
             acc = vaddvq_s32(vaddq_s32(a0, a1));
+            for (; k < K; k++) acc += (int32_t)xr[k] * qn[k];
+#elif defined(__AVX2__)
+            /* B4: maddubs sign trick -- exact int32 (see header comment), 64 int8/iter */
+            __m256i c0 = _mm256_setzero_si256(), c1 = _mm256_setzero_si256();
+            const __m256i ones = _mm256_set1_epi16(1);
+            int k = 0;
+            for (; k + 64 <= K; k += 64) {
+                __m256i x0 = _mm256_loadu_si256((const __m256i *)(xr + k));
+                __m256i w0 = _mm256_loadu_si256((const __m256i *)(qn + k));
+                __m256i x1 = _mm256_loadu_si256((const __m256i *)(xr + k + 32));
+                __m256i w1 = _mm256_loadu_si256((const __m256i *)(qn + k + 32));
+                __m256i p0 = _mm256_maddubs_epi16(_mm256_sign_epi8(x0, x0), _mm256_sign_epi8(w0, x0));
+                __m256i p1 = _mm256_maddubs_epi16(_mm256_sign_epi8(x1, x1), _mm256_sign_epi8(w1, x1));
+                c0 = _mm256_add_epi32(c0, _mm256_madd_epi16(p0, ones));
+                c1 = _mm256_add_epi32(c1, _mm256_madd_epi16(p1, ones));
+            }
+            for (; k + 32 <= K; k += 32) {
+                __m256i x0 = _mm256_loadu_si256((const __m256i *)(xr + k));
+                __m256i w0 = _mm256_loadu_si256((const __m256i *)(qn + k));
+                __m256i p0 = _mm256_maddubs_epi16(_mm256_sign_epi8(x0, x0), _mm256_sign_epi8(w0, x0));
+                c0 = _mm256_add_epi32(c0, _mm256_madd_epi16(p0, ones));
+            }
+            acc = aria_avx2_hsum_i32(_mm256_add_epi32(c0, c1));
             for (; k < K; k++) acc += (int32_t)xr[k] * qn[k];
 #else
             acc = 0;
