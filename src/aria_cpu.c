@@ -603,20 +603,25 @@ void aria_attention(float *out, const float *q, const float *k, const float *v,
      * L2-resident through QK->softmax->AV instead of streaming a full [Nq,Nk] matrix
      * (2 MB/head at Nq=Nk=710) through DRAM three times. Rows are independent, so the
      * output is identical to the single-shot path. */
+    /* A4: parallelize over (head, query-block) pairs instead of heads only -- H=16
+     * heads on a 20-thread part left 4 cores idle plus tail imbalance; H x ceil(Nq/BQ)
+     * units fill the machine. Each (h,qb) computation is unchanged -> bit-identical. */
     const int BQ = 64;
+    const int nqb = (Nq + BQ - 1) / BQ;
     #ifdef _OPENMP
-    #pragma omp parallel for schedule(dynamic)
+    #pragma omp parallel for schedule(dynamic) collapse(2)
     #endif
     for (int h = 0; h < H; h++) {
-        static __thread float *sc = NULL; static __thread size_t sccap = 0;
-        int bqcap = Nq < BQ ? Nq : BQ;
-        float *scores = grow_tls(&sc, &sccap, (size_t)bqcap * Nk);
-        if (!scores) continue;
-        const float *qh = q + (size_t)h * Nq * D;
-        const float *kh = k + (size_t)h * Nk * D;
-        const float *vh = v + (size_t)h * Nk * D;
-        float *oh = out + (size_t)h * Nq * D;
-        for (int qb = 0; qb < Nq; qb += BQ) {
+        for (int qbi = 0; qbi < nqb; qbi++) {
+            static __thread float *sc = NULL; static __thread size_t sccap = 0;
+            int bqcap = Nq < BQ ? Nq : BQ;
+            float *scores = grow_tls(&sc, &sccap, (size_t)bqcap * Nk);
+            if (!scores) continue;
+            const float *qh = q + (size_t)h * Nq * D;
+            const float *kh = k + (size_t)h * Nk * D;
+            const float *vh = v + (size_t)h * Nk * D;
+            float *oh = out + (size_t)h * Nq * D;
+            int qb = qbi * BQ;
             int bq = (Nq - qb < BQ) ? (Nq - qb) : BQ;
             aria_linear(scores, qh + (size_t)qb * D, kh, NULL, bq, D, Nk);  /* [bq,Nk] = qh . kh^T */
             for (size_t i = 0; i < (size_t)bq * Nk; i++) scores[i] *= scale;
@@ -673,23 +678,32 @@ void aria_attention_band(float *out, const float *q, const float *k, const float
 
 void aria_conv1d(float *out, const float *in, const float *w, const float *bias,
                  int Cin, int Cout, int K, int pad, int L) {
+    /* A4: loop-interchanged -- taps outer, t inner. Each output element accumulates
+     * its (i,k) terms in the SAME ascending order as the old per-t scalar loop, so
+     * the result is bit-identical; but the inner loop is now two contiguous streams
+     * (outo[t] += wik * ini[t+k-pad]) that auto-vectorize instead of a branchy
+     * strided gather. The old form was the top decode kernel on the CPU/Pi. */
     #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
     #endif
     for (int o = 0; o < Cout; o++) {
         const float *wo = w + (size_t)o * Cin * K;
         float *outo = out + (size_t)o * L;
-        for (int t = 0; t < L; t++) {
-            float acc = bias ? bias[o] : 0.0f;
-            for (int i = 0; i < Cin; i++) {
-                const float *wi = wo + (size_t)i * K;
-                const float *ini = in + (size_t)i * L;
-                for (int k = 0; k < K; k++) {
-                    int ti = t + k - pad;
-                    if (ti >= 0 && ti < L) acc += wi[k] * ini[ti];
-                }
+        float b = bias ? bias[o] : 0.0f;
+        for (int t = 0; t < L; t++) outo[t] = b;
+        for (int i = 0; i < Cin; i++) {
+            const float *wi = wo + (size_t)i * K;
+            const float *ini = in + (size_t)i * L;
+            for (int k = 0; k < K; k++) {
+                float wik = wi[k];
+                int t0 = pad - k > 0 ? pad - k : 0;            /* ti = t+k-pad in [0,L) */
+                int t1 = L + pad - k < L ? L + pad - k : L;
+                const float *src = ini + t0 + k - pad;
+                #ifdef _OPENMP
+                #pragma omp simd
+                #endif
+                for (int t = t0; t < t1; t++) outo[t] += wik * src[t - t0];
             }
-            outo[t] = acc;
         }
     }
 }
@@ -701,6 +715,9 @@ void aria_ff_glu(float *out, const float *x, int N, int dim, int inner, int dim_
     float *gated = scratch ? scratch + (size_t)N * 2 * inner : malloc((size_t)N * inner * sizeof(float));
     if (!proj || !gated) { if (!scratch) { free(proj); free(gated); } return; }
     aria_linear(proj, x, W_in, b_in, N, dim, 2 * inner);
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (int n = 0; n < N; n++) {
         const float *pr = proj + (size_t)n * 2 * inner;
         /* GLU: value = first half, gate = second half; out = value * silu(gate) */

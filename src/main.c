@@ -685,6 +685,13 @@ static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float con
 
 int main(int argc, char **argv) {
     if (argc < 2) { cli_help(argv[0]); return 1; }
+#ifdef _OPENMP
+    /* A4: a generation is thousands of short parallel regions (per-op fork/join);
+     * active waiting keeps the worker pool spinning between them instead of paying a
+     * futex sleep/wake per region. Set before the first region (libgomp reads it at
+     * pool init); a user-provided value always wins (setenv overwrite=0). */
+    setenv("OMP_WAIT_POLICY", "active", 0);
+#endif
 
     cli_config cfg;
     int pr = cli_parse(argc, argv, &cfg);

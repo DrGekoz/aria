@@ -33,8 +33,14 @@ void aria_sa3_timestep_embed(float *out, float t, int feat_dim, int ed,
 
 /* dst[H,S,hd] from src[S, stride] reading hd-blocks at `offset` per head:
  * dst[h,s,d] = src[s*stride + offset + h*hd + d] */
+/* A4: the block's elementwise glue ran serial between the parallel GEMMs -- ~2-4 s of
+ * a 60 s small CPU generation. Rows are independent, so plain `omp parallel for` is
+ * bit-exact (same per-element arithmetic, just spread over threads). */
 static void extract_heads(float *dst, const float *src, int S, int H, int hd,
                           int stride, int offset) {
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static) collapse(2)
+    #endif
     for (int h = 0; h < H; h++)
         for (int s = 0; s < S; s++) {
             const float *sp = src + (size_t)s * stride + offset + (size_t)h * hd;
@@ -45,6 +51,9 @@ static void extract_heads(float *dst, const float *src, int S, int H, int hd,
 
 /* dst[S, H*hd] from src[H,S,hd]: dst[s, h*hd+d] = src[h,s,d] */
 static void merge_heads(float *dst, const float *src, int S, int H, int hd) {
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static) collapse(2)
+    #endif
     for (int h = 0; h < H; h++)
         for (int s = 0; s < S; s++) {
             const float *sp = src + ((size_t)h * S + s) * hd;
@@ -55,14 +64,23 @@ static void merge_heads(float *dst, const float *src, int S, int H, int hd) {
 
 /* y = y*(1+scale)+shift over rows; scale/shift are [dim] broadcast over S rows. */
 static void adaln_modulate(float *y, const float *scale, const float *shift, int S, int dim) {
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (int s = 0; s < S; s++) {
         float *yr = y + (size_t)s * dim;
+        #ifdef _OPENMP
+        #pragma omp simd
+        #endif
         for (int i = 0; i < dim; i++) yr[i] = yr[i] * (1.0f + scale[i]) + shift[i];
     }
 }
 
 /* y *= sigmoid(1 - gate), gate [dim] broadcast over S rows. */
 static void gate_sigmoid(float *y, const float *gate, int S, int dim) {
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (int s = 0; s < S; s++) {
         float *yr = y + (size_t)s * dim;
         for (int i = 0; i < dim; i++) yr[i] *= sigmoidf(1.0f - gate[i]);
@@ -84,6 +102,9 @@ static void ff_glu_qw(float *out, const float *x, int N, int inner, int dim_out,
                       const aria_qweight *Wout, const float *bout, float *scratch) {
     float *proj = scratch, *gated = scratch + (size_t)N * 2 * inner;
     aria_linear_qw(proj, x, Win, bin, N);
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (int n = 0; n < N; n++)
         aria_silu_gate(gated + (size_t)n * inner, proj + (size_t)n * 2 * inner + inner,
                        proj + (size_t)n * 2 * inner, inner);
@@ -170,6 +191,9 @@ static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
         aria_rope_apply(qdh, rope_cos, rope_sin, H, S, hd, rot_dim);
         aria_rope_apply(kdh, rope_cos, rope_sin, H, S, hd, rot_dim);
         aria_attention(aod, qdh, kdh, vh, H, S, S, hd, NULL, scores);
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
         for (size_t i = 0; i < (size_t)H * S * hd; i++) ao[i] -= aod[i];
     }
     merge_heads(merged, ao, S, H, hd);
@@ -177,6 +201,9 @@ static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
     else    aria_linear(o, merged, w->sa_to_out, NULL, S, dim, dim);
     lora_hook(lora, layer_idx, ARIA_LORA_SA_TO_OUT, o, merged, S, dim, dim, ar);
     gate_sigmoid(o, gate_self, S, dim);
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (size_t i = 0; i < (size_t)S * dim; i++) x[i] += o[i];   /* in-place residual add */
 
     /* ---------- cross-attention (cached K/V, no rope, no gate) ---------- */
@@ -194,17 +221,26 @@ static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
             extract_heads(qdh, q, S, H, hd, nq * dim, dim);
             aria_rmsnorm(qdh, qdh, w->ca_q_norm, H * S, hd, eps_qk);
             aria_attention(aod, qdh, cross_kd, cross_v, H, S, Sc, hd, NULL, scores);
-            for (size_t i = 0; i < (size_t)H * S * hd; i++) ao[i] -= aod[i];
+            #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (size_t i = 0; i < (size_t)H * S * hd; i++) ao[i] -= aod[i];
         }
         merge_heads(merged, ao, S, H, hd);
     }
     if (bq) aria_linear_qw(o, merged, &bq->ca_to_out, NULL, S);
     else    aria_linear(o, merged, w->ca_to_out, NULL, S, dim, dim);
     lora_hook(lora, layer_idx, ARIA_LORA_CA_TO_OUT, o, merged, S, dim, dim, ar);
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (size_t i = 0; i < (size_t)S * dim; i++) x[i] += o[i];   /* in-place residual add */
 
     /* ---------- local-additive (inpaint) cond: x += left-padded local_emb ---------- */
     if (local_emb)
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
         for (size_t i = 0; i < (size_t)S * dim; i++) x[i] += local_emb[i];
 
     /* ---------- feed-forward (GLU) ---------- */
@@ -234,6 +270,9 @@ static void dit_block_core(float *x, int S, int dim, int H, int hd, int inner,
         }
     }
     gate_sigmoid(o, gate_ff, S, dim);
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (size_t i = 0; i < (size_t)S * dim; i++) x[i] += o[i];   /* in-place residual add */
 
     /* ---------- E12 residual steering at the block output, broadcast over all tokens, gated
