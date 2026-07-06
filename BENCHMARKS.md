@@ -195,6 +195,16 @@ upload it, add after cross-attn via the existing `k_add`) makes `--continue`/`--
   the fade and drift to silence past ~9 s. Steady-energy prompts ("melodic techno") hold.
   This is the inpaint-envelope-drift limit of the post-hoc method, not the GPU — CPU and GPU
   decay identically. See PAPER.md (beat-sync loop / streaming-trained model).
+- **Re-anchoring (`--anchor <beta>`, E14b) bounds the decay.** Each continuation context is
+  blended toward the chunk-0 reference tail (convex, conditioning-only) and its RMS pulled
+  back to the reference level (boost-only, ≤4×, then a ≤0.97 peak guard for the encoder).
+  Measured on the worst-case "ambient pads" (8 chunks, seed 0, RTX 3070): baseline sinks
+  −15.5 dB tail-vs-head and keeps falling (−34 dB); `--anchor 0.35` settles at ~−26 dB and
+  *recovers* (−8.8 dB drop; β 0.5/0.7 similar) — the stream no longer dies. The energy
+  correction is what matters: a plain amplitude blend only softened the drop (−13.1 dB).
+  `--evolve <n>` (E14c) adds the SA3-Realtime-style seed policy: default = fixed seed every
+  chunk (the voice carries forward); `--evolve N` re-seeds every N chunks for variation.
+  Defaults byte-identical (anchor/evolve off: GPU + CPU streams cmp-equal to pre-change).
 
 ## Steering efficiency — aria vs sf-api (E12)
 

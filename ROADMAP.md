@@ -248,7 +248,14 @@ The `--stream` stack shipped without a roadmap entry: continuous sliding-window
 generation (`--stream/--chunk/--context/--chunks/--hold`), post-hoc continuation
 (context 6 s + skip + emit ~2 s + tail per window), phase-aligned crossfade, HPSS
 hold mode, raw-f32 stdout piping with a writer thread; GPU continuation; RTF
-0.6–4× on the 3070. Documented in BENCHMARKS.md/PAPER.md. **Open improvements**
+0.6–4× on the 3070. Documented in BENCHMARKS.md/PAPER.md. Also shipped (2026-07,
+SA3-Realtime-inspired): **E14b `--anchor <beta>`** — re-anchor each continuation
+context toward the chunk-0 reference (convex blend + boost-only RMS correction +
+peak guard); bounds the decay-to-silence ceiling (worst-case "ambient pads":
+−15.5 dB and falling → −8.8 dB and recovering; numbers in BENCHMARKS.md).
+**E14c `--evolve <n>`** — per-chunk seed policy: default fixed seed (voice
+continuity), `--evolve N` re-seeds every N chunks for fresh variation. Both off
+by default (default stream byte-identical, CPU+GPU). **Open improvements**
 (2026-07 review):
 
 - ⬜ **E14.1** **P1** Partial (emit+halo) decode: decode only the emitted region +

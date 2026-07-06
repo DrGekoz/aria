@@ -38,7 +38,9 @@ typedef struct {
     const char *model_dir, *prompt, *prompt_embed, *out_path, *list_prefix;
     const char *init_audio, *load_quant, *util_a, *util_b;
     float seconds, inpaint_from, inpaint_to, stream_chunk, stream_context;
+    float stream_anchor;                    /* E14b: 0 = off; else blend context toward chunk-0 */
     int steps, bench, stream_chunks;
+    int stream_evolve;                      /* E14c: 0 = fixed seed (continuity); else re-seed every N chunks */
     long long seed;
     aria_device device;
     aria_dtype precision;
@@ -63,7 +65,7 @@ enum {   /* keys: short flags use their ASCII char; long-only options use ids pa
     K_SEED=256, K_DEVICE, K_BENCH, K_UNCOND, K_PEMB, K_INFO, K_LIST,
     K_INPAINT, K_CONTINUE, K_FROM, K_TO, K_PREC, K_LOADQ, K_RNG,
     K_STREAM, K_CHUNK, K_CTX, K_CHUNKS, K_HOLD, K_WAVRT, K_HPSS, K_STEER,
-    K_BATCH, K_LORA, K_STEERRAMP,
+    K_BATCH, K_LORA, K_STEERRAMP, K_ANCHOR, K_EVOLVE,
 };
 typedef enum { A_NONE, A_ONE, A_TWO, A_OPT } argkind;  /* flag / 1 arg / 2 args / optional 1 arg */
 typedef struct {
@@ -102,6 +104,8 @@ static const opt_spec OPTS[] = {
     {K_CHUNKS,   "chunks",        0,  A_ONE,  "<n>",        "stream",   "number of chunks (default 8)"},
     {K_HOLD,     "hold",          0,  A_NONE, NULL,         "stream",   "hold a steady HPSS drum loop"},
     {K_STEERRAMP,"steer-ramp",    0,  A_ONE,  "<lo:hi[:tri]>","stream",  "ramp the first --steer scale across chunks (tri = up-then-down)"},
+    {K_ANCHOR,   "anchor",        0,  A_ONE,  "<beta>",     "stream",   "re-anchor each context toward the chunk-0 reference (0..1; fights energy decay)"},
+    {K_EVOLVE,   "evolve",        0,  A_ONE,  "<n>",        "stream",   "fresh seed every n chunks (default 0 = fixed seed, the voice carries forward)"},
 
     {K_INFO,     "info",          0,  A_NONE, NULL,         "inspect",  "print model info and exit"},
     {K_LIST,     "list-tensors",  0,  A_OPT,  "[prefix]",   "inspect",  "list tensors (optional name prefix)"},
@@ -148,6 +152,8 @@ static int cli_apply(int key, char **a, cli_config *c) {
     case K_CTX:    c->stream_context = (float)atof(a[0]); break;
     case K_CHUNKS: c->stream_chunks = atoi(a[0]); break;
     case K_HOLD:   c->stream_hold = 1; break;
+    case K_ANCHOR: c->stream_anchor = (float)atof(a[0]); break;
+    case K_EVOLVE: c->stream_evolve = atoi(a[0]); break;
     case K_STEER:
         if (c->n_steer >= 16) { fprintf(stderr, "too many --steer (max 16)\n"); return 1; }
         c->steer_specs[c->n_steer++] = a[0]; break;
@@ -506,7 +512,8 @@ static void stream_flush(const aria_audio *outp, const float *held, int64_t held
  * re-steering on a TTY). `emit_s` is the --chunk value. */
 static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float context_s,
                       int n_chunks, int hold, const char *out_path,
-                      aria_steer *ramp_target, float ramp_lo, float ramp_hi, int ramp_tri) {
+                      aria_steer *ramp_target, float ramp_lo, float ramp_hi, int ramp_tri,
+                      float anchor_beta, int evolve_n) {
     int sr = aria_sample_rate(ctx), ch = aria_audio_channels(ctx);
     const float skip_s = 1.5f, tail_s = 3.0f, xfade_s = 0.25f;   /* seam / fade / crossfade */
     int64_t ctx_fr = (int64_t)(context_s * sr), xf_fr = (int64_t)(xfade_s * sr);
@@ -514,6 +521,17 @@ static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float con
     int interactive = isatty(fileno(stdin));
     char promptbuf[1024];
     float *held = NULL; int64_t held_len = 0; const char *held_prompt = NULL;  /* --hold drum loop */
+    /* E14b re-anchoring: keep the chunk-0 context tail as an energy/character reference and
+     * blend every later context toward it -- chained continuations can no longer inherit an
+     * outro fade and decay to silence (the documented streaming ceiling). Conditioning-only:
+     * the blend never reaches the output (only the regenerated body is emitted). */
+    if (anchor_beta < 0.0f) anchor_beta = 0.0f;
+    if (anchor_beta > 1.0f) anchor_beta = 1.0f;
+    aria_audio *anchor = NULL;
+    /* E14c seed policy (SA3-Realtime semantics): default = FIXED seed every chunk, so the
+     * per-chunk noise is identical and the voice carries forward ("continue"); --evolve N
+     * re-seeds every N chunks for fresh variation. */
+    int64_t base_seed = p->seed; int evolve_k = 0;
     int to_stdout = (strcmp(out_path, "-") == 0);   /* -o - : stream raw f32 to stdout for a player */
     int64_t emitted = 0;
     squeue q = { .m = PTHREAD_MUTEX_INITIALIZER, .ne = PTHREAD_COND_INITIALIZER, .nf = PTHREAD_COND_INITIALIZER };
@@ -527,8 +545,9 @@ static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float con
     aria_audio *context = NULL;
 
     const char *devname = p->device == ARIA_DEVICE_CPU ? "CPU" : p->device == ARIA_DEVICE_CUDA ? "CUDA" : "auto";
-    fprintf(stderr, "[stream] emit=%.1fs context=%.1fs (skip %.1f / tail %.1f / xfade %.2f) steps=%d (%s)%s\n",
+    fprintf(stderr, "[stream] emit=%.1fs context=%.1fs (skip %.1f / tail %.1f / xfade %.2f) steps=%d (%s)%s%s%s\n",
             emit_s, context_s, skip_s, tail_s, xfade_s, p->steps, devname,
+            anchor_beta > 0.0f ? " +anchor" : "", evolve_n > 0 ? " +evolve" : "",
             interactive ? " — type a prompt + Enter to re-steer" : "");
 
     for (int i = 0; i < n_chunks; i++) {
@@ -536,6 +555,12 @@ static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float con
         if (stream_poll_prompt(promptbuf, sizeof promptbuf)) {
             p->prompt = promptbuf;
             fprintf(stderr, "[stream] prompt -> \"%s\"\n", promptbuf);
+        }
+        /* E14c: evolve -- fresh variation every N chunks (base seed stays the anchor of
+         * the sequence so runs are reproducible); default (evolve_n==0) never re-seeds. */
+        if (evolve_n > 0 && i > 0 && i % evolve_n == 0) {
+            p->seed = (base_seed >= 0 ? base_seed : 0) + (++evolve_k);
+            fprintf(stderr, "[stream] evolve: seed -> %lld\n", (long long)p->seed);
         }
         /* i==0: plain text->audio, emit the strong front [0, context+emit] (drop its fade).
          * i>0 : continuation; emit the body [context+skip, context+skip+emit]. */
@@ -596,6 +621,43 @@ static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float con
 
         aria_audio_free(context);
         context = stream_slice(outp, written - ctx_fr, ctx_fr);   /* just-emitted tail */
+        if (anchor_beta > 0.0f) {
+            if (i == 0) {
+                /* chunk-0 tail = the reference the stream keeps being pulled back toward
+                 * (captured pre-hold-mix: the harmonic timeline; drums are re-added below) */
+                anchor = stream_slice(context, 0, context->num_frames);
+                fprintf(stderr, "[stream] anchor set (%.1fs, beta %.2f)\n",
+                        anchor ? anchor->num_frames / (double)sr : 0.0, anchor_beta);
+            } else if (anchor && anchor->num_frames > 0) {
+                /* convex blend toward the reference, then pull the context's ENERGY back to
+                 * the reference level (boost-only, capped at 4x): a linear blend alone cannot
+                 * out-weigh a tail that already faded 15+ dB, so the model would still hear
+                 * "quiet outro" and keep fading. Peak guard keeps the taae encoder in range. */
+                int64_t bn = context->num_frames < anchor->num_frames
+                           ? context->num_frames : anchor->num_frames;
+                double e_ctx = 0.0, e_anc = 0.0;
+                for (int64_t j = 0; j < bn * ch; j++) {
+                    float v = (1.0f - anchor_beta) * context->data[j] + anchor_beta * anchor->data[j];
+                    context->data[j] = v;
+                    e_ctx += (double)v * v;
+                    e_anc += (double)anchor->data[j] * anchor->data[j];
+                }
+                float g = 1.0f;
+                if (e_ctx > 0.0 && e_anc > e_ctx)
+                    g = (float)sqrt(e_anc / e_ctx);
+                if (g > 4.0f) g = 4.0f;
+                float pk = 0.0f;
+                for (int64_t j = 0; j < bn * ch; j++) {
+                    float v = context->data[j] * g;
+                    context->data[j] = v;
+                    float av = fabsf(v); if (av > pk) pk = av;
+                }
+                if (pk > 0.97f) {
+                    float sc = 0.97f / pk;
+                    for (int64_t j = 0; j < bn * ch; j++) context->data[j] *= sc;
+                }
+            }
+        }
         if (hold) stream_add_tiled(context->data, ctx_fr, ch, written - ctx_fr, held, held_len);
         aria_audio_free(win);
 
@@ -617,7 +679,7 @@ static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float con
         fprintf(stderr, "[stream] wrote %s (%.1fs total)\n", out_path, written / (double)sr);
     }
     free(held);
-    aria_audio_free(outp); aria_audio_free(context);
+    aria_audio_free(outp); aria_audio_free(context); aria_audio_free(anchor);
     return wrc;
 }
 
@@ -665,7 +727,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "--steer-ramp needs a --steer\n"); aria_free(ctx); return 1;
         }
         rc = cmd_stream(ctx, &p, cfg.stream_chunk, cfg.stream_context, cfg.stream_chunks, cfg.stream_hold, cfg.out_path,
-                        ramp_target, ramp_lo, ramp_hi, ramp_tri);
+                        ramp_target, ramp_lo, ramp_hi, ramp_tri, cfg.stream_anchor, cfg.stream_evolve);
         free_steer_set(&steer_set);
     } else if (cfg.do_list) {
         aria_list_tensors(ctx, cfg.list_prefix);
