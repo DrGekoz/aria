@@ -202,6 +202,41 @@ __global__ void k_rmsnorm_adaln(float *y, const float *x, const float *w,
     for (int i = threadIdx.x; i < dim; i += blockDim.x)
         yr[i] = (xr[i] * inv * w[i]) * (1.0f + scale[i]) + shift[i];
 }
+/* fp16-emitting variants of the GEMM-input producers (A2): every consumer is a tensor-
+ * core GEMM whose activation was converted fp32->fp16 anyway (k_f32_to_f16 pass in
+ * gemm_f16w) -- __float2half at the producer is the same RTNE bits, one [S,dim] fp32
+ * round-trip less per op. Math is fp32 internally, only the store rounds. */
+__global__ void k_rmsnorm_h(__half *y, const float *x, const float *w, int rows, int dim, float eps) {
+    int r = blockIdx.x; if (r >= rows) return;
+    const float *xr = x + (size_t)r * dim; __half *yr = y + (size_t)r * dim;
+    __shared__ float red[RED_TH];
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) ss += xr[i] * xr[i];
+    red[threadIdx.x] = ss; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv = rsqrtf(red[0] / dim + eps);
+    for (int i = threadIdx.x; i < dim; i += blockDim.x)
+        yr[i] = __float2half(xr[i] * inv * w[i]);
+}
+__global__ void k_rmsnorm_adaln_h(__half *y, const float *x, const float *w,
+                                  const float *scale, const float *shift, int S, int dim, float eps) {
+    int r = blockIdx.x; if (r >= S) return;
+    const float *xr = x + (size_t)r * dim; __half *yr = y + (size_t)r * dim;
+    __shared__ float red[RED_TH];
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) ss += xr[i] * xr[i];
+    red[threadIdx.x] = ss; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv = rsqrtf(red[0] / dim + eps);
+    for (int i = threadIdx.x; i < dim; i += blockDim.x)
+        yr[i] = __float2half((xr[i] * inv * w[i]) * (1.0f + scale[i]) + shift[i]);
+}
 
 extern "C" void aria_cuda_rmsnorm(float *y, const float *x, const float *w, int rows, int dim, float eps) {
     float *dx = d_in(x, (size_t)rows * dim), *dw = w ? d_in(w, dim) : NULL, *dy = d_new((size_t)rows * dim);
@@ -220,6 +255,13 @@ __global__ void k_dyt(float *y, const float *x, float alpha, const float *w, con
     if (i >= tot) return;
     int c = (int)(i % dim);
     y[i] = tanhf(alpha * x[i]) * w[c] + b[c];
+}
+/* fp16-emitting variant (A2): for dyt outputs whose only consumer is a GEMM. */
+__global__ void k_dyt_h(__half *y, const float *x, float alpha, const float *w, const float *b, size_t tot, int dim) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= tot) return;
+    int c = (int)(i % dim);
+    y[i] = __float2half(tanhf(alpha * x[i]) * w[c] + b[c]);
 }
 extern "C" void aria_cuda_dynamic_tanh(float *y, const float *x, float alpha,
                                        const float *w, const float *b, int rows, int dim) {
@@ -280,12 +322,15 @@ __global__ void k_softmax(float *x, int rows, int cols, const float *mask) {
 __global__ void k_scale(float *y, const float *x, float a, int n) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < (size_t)n) y[i] = x[i] * a;
 }
-/* k_softmax with fp16 output: identical fp32 math (x is the fp32 scratch), the final
+/* k_softmax with fp16 output: identical fp32 math (x holds the fp32 scores), the final
  * normalize writes __float2half(e*inv) straight into the AV GEMM's half buffer -- same
- * RTNE value the old separate k_f32_to_f16 pass produced, one S*S*H round-trip less. */
-__global__ void k_softmax_f16(float *x, __half *out, int rows, int cols) {
+ * RTNE value the old separate k_f32_to_f16 pass produced. The exp is RECOMPUTED in the
+ * normalize pass instead of written back to x (A2): expf is deterministic, so the
+ * result is bit-identical, and the [rows,cols] fp32 exp write -- the largest non-GEMM
+ * HBM write in the DiT (206 ms/768 inst on medium 60 s) -- disappears. x stays const. */
+__global__ void k_softmax_f16(const float *x, __half *out, int rows, int cols) {
     int r = blockIdx.x; if (r >= rows) return;
-    float *xr = x + (size_t)r * cols; __half *orow = out + (size_t)r * cols;
+    const float *xr = x + (size_t)r * cols; __half *orow = out + (size_t)r * cols;
     __shared__ float red[RED_TH];
     float mx = -INFINITY;
     for (int i = threadIdx.x; i < cols; i += blockDim.x) mx = fmaxf(mx, xr[i]);
@@ -293,11 +338,11 @@ __global__ void k_softmax_f16(float *x, __half *out, int rows, int cols) {
     for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]); __syncthreads(); }
     mx = red[0]; __syncthreads();
     float sum = 0.0f;
-    for (int i = threadIdx.x; i < cols; i += blockDim.x) { float e = expf(xr[i] - mx); xr[i] = e; sum += e; }
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) sum += expf(xr[i] - mx);
     red[threadIdx.x] = sum; __syncthreads();
     for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s]; __syncthreads(); }
     float inv = red[0] > 0.0f ? 1.0f / red[0] : 0.0f;
-    for (int i = threadIdx.x; i < cols; i += blockDim.x) orow[i] = __float2half(xr[i] * inv);
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) orow[i] = __float2half(expf(xr[i] - mx) * inv);
 }
 extern "C" void aria_cuda_softmax(float *x, int rows, int cols, const float *mask) {
     float *dx = d_in(x, (size_t)rows * cols), *dm = mask ? d_in(mask, (size_t)rows * cols) : NULL;
@@ -459,14 +504,26 @@ __global__ void k_transpose(float *dst, const float *src, int A, int B) {
     int a = (int)(idx / B), b = (int)(idx % B);
     dst[(size_t)b * A + a] = src[idx];
 }
-/* fused gate + residual add: out = residual + o * sigmoid(1 - gate[col]).
- * Replaces a k_gate + k_add pair (saves one read+write pass of [S,dim] + a launch). */
+/* fused gate + residual add: out = residual + (o + b[col]) * sigmoid(1 - gate[col]).
+ * Replaces a k_gate + k_add pair (saves one read+write pass of [S,dim] + a launch).
+ * b folds the producer GEMM's bias in (A2, drops that GEMM's k_add_bias pass); NULL = none. */
 __global__ void k_gate_add(float *out, const float *residual, const float *o,
-                           const float *gate, int S, int dim) {
+                           const float *gate, const float *b, int S, int dim) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (size_t)S * dim) return;
     int i = (int)(idx % dim);
-    out[idx] = residual[idx] + o[idx] * (1.0f / (1.0f + expf(-(1.0f - gate[i]))));
+    /* b==NULL skips the add entirely (adding literal 0.0f would flip -0.0 to +0.0) */
+    float ov = b ? (o[idx] + b[i]) : o[idx];
+    out[idx] = residual[idx] + ov * (1.0f / (1.0f + expf(-(1.0f - gate[i]))));
+}
+/* residual add with the producer GEMM's bias folded in: out = a + (o + b[col]) (A2).
+ * The bias binds to o FIRST -- the exact order the old k_add_bias + k_add pair used --
+ * so the fold is bit-identical. */
+__global__ void k_add_bias_res(float *out, const float *a, const float *o,
+                               const float *b, size_t n, int dim) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    out[idx] = a[idx] + (o[idx] + b[idx % dim]);
 }
 /* E12 residual steering (ADD): seq[t,c] += scale * dir[c] for c < ddim, broadcast over all S tokens.
  * scale is read from DEVICE memory so the launch can live inside the CUDA graph: the host
@@ -520,13 +577,32 @@ __global__ void k_merge_heads(float *dst, const float *src, int S, int H, int hd
     int d = (int)(idx % hd), s = (int)((idx / hd) % S), h = (int)(idx / ((size_t)hd * S));
     dst[(size_t)s * H * hd + (size_t)h * hd + d] = src[idx];
 }
-__global__ void k_ff_silugate(float *out, const float *proj, int S, int inner) {
+/* fp16-emitting merge (A2): dst feeds the to_out GEMM directly. */
+__global__ void k_merge_heads_h(__half *dst, const float *src, int S, int H, int hd) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;   /* src (h*S+s)*hd+d */
+    if (idx >= (size_t)H * S * hd) return;
+    int d = (int)(idx % hd), s = (int)((idx / hd) % S), h = (int)(idx / ((size_t)hd * S));
+    dst[(size_t)s * H * hd + (size_t)h * hd + d] = __float2half(src[idx]);
+}
+/* b2 folds the ff_in GEMM's bias ([2*inner], up half then gate half) in (A2); NULL = none. */
+__global__ void k_ff_silugate(float *out, const float *proj, const float *b2, int S, int inner) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;   /* s*inner+i */
     if (idx >= (size_t)S * inner) return;
     int s = (int)(idx / inner), i = (int)(idx % inner);
     const float *pr = proj + (size_t)s * 2 * inner;
-    float g = pr[inner + i];
-    out[idx] = (g / (1.0f + expf(-g))) * pr[i];
+    float up = b2 ? (pr[i] + b2[i]) : pr[i];
+    float g = b2 ? (pr[inner + i] + b2[inner + i]) : pr[inner + i];
+    out[idx] = (g / (1.0f + expf(-g))) * up;
+}
+/* fp16-emitting silu-gate (A2): out feeds the ff_out GEMM directly. */
+__global__ void k_ff_silugate_h(__half *out, const float *proj, const float *b2, int S, int inner) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;   /* s*inner+i */
+    if (idx >= (size_t)S * inner) return;
+    int s = (int)(idx / inner), i = (int)(idx % inner);
+    const float *pr = proj + (size_t)s * 2 * inner;
+    float up = b2 ? (pr[i] + b2[i]) : pr[i];
+    float g = b2 ? (pr[inner + i] + b2[inner + i]) : pr[inner + i];
+    out[idx] = __float2half((g / (1.0f + expf(-g))) * up);
 }
 
 /* ---- device bump arena (pointer arithmetic only) ---- */
@@ -695,6 +771,15 @@ static void gemm_f16w(cublasHandle_t cb, darena *ar, float *y, const float *x, c
     if (b) k_add_bias<<<nblocks((size_t)M * N), THREADS>>>(y, b, M, N);
     da_restore(ar, mark);
 }
+/* A2: activation already fp16 (emitted by a producer kernel) -- no conversion pass. */
+static void gemm_f16w_h(cublasHandle_t cb, float *y, const __half *xh, const __half *W,
+                        const float *b, int M, int K, int N) {
+    const float alpha = 1.0f, beta = 0.0f;
+    cublasGemmEx(cb, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha,
+                 W, CUDA_R_16F, K, xh, CUDA_R_16F, K, &beta,
+                 y, CUDA_R_32F, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    if (b) k_add_bias<<<nblocks((size_t)M * N), THREADS>>>(y, b, M, N);
+}
 
 /* ---- W8A8 (E-int8, opt-in via ARIA_W8A8=1 with --precision q8): int8 tensor-core
  * GEMMs. The Q8 weights are ALREADY packed int8 + per-row scale in VRAM; instead of
@@ -719,6 +804,25 @@ __global__ void k_quant_act_q8(int8_t *qx, float *sx, const float *x, int M, int
         qr[i] = (int8_t)(v < -127 ? -127 : (v > 127 ? 127 : v));
     }
 }
+/* fp16-input variant (A2): the producers emit fp16 now; quantizing from the RTNE'd
+ * half adds <=0.05% relative error on top of int8's ~1%, re-gated by the -s 1 probe. */
+__global__ void k_quant_act_q8_h(int8_t *qx, float *sx, const __half *x, int M, int K) {
+    int m = blockIdx.x; if (m >= M) return;
+    const __half *row = x + (size_t)m * K;
+    __shared__ float red[RED_TH];
+    float mx = 0.0f;
+    for (int i = threadIdx.x; i < K; i += blockDim.x) mx = fmaxf(mx, fabsf(__half2float(row[i])));
+    red[threadIdx.x] = mx; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]); __syncthreads(); }
+    float amax = red[0];
+    if (threadIdx.x == 0) sx[m] = amax > 0.0f ? amax / 127.0f : 0.0f;
+    float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+    int8_t *qr = qx + (size_t)m * K;
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        int v = __float2int_rn(__half2float(row[i]) * inv);
+        qr[i] = (int8_t)(v < -127 ? -127 : (v > 127 ? 127 : v));
+    }
+}
 /* in-place int32 -> fp32 dequant epilogue: y holds the raw int32 accumulators. */
 __global__ void k_deq_i32(float *y, const float *sx, const float *sw, const float *b, int M, int N) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -734,6 +838,19 @@ static void gemm_w8a8(cublasHandle_t cb, darena *ar, float *y, const float *x,
     int8_t *xq = da_alloc_i8(ar, (size_t)M * K);
     float *sx = da_alloc(ar, M);
     k_quant_act_q8<<<M, RED_TH>>>(xq, sx, x, M, K);
+    cublasGemmEx(cb, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &ione,
+                 Wq, CUDA_R_8I, K, xq, CUDA_R_8I, K, &izero,
+                 y, CUDA_R_32I, N, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT);
+    k_deq_i32<<<nblocks((size_t)M * N), THREADS>>>(y, sx, sw, b, M, N);
+    da_restore(ar, mark);
+}
+static void gemm_w8a8_h(cublasHandle_t cb, darena *ar, float *y, const __half *x,
+                        const int8_t *Wq, const float *sw, const float *b, int M, int K, int N) {
+    const int ione = 1, izero = 0;
+    size_t mark = da_save(ar);
+    int8_t *xq = da_alloc_i8(ar, (size_t)M * K);
+    float *sx = da_alloc(ar, M);
+    k_quant_act_q8_h<<<M, RED_TH>>>(xq, sx, x, M, K);
     cublasGemmEx(cb, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &ione,
                  Wq, CUDA_R_8I, K, xq, CUDA_R_8I, K, &izero,
                  y, CUDA_R_32I, N, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT);
@@ -758,6 +875,20 @@ static void gemm_dqw(aria_cuda_dit *h, float *y, const float *x, const dqw *w, c
         k_dequant_q4<<<nblocks(nk), THREADS>>>(h->dqbuf, (const uint8_t *)w->q, w->scale, w->N, w->K);
     gemm_f16w(h->cublas, &h->arena, y, x, h->dqbuf, b, M, w->K, w->N);
 }
+/* A2: fp16-activation variant (producers emit fp16; no k_f32_to_f16 pass). */
+static void gemm_dqw_h(aria_cuda_dit *h, float *y, const __half *x, const dqw *w, const float *b, int M) {
+    if (w->dt == ARIA_F32) { gemm_f16w_h(h->cublas, y, x, w->f16, b, M, w->K, w->N); return; }
+    if (w->dt == ARIA_Q8 && h->w8a8) {
+        gemm_w8a8_h(h->cublas, &h->arena, y, x, (const int8_t *)w->q, w->scale, b, M, w->K, w->N);
+        return;
+    }
+    size_t nk = (size_t)w->N * w->K;
+    if (w->dt == ARIA_Q8)
+        k_dequant_q8<<<nblocks(nk), THREADS>>>(h->dqbuf, (const int8_t *)w->q, w->scale, w->N, w->K);
+    else
+        k_dequant_q4<<<nblocks(nk), THREADS>>>(h->dqbuf, (const uint8_t *)w->q, w->scale, w->N, w->K);
+    gemm_f16w_h(h->cublas, y, x, h->dqbuf, b, M, w->K, w->N);
+}
 
 static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     int S = h->S, ed = h->ed, H = h->H, hd = h->hd, dim = ed, inner = h->inner, Sc = h->n_cond, rot = h->rot;
@@ -769,9 +900,20 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     k_add<<<nblocks((size_t)6 * dim), THREADS>>>(mod, w->ssg, h->dgcond, 6 * dim);
     float *scale_self = mod, *shift_self = mod + dim, *gate_self = mod + 2 * dim;
     float *scale_ff = mod + 3 * dim, *shift_ff = mod + 4 * dim, *gate_ff = mod + 5 * dim;
-    float *hh = da_alloc(ar, (size_t)S * dim);   /* no residual buffer: seq is preserved across each
-                                                  * sub-layer (norm writes to hh), so the add is in-place */
-    float *o = da_alloc(ar, (size_t)S * dim), *merged = da_alloc(ar, (size_t)S * dim);
+    /* hh/merged/gated are fp16 (A2): every consumer is a tensor-core GEMM that used to
+     * convert them fp32->fp16 anyway; emitting fp16 at the producer is the same RTNE
+     * bits with one fewer [S,dim]-class round-trip per op. EXCEPT under W8A8: its
+     * activation-quant kernel always read the producers' fp32 directly, so forcing a
+     * half round-trip there is a pure fidelity loss (measured 7.3%->9.6% on the -s 1
+     * probe) -- the W8A8 path keeps fp32 producers (with the same A2 bias folds).
+     * No residual buffer: seq is preserved across each sub-layer (norm writes to
+     * hh/hhf), so the add is in-place. */
+    int w8 = h->w8a8;
+    __half *hh = w8 ? NULL : da_alloc_half(ar, (size_t)S * dim);
+    float *hhf = w8 ? da_alloc(ar, (size_t)S * dim) : NULL;
+    float *o = da_alloc(ar, (size_t)S * dim);
+    __half *merged = w8 ? NULL : da_alloc_half(ar, (size_t)S * dim);
+    float *mergedf = w8 ? da_alloc(ar, (size_t)S * dim) : NULL;
     /* q/k/v are fp16 end-to-end (producers emit fp16, attn_dev_h consumes it) */
     __half *qh = da_alloc_half(ar, (size_t)H * S * hd), *kh = da_alloc_half(ar, (size_t)H * S * hd);
     __half *vh = da_alloc_half(ar, (size_t)H * S * hd);
@@ -784,10 +926,12 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
     if (diff) { qdh = da_alloc_half(ar, nHSd); kdh = da_alloc_half(ar, nHSd); aod = da_alloc(ar, nHSd); }
 
     /* self-attention (differential medium: out = attn(q,k,v) - attn(qd,kd,v)) */
-    k_rmsnorm_adaln<<<S, RED_TH>>>(hh, seq, w->pre_norm, scale_self, shift_self, S, dim, 1e-5f);
+    if (w8) k_rmsnorm_adaln<<<S, RED_TH>>>(hhf, seq, w->pre_norm, scale_self, shift_self, S, dim, 1e-5f);
+    else    k_rmsnorm_adaln_h<<<S, RED_TH>>>(hh, seq, w->pre_norm, scale_self, shift_self, S, dim, 1e-5f);
     int nq = diff ? 5 : 3;
     float *qkv = da_alloc(ar, (size_t)S * nq * dim);
-    gemm_dqw(h, qkv, hh, &w->sa_to_qkv, NULL, S);
+    if (w8) gemm_dqw(h, qkv, hhf, &w->sa_to_qkv, NULL, S);
+    else    gemm_dqw_h(h, qkv, hh, &w->sa_to_qkv, NULL, S);
     k_extract_normrope<<<H * S, hd>>>(qh, qkv, w->sa_q_norm, h->rope_cos, h->rope_sin, S, H, hd, nq * dim, 0, rot, 1e-6f);
     k_extract_normrope<<<H * S, hd>>>(kh, qkv, w->sa_k_norm, h->rope_cos, h->rope_sin, S, H, hd, nq * dim, dim, rot, 1e-6f);
     k_extract_heads_h<<<nHShd, THREADS>>>(vh, qkv, S, H, hd, nq * dim, 2 * dim);
@@ -798,15 +942,19 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
         attn_dev_h(h->cublas, ar, aod, qdh, kdh, vh, H, S, S, hd, scores);
         k_sub<<<nblocks(nHSd), THREADS>>>(ao, aod, nHSd);
     }
-    k_merge_heads<<<nHShd, THREADS>>>(merged, ao, S, H, hd);
-    gemm_dqw(h, o, merged, &w->sa_to_out, NULL, S);
-    k_gate_add<<<nSd, THREADS>>>(seq, seq, o, gate_self, S, dim);
+    if (w8) { k_merge_heads<<<nHShd, THREADS>>>(mergedf, ao, S, H, hd);
+              gemm_dqw(h, o, mergedf, &w->sa_to_out, NULL, S); }
+    else    { k_merge_heads_h<<<nHShd, THREADS>>>(merged, ao, S, H, hd);
+              gemm_dqw_h(h, o, merged, &w->sa_to_out, NULL, S); }
+    k_gate_add<<<nSd, THREADS>>>(seq, seq, o, gate_self, NULL, S, dim);
 
     /* cross-attention (cached fp16 K/V; differential: q_diff + cross_kd) */
-    k_rmsnorm<<<S, RED_TH>>>(hh, seq, w->cross_norm, S, dim, 1e-5f, 0);
+    if (w8) k_rmsnorm<<<S, RED_TH>>>(hhf, seq, w->cross_norm, S, dim, 1e-5f, 0);
+    else    k_rmsnorm_h<<<S, RED_TH>>>(hh, seq, w->cross_norm, S, dim, 1e-5f);
     int ncq = diff ? 2 : 1;
     float *q = da_alloc(ar, (size_t)S * ncq * dim);
-    gemm_dqw(h, q, hh, &w->ca_to_q, NULL, S);
+    if (w8) gemm_dqw(h, q, hhf, &w->ca_to_q, NULL, S);
+    else    gemm_dqw_h(h, q, hh, &w->ca_to_q, NULL, S);
     k_extract_normrope<<<H * S, hd>>>(qh, q, w->ca_q_norm, NULL, NULL, S, H, hd, ncq * dim, 0, rot, 1e-6f);
     attn_dev_h(h->cublas, ar, ao, qh, h->cross_k[blk], h->cross_v[blk], H, S, Sc, hd, scores);
     if (diff) {
@@ -814,20 +962,32 @@ static void dit_block_dev(aria_cuda_dit *h, float *seq, int blk) {
         attn_dev_h(h->cublas, ar, aod, qdh, h->cross_kd[blk], h->cross_v[blk], H, S, Sc, hd, scores);
         k_sub<<<nblocks(nHSd), THREADS>>>(ao, aod, nHSd);
     }
-    k_merge_heads<<<nHShd, THREADS>>>(merged, ao, S, H, hd);
-    gemm_dqw(h, o, merged, &w->ca_to_out, NULL, S);
+    if (w8) { k_merge_heads<<<nHShd, THREADS>>>(mergedf, ao, S, H, hd);
+              gemm_dqw(h, o, mergedf, &w->ca_to_out, NULL, S); }
+    else    { k_merge_heads_h<<<nHShd, THREADS>>>(merged, ao, S, H, hd);
+              gemm_dqw_h(h, o, merged, &w->ca_to_out, NULL, S); }
     k_add<<<nSd, THREADS>>>(seq, seq, o, (size_t)S * dim);
 
     /* local-additive (inpaint) cond: seq += per-block left-padded local_emb (memory rows 0) */
     if (h->has_local) k_add<<<nSd, THREADS>>>(seq, seq, h->local_emb[blk], (size_t)S * dim);
 
-    /* feed-forward (GLU) */
-    k_rmsnorm_adaln<<<S, RED_TH>>>(hh, seq, w->ff_norm, scale_ff, shift_ff, S, dim, 1e-5f);
-    float *proj = da_alloc(ar, (size_t)S * 2 * inner), *gated = da_alloc(ar, (size_t)S * inner);
-    gemm_dqw(h, proj, hh, &w->ff_in_w, w->ff_in_b, S);
-    k_ff_silugate<<<nblocks((size_t)S * inner), THREADS>>>(gated, proj, S, inner);
-    gemm_dqw(h, o, gated, &w->ff_out_w, w->ff_out_b, S);
-    k_gate_add<<<nSd, THREADS>>>(seq, seq, o, gate_ff, S, dim);
+    /* feed-forward (GLU); ff biases fold into the consumer kernels (A2) so the two
+     * k_add_bias passes per block disappear -- bit-identical adds, one pass less each. */
+    if (w8) k_rmsnorm_adaln<<<S, RED_TH>>>(hhf, seq, w->ff_norm, scale_ff, shift_ff, S, dim, 1e-5f);
+    else    k_rmsnorm_adaln_h<<<S, RED_TH>>>(hh, seq, w->ff_norm, scale_ff, shift_ff, S, dim, 1e-5f);
+    float *proj = da_alloc(ar, (size_t)S * 2 * inner);
+    if (w8) {
+        float *gatedf = da_alloc(ar, (size_t)S * inner);
+        gemm_dqw(h, proj, hhf, &w->ff_in_w, NULL, S);
+        k_ff_silugate<<<nblocks((size_t)S * inner), THREADS>>>(gatedf, proj, w->ff_in_b, S, inner);
+        gemm_dqw(h, o, gatedf, &w->ff_out_w, NULL, S);
+    } else {
+        __half *gated = da_alloc_half(ar, (size_t)S * inner);
+        gemm_dqw_h(h, proj, hh, &w->ff_in_w, NULL, S);
+        k_ff_silugate_h<<<nblocks((size_t)S * inner), THREADS>>>(gated, proj, w->ff_in_b, S, inner);
+        gemm_dqw_h(h, o, gated, &w->ff_out_w, NULL, S);
+    }
+    k_gate_add<<<nSd, THREADS>>>(seq, seq, o, gate_ff, w->ff_out_b, S, dim);
 
     /* E12 residual steering: seq += scale*dir at the block output (matches dit_block_core /
      * sf-api AdditiveInjector). Only static per-request conditions gate the LAUNCH (site, layer,
@@ -1195,6 +1355,14 @@ __global__ void k_merge_heads_b(float *dst, const float *src, int B, int S, int 
     int b = (int)(idx / ((size_t)hd * S * H));
     dst[(size_t)(b * S + s) * (H * hd) + (size_t)h * hd + d] = src[idx];
 }
+/* fp16-emitting variant (A2): dst feeds the to_out GEMM directly. */
+__global__ void k_merge_heads_b_h(__half *dst, const float *src, int B, int S, int H, int hd) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)B * H * S * hd) return;
+    int d = (int)(idx % hd), s = (int)((idx / hd) % S), h = (int)((idx / ((size_t)hd * S)) % H);
+    int b = (int)(idx / ((size_t)hd * S * H));
+    dst[(size_t)(b * S + s) * (H * hd) + (size_t)h * hd + d] = __float2half(src[idx]);
+}
 /* expand x[T,D] -> seq[Tp*17, D]: token t at row t*17 (zeros if padded), new_tokens at the next 16 */
 __global__ void k_expand_tokens(float *seq, const float *x, const float *new_tokens, int T, int Tp, int D) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1240,18 +1408,20 @@ static void taae_block_dev(aria_cuda_dec *h, float *seq, int B, const dec_blk_de
     int S = DC_S, D = DC_D, H = DC_H, hd = DC_HD;
     int N = B * S, NH = B * H * S * hd;
     size_t mark = da_save(ar);
-    float *res = da_alloc(ar, (size_t)N * D), *hh = da_alloc(ar, (size_t)N * D);
+    float *res = da_alloc(ar, (size_t)N * D);
     float *q  = da_alloc(ar, (size_t)NH), *k  = da_alloc(ar, (size_t)NH), *v = da_alloc(ar, (size_t)NH);
     float *qd = da_alloc(ar, (size_t)NH), *kd = da_alloc(ar, (size_t)NH);
     float *ob = da_alloc(ar, (size_t)NH), *od = da_alloc(ar, (size_t)NH);
-    float *merged = da_alloc(ar, (size_t)N * D), *o = da_alloc(ar, (size_t)N * D);
+    float *o = da_alloc(ar, (size_t)N * D);
     float *scores = da_alloc(ar, (size_t)B * H * S * S);
 
-    /* differential self-attention */
+    /* differential self-attention (hh/merged/gated fp16: GEMM-input producers, A2) */
+    __half *hhh = da_alloc_half(ar, (size_t)N * D);
+    __half *mergedh = da_alloc_half(ar, (size_t)N * D);
     cudaMemcpy(res, seq, (size_t)N * D * sizeof(float), cudaMemcpyDeviceToDevice);
-    k_dyt<<<nblocks((size_t)N * D), THREADS>>>(hh, seq, w->pre_alpha, w->pre_gamma, w->pre_beta, (size_t)N * D, D);
+    k_dyt_h<<<nblocks((size_t)N * D), THREADS>>>(hhh, seq, w->pre_alpha, w->pre_gamma, w->pre_beta, (size_t)N * D, D);
     float *qkv = da_alloc(ar, (size_t)N * DC_QKV);
-    gemm_f16w(h->cublas, ar, qkv, hh, w->to_qkv, NULL, N, D, DC_QKV);
+    gemm_f16w_h(h->cublas, qkv, hhh, w->to_qkv, NULL, N, D, DC_QKV);
     k_extract_heads_b<<<nblocks((size_t)NH), THREADS>>>(q,  qkv, B, S, H, hd, DC_QKV, 0);
     k_extract_heads_b<<<nblocks((size_t)NH), THREADS>>>(k,  qkv, B, S, H, hd, DC_QKV, 768);
     k_extract_heads_b<<<nblocks((size_t)NH), THREADS>>>(v,  qkv, B, S, H, hd, DC_QKV, 1536);
@@ -1269,18 +1439,19 @@ static void taae_block_dev(aria_cuda_dec *h, float *seq, int B, const dec_blk_de
     attn_dev(h->cublas, ar, ob, q,  k,  v, B * H, S, S, hd, scores);
     attn_dev(h->cublas, ar, od, qd, kd, v, B * H, S, S, hd, scores);
     k_subtract<<<nblocks((size_t)NH), THREADS>>>(ob, od, (size_t)NH);
-    k_merge_heads_b<<<nblocks((size_t)NH), THREADS>>>(merged, ob, B, S, H, hd);
-    gemm_f16w(h->cublas, ar, o, merged, w->to_out, NULL, N, D, D);
+    k_merge_heads_b_h<<<nblocks((size_t)NH), THREADS>>>(mergedh, ob, B, S, H, hd);
+    gemm_f16w_h(h->cublas, o, mergedh, w->to_out, NULL, N, D, D);
     k_add<<<nblocks((size_t)N * D), THREADS>>>(seq, res, o, (size_t)N * D);
 
-    /* SwiGLU feed-forward */
+    /* SwiGLU feed-forward (ff biases folded into the consumer kernels, A2) */
     cudaMemcpy(res, seq, (size_t)N * D * sizeof(float), cudaMemcpyDeviceToDevice);
-    k_dyt<<<nblocks((size_t)N * D), THREADS>>>(hh, seq, w->ff_alpha, w->ff_gamma, w->ff_beta, (size_t)N * D, D);
-    float *proj = da_alloc(ar, (size_t)N * 2 * DC_INNER), *gated = da_alloc(ar, (size_t)N * DC_INNER);
-    gemm_f16w(h->cublas, ar, proj, hh, w->ff_in_w, w->ff_in_b, N, D, 2 * DC_INNER);
-    k_ff_silugate<<<nblocks((size_t)N * DC_INNER), THREADS>>>(gated, proj, N, DC_INNER);
-    gemm_f16w(h->cublas, ar, o, gated, w->ff_out_w, w->ff_out_b, N, DC_INNER, D);
-    k_add<<<nblocks((size_t)N * D), THREADS>>>(seq, res, o, (size_t)N * D);
+    k_dyt_h<<<nblocks((size_t)N * D), THREADS>>>(hhh, seq, w->ff_alpha, w->ff_gamma, w->ff_beta, (size_t)N * D, D);
+    float *proj = da_alloc(ar, (size_t)N * 2 * DC_INNER);
+    __half *gated = da_alloc_half(ar, (size_t)N * DC_INNER);
+    gemm_f16w_h(h->cublas, proj, hhh, w->ff_in_w, NULL, N, D, 2 * DC_INNER);
+    k_ff_silugate_h<<<nblocks((size_t)N * DC_INNER), THREADS>>>(gated, proj, w->ff_in_b, N, DC_INNER);
+    gemm_f16w_h(h->cublas, o, gated, w->ff_out_w, NULL, N, DC_INNER, D);
+    k_add_bias_res<<<nblocks((size_t)N * D), THREADS>>>(seq, res, o, w->ff_out_b, (size_t)N * D, D);
 
     da_restore(ar, mark);
 }
@@ -1492,13 +1663,25 @@ __global__ void k_attn_band(float *out, const float *q, const float *k, const fl
     for (int c = 0; c < dpl; c++) oo[lane + c * 32] = orr[c];
 }
 
-/* sinusoidal GLU gate: out = sin(pi*gate) * value */
-__global__ void k_ff_singate(float *out, const float *proj, int S, int inner) {
+/* sinusoidal GLU gate: out = sin(pi*(gate+b)) * (value+b); b2 folds the ff_in GEMM's
+ * bias in (A2), NULL = none. fp16-emitting (_h): out feeds the ff_out GEMM directly. */
+__global__ void k_ff_singate(float *out, const float *proj, const float *b2, int S, int inner) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (size_t)S * inner) return;
     int s = (int)(idx / inner), i = (int)(idx % inner);
     const float *pr = proj + (size_t)s * 2 * inner;
-    out[idx] = sinf(3.14159265359f * pr[inner + i]) * pr[i];
+    float up = b2 ? (pr[i] + b2[i]) : pr[i];
+    float g = b2 ? (pr[inner + i] + b2[inner + i]) : pr[inner + i];
+    out[idx] = sinf(3.14159265359f * g) * up;
+}
+__global__ void k_ff_singate_h(__half *out, const float *proj, const float *b2, int S, int inner) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)S * inner) return;
+    int s = (int)(idx / inner), i = (int)(idx % inner);
+    const float *pr = proj + (size_t)s * 2 * inner;
+    float up = b2 ? (pr[i] + b2[i]) : pr[i];
+    float g = b2 ? (pr[inner + i] + b2[inner + i]) : pr[inner + i];
+    out[idx] = __float2half(sinf(3.14159265359f * g) * up);
 }
 
 /* fused extract-head + per-head DyT (dynamic tanh) + RoPE -> head-major out[h,s,:hd].
@@ -1667,16 +1850,18 @@ static void med_block_dev(aria_cuda_dec_medium *h, float *seq, int N, const floa
     /* res/hh/o persist across the block; the attention scratch is freed before the FF
      * (they're never live together) so the arena peak is the attention phase, not the
      * sum of both -- saves ~3*N*INNER (~100 MB on a 10 s medium clip). */
-    float *res = da_alloc(ar, (size_t)N * D), *hh = da_alloc(ar, (size_t)N * D), *o = da_alloc(ar, (size_t)N * D);
+    float *res = da_alloc(ar, (size_t)N * D), *o = da_alloc(ar, (size_t)N * D);
+    __half *hhh = da_alloc_half(ar, (size_t)N * D);   /* fp16 GEMM-input producer (A2) */
 
     cudaMemcpy(res, seq, (size_t)N * D * sizeof(float), cudaMemcpyDeviceToDevice);
-    k_dyt<<<nblocks((size_t)N * D), THREADS>>>(hh, seq, w->pre_alpha, w->pre_gamma, w->pre_beta, (size_t)N * D, D);
+    k_dyt_h<<<nblocks((size_t)N * D), THREADS>>>(hhh, seq, w->pre_alpha, w->pre_gamma, w->pre_beta, (size_t)N * D, D);
     size_t amark = da_save(ar);
     float *q  = da_alloc(ar, NH), *k = da_alloc(ar, NH), *v = da_alloc(ar, NH);
     float *qd = da_alloc(ar, NH), *kd = da_alloc(ar, NH);
-    float *ob = da_alloc(ar, NH), *od = da_alloc(ar, NH), *merged = da_alloc(ar, (size_t)N * D);
+    float *ob = da_alloc(ar, NH), *od = da_alloc(ar, NH);
+    __half *mergedh = da_alloc_half(ar, (size_t)N * D);
     float *qkv = da_alloc(ar, (size_t)N * MD_QKV);
-    gemm_f16w(h->cublas, ar, qkv, hh, w->to_qkv, NULL, N, D, MD_QKV);
+    gemm_f16w_h(h->cublas, qkv, hhh, w->to_qkv, NULL, N, D, MD_QKV);
 #if MED_FUSE_GLUE
     /* v: plain extract (never normed/roped). q/k/qd/kd: fused extract+DyT+RoPE.
      * 13 launches (5 extract + 4 dyt + 4 rope) -> 5 (1 extract + 4 fused). */
@@ -1704,19 +1889,20 @@ static void med_block_dev(aria_cuda_dec_medium *h, float *seq, int N, const floa
     attn_dev_band(ob, q,  k,  v, H, N, hd, MD_WIN);
     attn_dev_band(od, qd, kd, v, H, N, hd, MD_WIN);
     k_subtract<<<nblocks(NH), THREADS>>>(ob, od, NH);
-    k_merge_heads<<<nblocks(NH), THREADS>>>(merged, ob, N, H, hd);
-    gemm_f16w(h->cublas, ar, o, merged, w->to_out, NULL, N, D, D);
+    k_merge_heads_h<<<nblocks(NH), THREADS>>>(mergedh, ob, N, H, hd);
+    gemm_f16w_h(h->cublas, o, mergedh, w->to_out, NULL, N, D, D);
     k_add<<<nblocks((size_t)N * D), THREADS>>>(seq, res, o, (size_t)N * D);
     da_restore(ar, amark);   /* free q/k/v/qd/kd/ob/od/merged/qkv before the FF */
 
     cudaMemcpy(res, seq, (size_t)N * D * sizeof(float), cudaMemcpyDeviceToDevice);
-    k_dyt<<<nblocks((size_t)N * D), THREADS>>>(hh, seq, w->ff_alpha, w->ff_gamma, w->ff_beta, (size_t)N * D, D);
-    float *proj = da_alloc(ar, (size_t)N * 2 * MD_INNER), *gated = da_alloc(ar, (size_t)N * MD_INNER);
-    gemm_f16w(h->cublas, ar, proj, hh, w->ff_in_w, w->ff_in_b, N, D, 2 * MD_INNER);
-    if (sinusoidal) k_ff_singate<<<nblocks((size_t)N * MD_INNER), THREADS>>>(gated, proj, N, MD_INNER);
-    else            k_ff_silugate<<<nblocks((size_t)N * MD_INNER), THREADS>>>(gated, proj, N, MD_INNER);
-    gemm_f16w(h->cublas, ar, o, gated, w->ff_out_w, w->ff_out_b, N, MD_INNER, D);
-    k_add<<<nblocks((size_t)N * D), THREADS>>>(seq, res, o, (size_t)N * D);
+    k_dyt_h<<<nblocks((size_t)N * D), THREADS>>>(hhh, seq, w->ff_alpha, w->ff_gamma, w->ff_beta, (size_t)N * D, D);
+    float *proj = da_alloc(ar, (size_t)N * 2 * MD_INNER);
+    __half *gated = da_alloc_half(ar, (size_t)N * MD_INNER);
+    gemm_f16w_h(h->cublas, proj, hhh, w->ff_in_w, NULL, N, D, 2 * MD_INNER);
+    if (sinusoidal) k_ff_singate_h<<<nblocks((size_t)N * MD_INNER), THREADS>>>(gated, proj, w->ff_in_b, N, MD_INNER);
+    else            k_ff_silugate_h<<<nblocks((size_t)N * MD_INNER), THREADS>>>(gated, proj, w->ff_in_b, N, MD_INNER);
+    gemm_f16w_h(h->cublas, o, gated, w->ff_out_w, NULL, N, MD_INNER, D);
+    k_add_bias_res<<<nblocks((size_t)N * D), THREADS>>>(seq, res, o, w->ff_out_b, (size_t)N * D, D);
 
     da_restore(ar, mark);
 }
