@@ -1,9 +1,9 @@
 """dump_phase1.py - Dump PyTorch reference tensors for aria's Phase 1 parity tests.
 
-Run with the sa3-sf-api venv so stable_audio_tools imports work, e.g.:
+Run with a venv that has stable_audio_tools installed, e.g.:
 
   SA3_MODEL=~/.cache/huggingface/hub/models--stabilityai--stable-audio-3-small-music/snapshots/<snap>
-  .../sa3-sf-api/.venv/bin/python dump_phase1.py "$SA3_MODEL" out_dir
+  python dump_phase1.py "$SA3_MODEL" out_dir
 
 Currently dumps:
   number_cond/seconds_<i>.atns   reference seconds_total embeddings [768]

@@ -1,7 +1,7 @@
-/* bench_megakernel.cu - True-Megakernel feasibility benchmark (PAPER.md Direction 1).
+/* bench_megakernel.cu - True-Megakernel feasibility benchmark.
  *
  * Question: can a hand-rolled WMMA tensor-core GEMM (+ on-chip fusion) beat cuBLAS at the
- * SA3 DiT's short-sequence GEMM shapes on Ampere (RTX 3070, sm_86)? PAPER.md predicts no:
+ * SA3 DiT's short-sequence GEMM shapes on Ampere (RTX 3070, sm_86)? The prediction is no:
  * the per-block weights (10MB+) must stream from HBM regardless, so the GEMMs are weight-
  * bound and a megakernel only saves the activation round-trips. This measures it.
  *

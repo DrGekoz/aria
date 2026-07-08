@@ -49,7 +49,7 @@ LIB := $(BUILD)/libaria.a
 all: cpu
 cpu: aria
 
-# example external program: links libaria.a using only the public headers (E11.1)
+# example external program: links libaria.a using only the public headers
 example: $(LIB)
 	$(CC) $(CFLAGS) -I$(SRC) examples/generate.c -L$(BUILD) -laria $(LDFLAGS) -o example
 
@@ -62,7 +62,7 @@ install: aria $(LIB)
 	install -m 644 $(SRC)/aria.h $(SRC)/aria_wav.h $(SRC)/aria_quant.h $(DESTDIR)$(PREFIX)/include/aria/
 	@echo "installed aria + libaria.a + headers under $(DESTDIR)$(PREFIX)"
 
-# offline weight quantizer (E9.2): model.safetensors -> packed .aria DiT overlay
+# offline weight quantizer: model.safetensors -> packed .aria DiT overlay
 quantize: aria-quantize
 aria-quantize: $(LIB)
 	$(CC) $(CFLAGS) -I$(SRC) tools/aria_quantize.c -L$(BUILD) -laria $(LDFLAGS) -o aria-quantize
@@ -74,7 +74,7 @@ help:
 	@echo "    make / make cpu    CPU build (default): build/libaria.a + ./aria"
 	@echo "    make cuda          CUDA build (CUDA_ARCH=sm_86 for RTX 3070; default sm_61."
 	@echo "                       also NVCC, CUDA_HOME, CUDA_CCBIN)"
-	@echo "    make quantize      offline DiT quantizer -> ./aria-quantize (E9.2)"
+	@echo "    make quantize      offline DiT quantizer -> ./aria-quantize"
 	@echo "    make install       install aria + libaria.a + headers (PREFIX=/usr/local)"
 	@echo "    make example       build examples/generate.c against libaria.a"
 	@echo "    make clean         remove build/ and ./aria"
@@ -128,7 +128,7 @@ $(LIB): $(LIB_OBJS)
 aria: $(BUILD)/main.o $(BUILD)/aria_hpss.o $(LIB)
 	$(CC) $(CFLAGS) -I$(SRC) $(BUILD)/main.o $(BUILD)/aria_hpss.o -L$(BUILD) -laria $(LDFLAGS) -o $@
 
-# resident HTTP server (E13.2, ds4-server pattern): one worker thread owns the ctx
+# resident HTTP server (ds4-server pattern): one worker thread owns the ctx
 aria-server: $(BUILD)/aria_server.o $(LIB)
 	$(CC) $(CFLAGS) -I$(SRC) $(BUILD)/aria_server.o -L$(BUILD) -laria $(LDFLAGS) -lpthread -o $@
 
@@ -144,8 +144,8 @@ test: $(LIB)
 	done; \
 	echo "all tests passed"
 
-# ---- parity tests (need a model dir + the sa3-sf-api venv) ----
-PYTHON    ?= ../sa3-sf-api/.venv/bin/python
+# ---- parity tests (need a model dir + a venv with stable_audio_tools) ----
+PYTHON    ?= python3
 ARIA_MODEL ?=
 DUMPS     ?= build/parity_dumps
 PARITY_TESTS := test_number_cond test_attn test_dit test_dit_diff test_dit_full test_quant_dit test_schedule test_dec test_taae_med test_enc test_inpaint test_inpaint_e2e test_e2e test_t5enc test_tokenizer
@@ -161,7 +161,7 @@ parity: $(LIB)
 	done; \
 	echo "parity passed"
 
-# ---- CUDA backend (E8) ----
+# ---- CUDA backend ----
 # Local dev box: GT 1030 (sm_61), CUDA 11.2 at /usr/lib/cuda (needs host gcc <= 10).
 # RTX 3070: make cuda CUDA_ARCH=sm_86. The pure-C build stays the default.
 NVCC       ?= /usr/lib/cuda/bin/nvcc

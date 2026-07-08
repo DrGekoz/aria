@@ -6,7 +6,7 @@
 # Usage: tests/steer_compare.sh <aria_model_dir> [sf_api_dir] [sf_model_name]
 set -e
 ARIA_MODEL="$1"; [ -z "$ARIA_MODEL" ] && { echo "usage: $0 <aria_model_dir> [sf_api_dir] [sf_model_name]"; exit 1; }
-SF_DIR="${2:-/home/matteo/Scrivania/Projects/csc/soundfood/sa3-sf-api}"
+SF_DIR="$2"; [ -z "$SF_DIR" ] && { echo "usage: $0 <aria_model_dir> <sf_api_dir> [sf_model_name]"; exit 1; }
 SF_MODEL="${3:-stabilityai/stable-audio-3-small-music}"
 ARIA="${ARIA:-./aria}"
 PY="$SF_DIR/.venv/bin/python"

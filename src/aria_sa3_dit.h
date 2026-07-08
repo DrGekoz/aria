@@ -88,8 +88,8 @@ int aria_sa3_dit_quant_load(aria_sa3_dit *m, const char *path);
  * Thread-safety / batch foundation: the model (aria_sa3_dit) is immutable and
  * read-only during a step; each request owns its arena and caches with no shared
  * mutable state. Distinct requests may therefore run concurrently against one
- * shared model -- the basis for a request-parallel batch/server API (see
- * ROADMAP E13). (Each step uses OpenMP internally, so a server caps per-request
+ * shared model -- the basis for a request-parallel batch/server API.
+ * (Each step uses OpenMP internally, so a server caps per-request
  * threads to avoid oversubscription.) */
 typedef struct aria_sa3_dit_req aria_sa3_dit_req;
 

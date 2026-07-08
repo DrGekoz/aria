@@ -3,7 +3,7 @@
  *
  * Each steer adds a fixed calibrated direction to one activation site during generation.
  * The direction is just a vector, so the same mechanism steers ANYTHING (taste is one use
- * case). The op matches the reference injector (sa3-sf-api/steering/injector.py) exactly:
+ * case). The op matches the PyTorch reference injector exactly:
  * at the site, `x += scale * dir`, where `dir` is the alpha-less calibrated direction
  * (= mean_residual_norm * unit_direction, baked at export). Gated to the inclusive denoise-
  * step window [step_lo,step_hi] and, for the residual site, the target DiT layer. scale==0

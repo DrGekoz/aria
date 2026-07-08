@@ -28,8 +28,8 @@ make profile ARGS="-m $MODEL --uncond -d 10 -s 8 --device cuda -o /tmp/p.wav"
 
 `scripts/profile.sh` runs the built-in profile, then — on a CUDA build with
 **Nsight Systems (`nsys`)** installed — the per-kernel GPU-time and host↔device
-transfer breakdown. On a CPU build it falls back to `perf stat`. Example (3070,
-post-E8.5d): the cuBLAS GEMMs (`ampere_*gemm_*`) dominate (~45 %), then
+transfer breakdown. On a CPU build it falls back to `perf stat`. Example (3070):
+the cuBLAS GEMMs (`ampere_*gemm_*`) dominate (~45 %), then
 `k_softmax` 9 %, `k_f32_to_f16` 6 %, `k_rope` 4 %, `k_conv1d` 3 % — the next
 optimization targets. (The full `.nsys-rep` opens in the Nsight Systems GUI for a
 timeline.)
@@ -41,5 +41,5 @@ and `make bench-sweep` tunes the AVX2 register tile.
 
 1. `--bench N` + `ARIA_PROFILE=1` → which **stage** and how much **memory**.
 2. `make profile` → which **kernel** dominates that stage.
-3. Optimize the top kernel; re-profile. (This is how E8.5d found that a fp64
-   thread-per-row `k_rmsnorm` was 51 % of GPU time — invisible at the stage level.)
+3. Optimize the top kernel; re-profile. (This is how we found a fp64
+   thread-per-row `k_rmsnorm` eating 51 % of GPU time — invisible at the stage level.)

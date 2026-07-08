@@ -1,21 +1,12 @@
 # AGENTS.md — working guide for aria.c
 
-Conventions and ground rules for anyone (human or AI agent) working in this
-repository. Read this before making changes. Keep it short and follow it.
+Conventions and ground rules for anyone (human or AI agent) working in this repository. Read this before making changes. Keep it short and follow it.
 
 ## What this is
 
-`aria.c` is a from-scratch, **dependency-free C inference runtime** for audio
-diffusion models. First target: **Stable Audio 3** (small-music + medium). It is
-designed to be **modular** so other audio diffusion models (e.g. AceStep 1.5)
-plug in as new model modules without touching the kernels, sampler, or I/O.
+`aria.c` is a from-scratch, **dependency-free C inference runtime** for audio diffusion models. First target: **Stable Audio 3** (small-music + medium). It is designed to be **modular** so other audio diffusion models (e.g. AceStep 1.5) plug in as new model modules without touching the kernels, sampler, or I/O.
 
-It is the audio sibling of two reference runtimes (study them, don't copy
-blindly): `../sa3-sf-api/references/iris.c` (FLUX/Z-Image image diffusion — the
-diffusion architecture + modularity model; **no CUDA**) and
-`../sa3-sf-api/references/ds4` (DeepSeek LLMs — the CUDA backend, int8/q4
-quantization with dequant-on-use, mmap + SSD weight streaming, compile-time
-backend selection).
+It is the audio sibling of two reference runtimes (study them, don't copy blindly): `iris.c` (FLUX/Z-Image image diffusion — the diffusion architecture + modularity model; **no CUDA**) and `ds4` (DeepSeek LLMs — the CUDA backend, int8/q4 quantization with dequant-on-use, mmap + SSD weight streaming, compile-time backend selection).
 
 ## Golden rules
 
@@ -56,8 +47,8 @@ make clean
 - `make test` must never require a model, network, or GPU. Parity tests that
   need a model live behind `ARIA_MODEL`/`ARIA_DUMPS` env vars and **SKIP**
   cleanly when unset, so they don't break the hermetic suite.
-- `PYTHON` defaults to `../sa3-sf-api/.venv/bin/python` (the parity reference
-  venv with `stable_audio_tools`).
+- `PYTHON` defaults to `python3`; point it at a venv that has
+  `stable_audio_tools` installed to run the parity dumps.
 - Build must be warning-clean under `-Wall -Wextra`.
 
 ## Repository layout
@@ -94,7 +85,7 @@ tools/aria_quantize.c        offline DiT quantizer (model.safetensors -> .aria o
 ```
 
 The CUDA backend (`aria_cuda.cu`), Q8/Q4 quantization, continue/inpaint, and the
-medium model are all implemented (see [STATUS.md](STATUS.md)); the pure-C `make`
+medium model are all implemented; the pure-C `make`
 build stays the default and the always-green reference.
 
 ## Architecture (and how to add a model)
@@ -132,27 +123,16 @@ op surface generically if a primitive is genuinely missing.
 
 ## Parity methodology (how we prove correctness)
 
-- `.atns` format (`scripts/parity_io.py` writer, `src/aria_parity.*` reader):
-  `"ATNS" | u32 version | u32 ndim | u32 dtype(0=f32) | i64 shape[] | f32 data`.
-- Dump references from the **real** `stable_audio_tools` modules
-  (`scripts/dump_phase1.py`), not a Python reimplementation — except where a
-  computation is ill-conditioned in f32 (then dump an f64-canonical value and
-  log the deviation from torch).
-- **Gate with atol + rtol**: `pass if maxabsdiff <= atol + rtol * max|ref|`.
-  Float32 matmul accumulation order legitimately differs from numpy/BLAS by
-  ~1e-3·max|ref|; a fixed tiny atol will false-fail. Typical: `atol≈3e-4`,
-  `rtol≈2e-3` for linear-heavy ops; tighten for elementwise.
-- For RNG-sensitive paths (sampler), inject identical noise from Python into the
-  C path so you validate the *math* independently of the RNG.
+- `.atns` format (`scripts/parity_io.py` writer, `src/aria_parity.*` reader): `"ATNS" | u32 version | u32 ndim | u32 dtype(0=f32) | i64 shape[] | f32 data`.
+- Dump references from the **real** `stable_audio_tools` modules (`scripts/dump_phase1.py`), not a Python reimplementation — except where a computation is ill-conditioned in f32 (then dump an f64-canonical value and log the deviation from torch).
+- **Gate with atol + rtol**: `pass if maxabsdiff <= atol + rtol * max|ref|`. Float32 matmul accumulation order legitimately differs from numpy/BLAS by ~1e-3·max|ref|; a fixed tiny atol will false-fail. Typical: `atol≈3e-4`, `rtol≈2e-3` for linear-heavy ops; tighten for elementwise.
+- For RNG-sensitive paths (sampler), inject identical noise from Python into the C path so you validate the *math* independently of the RNG.
 - Determinism: tests must be deterministic. Seed explicitly.
 
 ## Hardware targets
 
-- **CPU (primary):** i7-class, AVX2 + FMA + F16C, OpenMP. Must be correct and the
-  reference for parity.
-- **CUDA (secondary):** RTX 3070 (sm_86, fp16 tensor cores) is the realistic GPU
-  target; GT 1030 (sm_61, 2 GB, slow fp16) is an extreme low-VRAM edge handled
-  with fp16-storage + SSD weight streaming. CUDA toolkit 11.2.
+- **CPU (primary):** i7-class, AVX2 + FMA + F16C, OpenMP. Must be correct and the   reference for parity.
+- **CUDA (secondary):** RTX 3070 (sm_86, fp16 tensor cores) is the realistic GPU   target; GT 1030 (sm_61, 2 GB, slow fp16) is an extreme low-VRAM edge handled with fp16-storage + SSD weight streaming. CUDA toolkit 11.2.
 
 ## Don'ts
 
@@ -164,15 +144,4 @@ op surface generically if a primitive is genuinely missing.
 
 ## Quick SA3 reference (small-music)
 
-Latent 256-D @ ~10.7 Hz, stereo 44.1 kHz, downsample 4096×. DiT: embed_dim 1024,
-depth 20, 16 heads, head_dim 64, FFN GLU (`ff.0.proj[8192,1024]`→`ff.2[1024,4096]`),
-fused `to_qkv[3072,1024]`, QK-RMSNorm `q/k_norm.gamma[64]`, RMSNorm weights named
-`.gamma`, adaLN `to_scale_shift_gate[6144]`, 64 memory tokens, zero-init inpaint
-MLP `to_local_embed.0[1024,257]`. Conditioning: cross-attn `[prompt | seconds]`,
-global adaLN from `seconds_total`, local-additive `[inpaint_mask | masked_input]`.
-Autoencoder: `taae_v2`, patch 256, stride 16, differential attention + DynamicTanh
-+ softnorm bottleneck. Objective `rf_denoiser`; sampler **pingpong** (8 steps,
-cfg 1.0): `x ← (1−t_next)·(x − t·v) + t_next·noise`. Text encoder: T5Gemma-b-b
-(12-layer Gemma2-style, 768-d, RoPE θ=10000, logit softcap 50, query_pre_attn
-scalar 64); weights + tokenizer cached under the model's `t5gemma-b-b-ul2/`.
-Always confirm against the live `model_config.json`.
+Latent 256-D @ ~10.7 Hz, stereo 44.1 kHz, downsample 4096×. DiT: embed_dim 1024, depth 20, 16 heads, head_dim 64, FFN GLU (`ff.0.proj[8192,1024]`→`ff.2[1024,4096]`), fused `to_qkv[3072,1024]`, QK-RMSNorm `q/k_norm.gamma[64]`, RMSNorm weights named `.gamma`, adaLN `to_scale_shift_gate[6144]`, 64 memory tokens, zero-init inpaint MLP `to_local_embed.0[1024,257]`. Conditioning: cross-attn `[prompt | seconds]`, global adaLN from `seconds_total`, local-additive `[inpaint_mask | masked_input]`. Autoencoder: `taae_v2`, patch 256, stride 16, differential attention + DynamicTanh + softnorm bottleneck. Objective `rf_denoiser`; sampler **pingpong** (8 steps, cfg 1.0): `x ← (1−t_next)·(x − t·v) + t_next·noise`. Text encoder: T5Gemma-b-b (12-layer Gemma2-style, 768-d, RoPE θ=10000, logit softcap 50, query_pre_attn scalar 64); weights + tokenizer cached under the model's `t5gemma-b-b-ul2/`. Always confirm against the live `model_config.json`.

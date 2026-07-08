@@ -117,7 +117,7 @@ launch-overhead win is **modest at these sizes** — ~4 % warm-min on the medium
 compute-bound so the ~14 k launches mostly hide behind compute. The graph's clearer benefit
 is **steadier per-step latency** (less launch jitter); the win grows with steps and the
 medium differential path's kernel count. Also drops the redundant per-block residual copies
-(3 `cudaMemcpyD2D`/block) on the same path. See PAPER.md §4.
+(3 `cudaMemcpyD2D`/block) on the same path.
 
 **True Megakernel feasibility (measured, not adopted).** `tests/bench_megakernel.cu` benches a
 from-scratch WMMA tensor-core GEMM vs cuBLAS `GemmEx` at the DiT FFN/qkv shapes (3070, sm_86).
@@ -194,7 +194,7 @@ upload it, add after cross-attn via the existing `k_add`) makes `--continue`/`--
   natural outro fade (e.g. "ambient pads", "funk groove"), the chained continuations inherit
   the fade and drift to silence past ~9 s. Steady-energy prompts ("melodic techno") hold.
   This is the inpaint-envelope-drift limit of the post-hoc method, not the GPU — CPU and GPU
-  decay identically. See PAPER.md (beat-sync loop / streaming-trained model).
+  decay identically (beat-sync loop / streaming-trained model).
 - **Re-anchoring (`--anchor <beta>`, E14b) bounds the decay.** Each continuation context is
   blended toward the chunk-0 reference tail (convex, conditioning-only) and its RMS pulled
   back to the reference level (boost-only, ≤4×, then a ≤0.97 peak guard for the encoder).
@@ -208,8 +208,8 @@ upload it, add after cross-attn via the existing `k_add`) makes `--continue`/`--
 
 ## Steering efficiency — aria vs sf-api (E12)
 
-Same residual steer (`delta = α·norm·unit`) through the aria C runtime and the sf-api PyTorch
-reference (`sa3-sf-api/experiments/efficiency_compare.py`). 10 s / 8 steps, steered, RTX 3070.
+Same residual steer (`delta = α·norm·unit`) through the aria C runtime and the PyTorch
+reference. 10 s / 8 steps, steered, RTX 3070.
 **Warm = in-process resident (`--bench` warm-min) on both sides**; a one-shot aria CLI
 invocation additionally re-pays per-process setup (T5 encode on CPU + weight upload —
 "invocation" row):
