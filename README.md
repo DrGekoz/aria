@@ -104,4 +104,6 @@ aria draws on two reference runtimes: [iris.c](https://github.com/antirez/iris.c
 
 ## License
 
-See [LICENSE](LICENSE).
+The code is distributed under the MIT license; see [LICENSE](LICENSE). The model
+weights are distributed under their own licenses — see the [Stability AI Community
+License](https://stability.ai/license).
