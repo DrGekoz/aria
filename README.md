@@ -1,10 +1,11 @@
 # aria
 
+[![arXiv](https://img.shields.io/badge/arXiv-2607.08526-b31b1b?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2607.08526)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 aria is a native inference engine for audio diffusion models, written from scratch in C with no third-party dependencies. It runs Stable Audio 3 (small-music and medium) end to end, from a text prompt to a stereo WAV, with no Python or deep-learning framework underneath.
 
 It is CPU-first by design and runs on ordinary laptops, on old and cheap NVIDIA cards through an optional CUDA backend, and on an 8 GB Raspberry Pi 5. The point is to make capable open-weight audio models usable on hardware people already own, where the usual PyTorch stack is impractical.
-
-A companion paper describing the design and the quantization study is coming to arXiv soon, and pre-quantized aria weights and steering directions will be published on the Hugging Face Hub.
 
 ## What it does
 
@@ -107,3 +108,17 @@ aria draws on two reference runtimes: [iris.c](https://github.com/antirez/iris.c
 The code is distributed under the MIT license; see [LICENSE](LICENSE). The model
 weights are distributed under their own licenses — see the [Stability AI Community
 License](https://stability.ai/license).
+
+If you use this work, please cite the CBMI 2026 paper:
+
+```bibtex
+@misc{spanio2026quantizednativeruntimeondevice,
+      title={A Quantized Native Runtime for On-Device Semantic Audio Generation}, 
+      author={Matteo Spanio and Antonio Rodà},
+      year={2026},
+      eprint={2607.08526},
+      archivePrefix={arXiv},
+      primaryClass={cs.SD},
+      url={https://arxiv.org/abs/2607.08526}, 
+}
+```
