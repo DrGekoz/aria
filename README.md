@@ -109,7 +109,7 @@ The code is distributed under the MIT license; see [LICENSE](LICENSE). The model
 weights are distributed under their own licenses — see the [Stability AI Community
 License](https://stability.ai/license).
 
-If you use this work, please cite the CBMI 2026 paper:
+If you use this work, please cite this paper:
 
 ```bibtex
 @misc{spanio2026quantizednativeruntimeondevice,
