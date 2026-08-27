@@ -4,6 +4,10 @@
 
 #include "aria_arena.h"
 #include <stdlib.h>
+#ifdef _WIN32
+#include <malloc.h>
+#define aligned_alloc(alignment, size) malloc(size)
+#endif
 
 #define ARIA_ARENA_ALIGN 64
 

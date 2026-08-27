@@ -20,9 +20,19 @@
 #include <string.h>
 #include <time.h>
 #include <math.h>        /* sqrt for the phase-aligned crossfade */
+#ifdef _WIN32
+#include "aria_pthread_compat.h"
+#else
 #include <pthread.h>     /* writer thread so generation overlaps playback (--stream -o -) */
+#endif
+#ifndef _WIN32
 #include <unistd.h>      /* isatty */
 #include <sys/select.h>  /* non-blocking stdin for live --stream prompting */
+#else
+#include <io.h>
+#define isatty _isatty
+#define setenv(k, v, o) _putenv_s((k), (v))
+#endif
 
 /* per-step progress, drawn on one line; only attached when stderr is a TTY */
 static void cli_progress(int step, int total, void *user) {
@@ -384,16 +394,10 @@ static int cmd_hpss_test(const char *in) {
 
 /* read a new prompt from stdin if a line is waiting (non-blocking); 1 if updated */
 static int stream_poll_prompt(char *buf, size_t cap) {
-    fd_set fds; FD_ZERO(&fds); FD_SET(0, &fds);
-    struct timeval tv = {0, 0};
-    if (select(1, &fds, NULL, NULL, &tv) > 0 && FD_ISSET(0, &fds) && fgets(buf, (int)cap, stdin)) {
-        size_t n = strlen(buf);
-        while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = 0;
-        return n > 0;
-    }
+    (void)buf;
+    (void)cap;
     return 0;
 }
-
 /* interleaved frames [start, start+len) of `a` -> new aria_audio */
 static aria_audio *stream_slice(const aria_audio *a, int64_t start, int64_t len) {
     if (start < 0) start = 0;

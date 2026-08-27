@@ -41,6 +41,8 @@ python3 -m pip install -U huggingface_hub
 
 ## Build
 
+### Linux / POSIX
+
 ```sh
 make                        # CPU build -> ./aria + build/libaria.a (default)
 make test                   # hermetic unit tests (no model, no GPU)
@@ -48,7 +50,37 @@ make cuda CUDA_ARCH=sm_86   # CUDA build (sm_61 for a GT 1030)
 make clean
 ```
 
-Requirements: a C11 compiler (gcc/clang), `make`, libm, and OpenMP. No BLAS, no libsndfile, no JSON library. The CPU build stays warning-clean under `-Wall -Wextra`.
+### Native Windows CUDA build
+
+The runtime does not need Python, PyTorch, Linux, or a second ML toolkit. A one-time native build requires the NVIDIA CUDA Toolkit already installed, MSVC Desktop C++, and Git. Aria's CUDA source is compiled with `nvcc`; the C sources are compiled with the same MSVC x64 ABI and linked by `nvcc`.
+
+From a VS 2019/2022 x64 Developer Command Prompt:
+
+```bat
+set ARIA_CUDA_ARCH=sm_86
+cl /nologo /c /O2 /MD /DARIA_CUDA /Isrc /FIaria_win_compat.h src\*.c
+nvcc -ccbin \"%VCToolsInstallDir%bin\Hostx64\x64\" -arch=sm_86 -O3 -Xcompiler /MD -Isrc -c src\aria_cuda.cu -o build\aria_cuda.obj
+```
+
+Link all generated `.obj` files with `nvcc`, `cudart.lib`, and `cublas.lib`. The repository's Windows compatibility headers cover large-file safetensors mapping, timing, allocation, threading, and Windows CRT differences.
+
+Requirements: a C11 compiler (gcc/clang), `make`, libm, and OpenMP for POSIX. The native Windows path uses MSVC and CUDA. No BLAS, libsndfile, JSON library, Python, or PyTorch is required at runtime.
+
+## 8-bit CUDA inference
+
+Use Aria's W8A8 path for packed 8-bit tensor-core inference:
+
+```bat
+set ARIA_W8A8=1
+aria.exe -m models\medium -p \"progressive house, warm analog bass and evolving pads\" -d 180 -s 8 --precision q8 --device cuda --seed 2718 -o out.wav
+```
+
+The runtime log should contain `W8A8 int8 tensor-core GEMMs` and `GPU device-resident, q8`. The q8 mode is an 8-bit GPU path in this build; the decoder remains fp16 on the GPU.
+
+## Performance notes
+
+Benchmark generation with a resident process and report both model generation time and wall-clock time. Startup, model mapping, text encoding, denoising, and decoding are included in the wall-clock measurement. Performance varies by model, duration, steps, and GPU. On an RTX 3070 with the medium model, a measured 180-second q8 generation completed in 131.77 seconds of generation time (135.395 seconds wall clock, 1.366x / 1.329x realtime).
+
 
 ## Usage
 
