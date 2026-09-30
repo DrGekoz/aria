@@ -58,11 +58,13 @@ From a VS 2019/2022 x64 Developer Command Prompt:
 
 ```bat
 set ARIA_CUDA_ARCH=sm_86
-cl /nologo /c /O2 /MD /DARIA_CUDA /Isrc /FIaria_win_compat.h src\*.c
-nvcc -ccbin \"%VCToolsInstallDir%bin\Hostx64\x64\" -arch=sm_86 -O3 -Xcompiler /MD -Isrc -c src\aria_cuda.cu -o build\aria_cuda.obj
+:: src\aria_server.c is POSIX-only (BSD sockets + POSIX threads) and is
+:: not part of the Windows port yet -- in a .bat file write %%f instead of %f
+for %f in (src\*.c) do @if not "%~nxf"=="aria_server.c" cl /nologo /c /O2 /MD /DARIA_CUDA /Isrc /FIaria_win_compat.h "%f"
+nvcc -ccbin "%VCToolsInstallDir%bin\Hostx64\x64" -arch=sm_86 -O3 -Xcompiler /MD -Isrc -c src\aria_cuda.cu -o build\aria_cuda.obj
 ```
 
-Link all generated `.obj` files with `nvcc`, `cudart.lib`, and `cublas.lib`. The repository's Windows compatibility headers cover large-file safetensors mapping, timing, allocation, threading, and Windows CRT differences.
+Link the generated `.obj` files (the CLI objects above plus `aria_cuda.obj`) with `nvcc`, `cudart.lib`, and `cublas.lib`. The repository's Windows compatibility headers cover large-file safetensors mapping, timing, allocation, threading, and Windows CRT differences.
 
 Requirements: a C11 compiler (gcc/clang), `make`, libm, and OpenMP for POSIX. The native Windows path uses MSVC and CUDA. No BLAS, libsndfile, JSON library, Python, or PyTorch is required at runtime.
 
@@ -72,7 +74,7 @@ Use Aria's W8A8 path for packed 8-bit tensor-core inference:
 
 ```bat
 set ARIA_W8A8=1
-aria.exe -m models\medium -p \"progressive house, warm analog bass and evolving pads\" -d 180 -s 8 --precision q8 --device cuda --seed 2718 -o out.wav
+aria.exe -m models\medium -p "progressive house, warm analog bass and evolving pads" -d 180 -s 8 --precision q8 --device cuda --seed 2718 -o out.wav
 ```
 
 The runtime log should contain `W8A8 int8 tensor-core GEMMs` and `GPU device-resident, q8`. The q8 mode is an 8-bit GPU path in this build; the decoder remains fp16 on the GPU.
