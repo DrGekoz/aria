@@ -7,38 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.0] - Unreleased
 
-Native Windows build support: the same runtime, compiled for Windows x64 with MSVC + `nvcc`.
+Native Windows build support: the same runtime, compiled for Windows x64 with MSVC, optionally
+with the CUDA backend.
 
 ### Added
 
-- Native Windows x64 build path: the C sources compile with MSVC and are linked by `nvcc` against
-  the CUDA toolkit already used on POSIX, with no second ML stack, Python, or PyTorch involved.
-- Windows compatibility headers for what the sources previously assumed from the platform:
-  64-bit `CreateFileMapping`/`MapViewOfFile` safetensors mapping, `clock_gettime` via
-  `QueryPerformanceCounter`, `MAP_*`/`madvise`/`sysconf` shims, `strtok_r`/`strcasestr`, and CRT
-  differences (`isatty`, `setenv`).
-- Windows-safe large-file seeking for model, config, and text-encoder assets
-  (`_fseeki64`/`_ftelli64`/`_fstat64` instead of 32-bit `long` offsets).
-- A `pthread` shim for MSVC built on `SRWLOCK` + `SleepConditionVariableSRW` -- both genuinely
-  zero-initializable, so `PTHREAD_MUTEX_INITIALIZER` is a real initializer and no lazy
-  `InitializeCriticalSection` is needed -- with `_beginthreadex` threads.
-- README: native Windows CUDA build instructions, `--precision q8` usage, and how to read the
-  performance numbers.
-
-### Performance
-
-- Measured on the Windows build (RTX 3070, Stable Audio 3 Medium, `--precision q8`): a 180-second
-  progressive-house generation in 131.77 s of generation time, 135.395 s wall clock
-  (1.37x / 1.33x realtime). The q8 path itself is unchanged by this PR; the numbers document that
-  it reaches the MSVC build intact.
+- Native Windows x64 build with `build.bat`, the Makefile's counterpart (`build.bat`,
+  `build.bat test`, `build.bat cuda`). The C sources compile with MSVC; the CUDA build uses the
+  same `nvcc` flags and cuBLAS as on Linux. No Python, PyTorch, or second ML stack at runtime.
+- Windows compatibility header (`aria_win_compat.h`, force-included) for what the sources assumed
+  from the platform: 64-bit `CreateFileMapping`/`MapViewOfFile` safetensors mapping,
+  `clock_gettime` via `QueryPerformanceCounter`, `MAP_*`/`madvise`/`sysconf` shims, `strtok_r`,
+  and `__thread`. CRT differences are handled where they occur: `isatty`/`setenv` and binary
+  `stdout` for `--stream -o -` in `main.c`, `_aligned_malloc` for the scratch arena.
+- Windows-safe large-file handling for model and config files (`_fstat64`, `_fseeki64`/`_ftelli64`
+  instead of 32-bit `long` offsets).
+- A `pthread` shim for MSVC built on `SRWLOCK` + `SleepConditionVariableSRW` (both statically
+  initializable, so no lazy init) with `_beginthreadex` threads.
+- Windows CI: an MSVC CPU build running the hermetic unit tests, and an MSVC + CUDA build.
 
 ### Compatibility
 
-- The POSIX/CPU build path is unchanged.
-- Live prompt re-steering during `--stream` stays POSIX-only: it relies on `select()` over fd 0,
-  which has no portable Windows console/pipe equivalent. Windows stubs it out and does not
-  advertise the hint.
-- The Windows runtime needs only the built binary plus the installed NVIDIA driver/CUDA runtime.
+- The POSIX build is unchanged.
+- Not ported yet: live prompt re-steering during `--stream` (it relies on `select()` over fd 0;
+  Windows does not advertise it) and `aria-server` (BSD sockets).
+- The MSVC build compiles the scalar, single-threaded CPU kernels (no OpenMP or AVX2 yet); use
+  `--device cuda` on Windows. `madvise` is a no-op there, so host weights stay mapped after the
+  GPU upload.
 
 ## [0.1.0] - 2026-07-08
 
