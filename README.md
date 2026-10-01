@@ -57,7 +57,7 @@ Requirements: a C11 compiler (gcc/clang), `make`, libm, and OpenMP. No BLAS, no 
 `build.bat` is the Makefile's Windows counterpart. Run it from an *x64 Native Tools Command Prompt for VS 2019/2022*:
 
 ```bat
-rem CPU build: build\aria.exe + build\aria.lib
+rem CPU build: build\aria.exe + build\libaria.lib
 build.bat
 rem CPU build + hermetic unit tests (no model, no GPU)
 build.bat test

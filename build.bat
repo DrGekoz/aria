@@ -1,7 +1,7 @@
 @echo off
 rem build.bat - native Windows build with MSVC (the Makefile's counterpart).
 rem Run from an "x64 Native Tools Command Prompt for VS 2019/2022".
-rem   build.bat        CPU build: build\aria.exe + build\aria.lib
+rem   build.bat        CPU build: build\aria.exe + build\libaria.lib
 rem   build.bat test   CPU build + the hermetic unit tests, no model or GPU needed
 rem   build.bat cuda   CUDA build: nvcc on PATH, ARIA_CUDA_ARCH (default sm_86)
 setlocal enabledelayedexpansion
@@ -29,13 +29,13 @@ for %%f in (src\*.c) do if /i not "%%~nxf"=="main.c" if /i not "%%~nxf"=="aria_s
     set "OBJS=!OBJS! build\%%~nf.obj"
 )
 cl !CFLAGS! /MP /c /Fobuild\ !SRCS! || exit /b 1
-lib /nologo /OUT:build\aria.lib !OBJS! || exit /b 1
+lib /nologo /OUT:build\libaria.lib !OBJS! || exit /b 1
 
 cl !CFLAGS! /c /Fobuild\ src\main.c || exit /b 1
 if /i "%~1"=="cuda" (
-    nvcc -o build\aria.exe build\main.obj build\aria_cuda.obj build\aria.lib -lcublas || exit /b 1
+    nvcc -o build\aria.exe build\main.obj build\aria_cuda.obj build\libaria.lib -lcublas || exit /b 1
 ) else (
-    link /nologo /OUT:build\aria.exe build\main.obj build\aria.lib || exit /b 1
+    link /nologo /OUT:build\aria.exe build\main.obj build\libaria.lib || exit /b 1
 )
 
 if /i "%~1"=="test" (
@@ -45,7 +45,7 @@ if /i "%~1"=="test" (
     if not defined TESTS (echo no TESTS list found in the Makefile & exit /b 1)
     for %%t in (!TESTS!) do (
         echo ==^> build %%t
-        cl !CFLAGS! /Fobuild\ /Febuild\%%t.exe tests\%%t.c build\aria.lib || exit /b 1
+        cl !CFLAGS! /Fobuild\ /Febuild\%%t.exe tests\%%t.c build\libaria.lib || exit /b 1
         echo ==^> run %%t
         build\%%t.exe || exit /b 1
     )
