@@ -30,6 +30,7 @@
 #include <sys/select.h>  /* non-blocking stdin for live --stream prompting */
 #else
 #include <io.h>
+#include <fcntl.h>       /* _O_BINARY for raw f32 on stdout (--stream -o -) */
 #define isatty _isatty
 /* _putenv_s always overwrites; honour the overwrite=0 flag explicitly so a
  * user-provided OMP_WAIT_POLICY still wins (see main()). */
@@ -561,6 +562,9 @@ static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float con
      * re-seeds every N chunks for fresh variation. */
     int64_t base_seed = p->seed; int evolve_k = 0;
     int to_stdout = (strcmp(out_path, "-") == 0);   /* -o - : stream raw f32 to stdout for a player */
+#ifdef _WIN32
+    if (to_stdout) _setmode(_fileno(stdout), _O_BINARY);   /* text mode would turn every 0x0A into CRLF */
+#endif
     int64_t emitted = 0;
     squeue q = { .m = PTHREAD_MUTEX_INITIALIZER, .ne = PTHREAD_COND_INITIALIZER, .nf = PTHREAD_COND_INITIALIZER };
     pthread_t writer; int have_writer = 0;
